@@ -86,6 +86,25 @@ pub fn set_menu_animation(enabled: bool) {
     NSUserDefaults::standardUserDefaults().setBool_forKey(enabled, ns_string!("AnimateMenuBar"));
 }
 
+pub fn menu_shortcut() -> Option<crate::hotkey::Shortcut> {
+    let value = NSUserDefaults::standardUserDefaults().stringForKey(ns_string!("MenuShortcut"))?;
+    crate::hotkey::Shortcut::decode(&value.to_string())
+}
+
+pub fn set_menu_shortcut(shortcut: Option<&crate::hotkey::Shortcut>) {
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let key = ns_string!("MenuShortcut");
+    if let Some(shortcut) = shortcut {
+        let value = objc2_foundation::NSString::from_str(&shortcut.encode());
+        // SAFETY: NSString is a valid property-list value copied by NSUserDefaults.
+        unsafe {
+            defaults.setObject_forKey(Some(&value), key);
+        }
+    } else {
+        defaults.removeObjectForKey(key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

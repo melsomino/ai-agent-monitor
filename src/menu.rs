@@ -1,6 +1,6 @@
 //! Resident menu bar item and native sessions menu.
 use crate::{
-    core, motion, native, pending, pointer,
+    core, hotkey, motion, native, pending, pointer,
     sessions::{self, Activity, Client, Session},
     settings,
 };
@@ -25,6 +25,14 @@ use std::{
 static RESIDENT: AtomicBool = AtomicBool::new(false);
 thread_local! { static CONTROLLER: RefCell<Option<Retained<MenuController>>> = const { RefCell::new(None) }; }
 
+pub fn show_from_hotkey() {
+    CONTROLLER.with(|slot| {
+        if let Some(controller) = slot.borrow().as_ref() {
+            controller.show();
+        }
+    });
+}
+
 pub fn is_resident() -> bool {
     RESIDENT.load(Ordering::Relaxed)
 }
@@ -42,6 +50,12 @@ struct State {
     animation_switch: OnceCell<Retained<NSSwitch>>,
     login_note: OnceCell<Retained<NSTextField>>,
     login_settings_button: OnceCell<Retained<NSButton>>,
+    shortcut_button: OnceCell<Retained<NSButton>>,
+    shortcut_clear: OnceCell<Retained<NSButton>>,
+    shortcut_note: OnceCell<Retained<NSTextField>>,
+    shortcut_error: RefCell<Option<String>>,
+    shortcut_monitor: RefCell<Option<Retained<AnyObject>>>,
+    shortcut_registration: RefCell<Option<hotkey::Registration>>,
     menu: OnceCell<Retained<NSMenu>>,
     menu_item: OnceCell<Retained<NSMenuItem>>,
     menu_open: Cell<bool>,
@@ -120,6 +134,14 @@ define_class!(
         #[unsafe(method(windowDidBecomeKey:))]
         fn settings_became_key(&self, _notification: &NSNotification) {
             self.refresh_settings();
+        }
+        #[unsafe(method(windowDidResignKey:))]
+        fn settings_resigned_key(&self, _notification: &NSNotification) {
+            self.end_shortcut_recording(true);
+        }
+        #[unsafe(method(windowWillClose:))]
+        fn settings_will_close(&self, _notification: &NSNotification) {
+            self.end_shortcut_recording(true);
         }
     }
     // SAFETY: The retained main-thread controller implements NSMenuDelegate.
@@ -222,6 +244,16 @@ define_class!(
         #[unsafe(method(openLoginSettings:))]
         fn open_login_settings(&self, _sender: Option<&AnyObject>) {
             settings::open_login_settings();
+        }
+
+        #[unsafe(method(recordShortcut:))]
+        fn record_shortcut(&self, _sender: Option<&AnyObject>) {
+            self.begin_shortcut_recording();
+        }
+
+        #[unsafe(method(clearShortcut:))]
+        fn clear_shortcut(&self, _sender: Option<&AnyObject>) {
+            self.clear_menu_shortcut();
         }
 
         #[unsafe(method(quit:))]
@@ -495,6 +527,41 @@ fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
+fn detail_text_color(approval: bool) -> Retained<NSColor> {
+    let (dark_rgb, light_rgb) = if approval {
+        ([232.0, 197.0, 138.0], [128.0, 84.0, 22.0])
+    } else {
+        ([168.0, 199.0, 232.0], [54.0, 90.0, 124.0])
+    };
+    let color = |rgb: [f64; 3]| {
+        NSColor::colorWithSRGBRed_green_blue_alpha(
+            rgb[0] / 255.0,
+            rgb[1] / 255.0,
+            rgb[2] / 255.0,
+            1.0,
+        )
+    };
+    let dark = color(dark_rgb);
+    let light = color(light_rgb);
+    let provider = block2::RcBlock::new(move |appearance: std::ptr::NonNull<NSAppearance>| {
+        // SAFETY: AppKit supplies a live appearance; framework name constants
+        // are immutable, valid NSStrings for the lifetime of the process.
+        let is_dark = unsafe {
+            appearance
+                .as_ref()
+                .bestMatchFromAppearancesWithNames(&NSArray::from_slice(&[
+                    NSAppearanceNameDarkAqua,
+                    NSAppearanceNameAqua,
+                ]))
+                .is_some_and(|name| &*name == NSAppearanceNameDarkAqua)
+        };
+        std::ptr::NonNull::from(if is_dark { &*dark } else { &*light })
+    });
+    // SAFETY: Both returned colors are retained by the provider's captures.
+    // NSColor copies and retains the provider for subsequent appearance changes.
+    unsafe { NSColor::colorWithName_dynamicProvider(None, &provider) }
+}
+
 fn center_label(label: &NSTextField, center_y: f64) {
     let mut frame = label.frame();
     // A title may contain pasted attachment metadata with newlines. Never size
@@ -507,6 +574,132 @@ fn center_label(label: &NSTextField, center_y: f64) {
 }
 
 impl MenuController {
+    fn clear_menu_shortcut(&self) {
+        self.end_shortcut_recording(false);
+        self.ivars().shortcut_registration.borrow_mut().take();
+        settings::set_menu_shortcut(None);
+        self.ivars().shortcut_error.borrow_mut().take();
+        self.refresh_settings();
+    }
+
+    fn install_shortcut(&self) {
+        let old = self.ivars().shortcut_registration.borrow_mut().take();
+        drop(old);
+        self.ivars().shortcut_error.borrow_mut().take();
+        if let Some(shortcut) = settings::menu_shortcut() {
+            match hotkey::Registration::new(&shortcut, self.mtm()) {
+                Ok(registration) => {
+                    *self.ivars().shortcut_registration.borrow_mut() = Some(registration)
+                }
+                Err(error) => *self.ivars().shortcut_error.borrow_mut() = Some(error.to_string()),
+            }
+        }
+    }
+
+    fn begin_shortcut_recording(&self) {
+        if self.ivars().shortcut_monitor.borrow().is_some() {
+            self.end_shortcut_recording(true);
+            return;
+        }
+        // Temporarily release the existing key so it can be recorded again.
+        let old = self.ivars().shortcut_registration.borrow_mut().take();
+        drop(old);
+        self.ivars().shortcut_error.borrow_mut().take();
+        let callback = block2::RcBlock::new(|event: std::ptr::NonNull<NSEvent>| {
+            let handled = CONTROLLER.with(|slot| {
+                slot.borrow().as_ref().is_some_and(|controller| {
+                    // SAFETY: The local monitor supplies a live event for this callback.
+                    controller.record_shortcut_key(unsafe { event.as_ref() })
+                })
+            });
+            if handled {
+                std::ptr::null_mut()
+            } else {
+                event.as_ptr()
+            }
+        });
+        // SAFETY: This retained local monitor only receives events in this app.
+        // Its block borrows no controller; removal always uses the returned token.
+        let monitor = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &callback)
+        };
+        if let Some(monitor) = monitor {
+            *self.ivars().shortcut_monitor.borrow_mut() = Some(monitor);
+        } else {
+            self.install_shortcut();
+            *self.ivars().shortcut_error.borrow_mut() =
+                Some("Could not start shortcut recording.".into());
+        }
+        self.refresh_settings();
+    }
+
+    fn end_shortcut_recording(&self, restore: bool) {
+        let monitor = self.ivars().shortcut_monitor.borrow_mut().take();
+        if let Some(monitor) = monitor {
+            // SAFETY: This is exactly the token returned by our local monitor.
+            unsafe {
+                NSEvent::removeMonitor(&monitor);
+            }
+            if restore {
+                self.install_shortcut();
+            }
+            self.refresh_settings();
+        }
+    }
+
+    fn record_shortcut_key(&self, event: &NSEvent) -> bool {
+        if !self
+            .ivars()
+            .settings_window
+            .get()
+            .is_some_and(|window| window.isKeyWindow())
+        {
+            self.end_shortcut_recording(true);
+            return false;
+        }
+        if event.isARepeat() {
+            return true;
+        }
+        let flags = event.modifierFlags();
+        let modified = flags.intersects(
+            NSEventModifierFlags::Command
+                | NSEventModifierFlags::Option
+                | NSEventModifierFlags::Control
+                | NSEventModifierFlags::Shift,
+        );
+        if !modified && (event.keyCode() == 53 || event.keyCode() == 48) {
+            self.end_shortcut_recording(true);
+            return event.keyCode() != 48;
+        }
+        if !modified && (event.keyCode() == 51 || event.keyCode() == 117) {
+            self.clear_menu_shortcut();
+            return true;
+        }
+        let characters = event
+            .charactersByApplyingModifiers(NSEventModifierFlags::empty())
+            .map(|text| text.to_string())
+            .unwrap_or_default();
+        let Some(shortcut) = hotkey::Shortcut::from_event(event.keyCode(), flags, &characters)
+        else {
+            *self.ivars().shortcut_error.borrow_mut() = Some("Use ⌘, ⌥ or ⌃ with a key.".into());
+            self.refresh_settings();
+            return true;
+        };
+        match hotkey::Registration::new(&shortcut, self.mtm()) {
+            Ok(registration) => {
+                *self.ivars().shortcut_registration.borrow_mut() = Some(registration);
+                settings::set_menu_shortcut(Some(&shortcut));
+                self.ivars().shortcut_error.borrow_mut().take();
+                self.end_shortcut_recording(false);
+            }
+            Err(error) => {
+                *self.ivars().shortcut_error.borrow_mut() = Some(error.to_string());
+                self.refresh_settings();
+            }
+        }
+        true
+    }
+
     fn dismiss_menu(&self) {
         if self.ivars().menu_open.get()
             && let Some(menu) = self.ivars().menu.get()
@@ -542,6 +735,7 @@ impl MenuController {
         this.ivars().lock.set(lock).expect("lock initialized once");
         this.build_menu();
         this.build_status_item();
+        this.install_shortcut();
         this.refresh();
         // SAFETY: Observer implements showSessions: and is retained for the entire
         // process lifetime. Distributed notifications carry no executable payload.
@@ -566,7 +760,7 @@ impl MenuController {
             let window = unsafe {
                 let window = NSWindow::initWithContentRect_styleMask_backing_defer(
                     NSWindow::alloc(self.mtm()),
-                    rect(0.0, 0.0, 460.0, 216.0),
+                    rect(0.0, 0.0, 460.0, 304.0),
                     NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
                     NSBackingStoreType::Buffered,
                     false,
@@ -579,11 +773,11 @@ impl MenuController {
             window.setHidesOnDeactivate(false);
             window.setDelegate(Some(ProtocolObject::from_ref(self)));
             let view =
-                NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 216.0));
+                NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 304.0));
             self.label(
                 &view,
                 "Launch at login",
-                rect(24.0, 166.0, 350.0, 22.0),
+                rect(24.0, 254.0, 350.0, 22.0),
                 13.0,
                 0.23,
                 false,
@@ -591,19 +785,19 @@ impl MenuController {
             let note = self.label(
                 &view,
                 "Open Codex Notify automatically",
-                rect(24.0, 144.0, 370.0, 18.0),
+                rect(24.0, 232.0, 370.0, 18.0),
                 11.0,
                 0.0,
                 true,
             );
             let separator =
-                NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(24.0, 126.0, 412.0, 1.0));
+                NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(24.0, 214.0, 412.0, 1.0));
             separator.setBoxType(NSBoxType::Separator);
             view.addSubview(&separator);
             self.label(
                 &view,
                 "Menu bar animation",
-                rect(24.0, 88.0, 350.0, 22.0),
+                rect(24.0, 176.0, 350.0, 22.0),
                 13.0,
                 0.23,
                 false,
@@ -611,20 +805,20 @@ impl MenuController {
             self.label(
                 &view,
                 "Rotate the indicator while an agent is working",
-                rect(24.0, 66.0, 350.0, 18.0),
+                rect(24.0, 154.0, 350.0, 18.0),
                 11.0,
                 0.0,
                 true,
             );
             for (y, action, storage, title) in [
                 (
-                    163.0,
+                    251.0,
                     sel!(toggleLogin:),
                     &state.login_switch,
                     ns_string!("Launch at login"),
                 ),
                 (
-                    85.0,
+                    173.0,
                     sel!(toggleMenuAnimation:),
                     &state.animation_switch,
                     ns_string!("Menu bar animation"),
@@ -665,6 +859,26 @@ impl MenuController {
                 .login_note
                 .set(note)
                 .expect("login note initialized once");
+            let separator = NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(24.0, 136.0, 412.0, 1.0));
+            separator.setBoxType(NSBoxType::Separator);
+            view.addSubview(&separator);
+            self.label(&view, "Keyboard shortcut", rect(24.0, 98.0, 220.0, 22.0), 13.0, 0.23, false);
+            let note = self.label(&view, "Open the sessions menu from any app", rect(24.0, 76.0, 412.0, 18.0), 11.0, 0.0, true);
+            state.shortcut_note.set(note).expect("shortcut note initialized once");
+            // SAFETY: Both action selectors are implemented by this retained controller.
+            let record = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Record shortcut"), Some(self), Some(sel!(recordShortcut:)), self.mtm()) };
+            record.setFrame(rect(264.0, 94.0, 140.0, 28.0));
+            record.setToolTip(Some(ns_string!("Click, then press a shortcut. Escape cancels.")));
+            view.addSubview(&record);
+            state.shortcut_button.set(record).expect("shortcut recorder initialized once");
+            // SAFETY: The clear action's target remains valid for the window's lifetime.
+            let clear = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("×"), Some(self), Some(sel!(clearShortcut:)), self.mtm()) };
+            clear.setFrame(rect(408.0, 94.0, 28.0, 28.0));
+            clear.setToolTip(Some(ns_string!("Clear keyboard shortcut")));
+            // SAFETY: NSButton supports the accessibility label property.
+            unsafe { let _: () = msg_send![&*clear, setAccessibilityLabel: ns_string!("Clear keyboard shortcut")]; }
+            view.addSubview(&clear);
+            state.shortcut_clear.set(clear).expect("shortcut clear button initialized once");
             window.setContentView(Some(&view));
             window.center();
             window
@@ -715,6 +929,38 @@ impl MenuController {
         }
         if let Some(button) = state.login_settings_button.get() {
             button.setHidden(status != settings::LoginStatus::RequiresApproval);
+        }
+        let shortcut = settings::menu_shortcut();
+        let recording = state.shortcut_monitor.borrow().is_some();
+        if let Some(button) = state.shortcut_button.get() {
+            let title = if recording {
+                "Press shortcut…".into()
+            } else {
+                shortcut
+                    .as_ref()
+                    .map(|shortcut| shortcut.label())
+                    .unwrap_or_else(|| "Record shortcut".into())
+            };
+            button.setTitle(&NSString::from_str(&title));
+        }
+        if let Some(button) = state.shortcut_clear.get() {
+            button.setEnabled(shortcut.is_some() || recording);
+        }
+        if let Some(note) = state.shortcut_note.get() {
+            let error = state.shortcut_error.borrow();
+            let message = error.as_deref().unwrap_or(if recording {
+                "Press a shortcut. Escape cancels."
+            } else {
+                "Open the sessions menu from any app"
+            });
+            note.setStringValue(&NSString::from_str(message));
+            note.setToolTip(Some(&NSString::from_str(message)));
+            let color = if error.is_some() {
+                NSColor::systemRedColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            note.setTextColor(Some(&color));
         }
     }
 
@@ -1542,6 +1788,7 @@ impl MenuController {
                 let label =
                     NSTextField::wrappingLabelWithString(&NSString::from_str(text), self.mtm());
                 label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                label.setTextColor(Some(&detail_text_color(session.approval.is_some())));
                 label.setSelectable(true);
                 label.setMaximumNumberOfLines(0);
                 let height = label
