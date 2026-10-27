@@ -25,10 +25,23 @@ use std::{
 static RESIDENT: AtomicBool = AtomicBool::new(false);
 thread_local! { static CONTROLLER: RefCell<Option<Retained<MenuController>>> = const { RefCell::new(None) }; }
 
-pub fn show_from_hotkey() {
+pub fn toggle_from_hotkey() {
     CONTROLLER.with(|slot| {
         if let Some(controller) = slot.borrow().as_ref() {
-            controller.show();
+            // Return from Carbon's callback before opening a nested menu loop
+            // or suspending the registration that delivered this callback.
+            // SAFETY: This retained controller implements toggleMenuFromHotkey:;
+            // common run-loop modes also run during native menu tracking.
+            unsafe {
+                let timer = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                    0.0,
+                    controller,
+                    sel!(toggleMenuFromHotkey:),
+                    None,
+                    false,
+                );
+                NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
+            }
         }
     });
 }
@@ -58,6 +71,7 @@ struct State {
     shortcut_registration: RefCell<Option<hotkey::Registration>>,
     menu: OnceCell<Retained<NSMenu>>,
     menu_item: OnceCell<Retained<NSMenuItem>>,
+    menu_close_shortcut: OnceCell<Retained<NSMenuItem>>,
     menu_open: Cell<bool>,
     incoming: RefCell<Option<std::sync::mpsc::Receiver<Result<Vec<Session>>>>>,
     last_refresh: Cell<Option<Instant>>,
@@ -149,6 +163,10 @@ define_class!(
         #[unsafe(method(menuWillOpen:))]
         fn will_open(&self, _menu: &NSMenu) {
             self.ivars().menu_open.set(true);
+            // NSMenu handles this shortcut as a native key equivalent while it
+            // tracks. Keeping Carbon registered here can buffer the key until
+            // tracking ends, reopening the menu instead of closing it.
+            self.ivars().shortcut_registration.borrow_mut().take();
             self.receive_sessions();
             if self.ivars().expand_approvals(&self.ivars().all.borrow()) {
                 self.render_rows(&self.ivars().all.borrow());
@@ -160,10 +178,20 @@ define_class!(
         fn did_close(&self, _menu: &NSMenu) {
             self.ivars().menu_open.set(false);
             self.close_panel();
+            self.install_shortcut();
         }
     }
 
     impl MenuController {
+        #[unsafe(method(toggleMenuFromHotkey:))]
+        fn toggle_menu_from_hotkey(&self, _timer: &NSTimer) {
+            if self.ivars().menu_open.get() { self.dismiss_menu(); } else { self.show(); }
+        }
+
+        #[unsafe(method(closeMenu:))]
+        fn close_menu(&self, _sender: Option<&AnyObject>) {
+            self.dismiss_menu();
+        }
         #[unsafe(method(animateStatus:))]
         fn animate_status(&self, _timer: &NSTimer) {
             if let Some(icon) = self.ivars().status_working.get() {
@@ -586,12 +614,29 @@ impl MenuController {
         let old = self.ivars().shortcut_registration.borrow_mut().take();
         drop(old);
         self.ivars().shortcut_error.borrow_mut().take();
+        self.configure_menu_shortcut();
         if let Some(shortcut) = settings::menu_shortcut() {
+            if self.ivars().menu_open.get() {
+                return;
+            }
             match hotkey::Registration::new(&shortcut, self.mtm()) {
                 Ok(registration) => {
                     *self.ivars().shortcut_registration.borrow_mut() = Some(registration)
                 }
                 Err(error) => *self.ivars().shortcut_error.borrow_mut() = Some(error.to_string()),
+            }
+        }
+    }
+
+    fn configure_menu_shortcut(&self) {
+        if let Some(item) = self.ivars().menu_close_shortcut.get() {
+            if let Some(shortcut) = settings::menu_shortcut() {
+                item.setKeyEquivalent(&NSString::from_str(&shortcut.menu_key_equivalent()));
+                item.setKeyEquivalentModifierMask(shortcut.cocoa_modifiers());
+                item.setEnabled(true);
+            } else {
+                item.setKeyEquivalent(ns_string!(""));
+                item.setEnabled(false);
             }
         }
     }
@@ -896,6 +941,7 @@ impl MenuController {
     }
 
     fn refresh_settings(&self) {
+        self.configure_menu_shortcut();
         let state = self.ivars();
         let status = settings::login_status();
         if let Some(toggle) = state.login_switch.get() {
@@ -1250,6 +1296,29 @@ impl MenuController {
         item.setEnabled(true);
         item.setView(Some(&view));
         menu.addItem(&item);
+        // A hidden native command receives the shortcut during menu tracking;
+        // the custom session view continues to own the visible menu contents.
+        // SAFETY: closeMenu: is implemented by the retained controller.
+        let close = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!("Close"),
+                Some(sel!(closeMenu:)),
+                ns_string!(""),
+            )
+        };
+        // SAFETY: The target lives as long as the resident controller and menu.
+        unsafe {
+            close.setTarget(Some(self));
+        }
+        close.setHidden(true);
+        close.setAllowsKeyEquivalentWhenHidden(true);
+        close.setEnabled(false);
+        menu.addItem(&close);
+        self.ivars()
+            .menu_close_shortcut
+            .set(close)
+            .expect("menu shortcut initialized once");
         self.ivars()
             .menu_item
             .set(item)

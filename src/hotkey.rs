@@ -65,6 +65,50 @@ impl Shortcut {
         label
     }
 
+    pub fn cocoa_modifiers(&self) -> NSEventModifierFlags {
+        let mut flags = NSEventModifierFlags::empty();
+        for (mask, flag) in [
+            (COMMAND, NSEventModifierFlags::Command),
+            (SHIFT, NSEventModifierFlags::Shift),
+            (OPTION, NSEventModifierFlags::Option),
+            (CONTROL, NSEventModifierFlags::Control),
+        ] {
+            if self.modifiers & mask != 0 {
+                flags |= flag;
+            }
+        }
+        flags
+    }
+
+    pub fn menu_key_equivalent(&self) -> String {
+        let character = match self.key_code {
+            36 => Some('\r'),
+            76 => Some('\u{3}'),
+            48 => Some('\t'),
+            49 => Some(' '),
+            51 => Some('\u{7f}'),
+            53 => Some('\u{1b}'),
+            115 => Some('\u{f729}'),
+            116 => Some('\u{f72c}'),
+            117 => Some('\u{f728}'),
+            119 => Some('\u{f72b}'),
+            121 => Some('\u{f72d}'),
+            123 => Some('\u{f702}'),
+            124 => Some('\u{f703}'),
+            125 => Some('\u{f701}'),
+            126 => Some('\u{f700}'),
+            _ => self
+                .key_name
+                .strip_prefix('F')
+                .and_then(|number| number.parse::<u32>().ok())
+                .filter(|number| (1..=20).contains(number))
+                .and_then(|number| char::from_u32(0xf703 + number)),
+        };
+        character
+            .map(|character| character.to_string())
+            .unwrap_or_else(|| self.key_name.to_lowercase())
+    }
+
     pub fn encode(&self) -> String {
         json!({"keyCode": self.key_code, "modifiers": self.modifiers, "keyName": self.key_name})
             .to_string()
@@ -148,7 +192,7 @@ type Handler = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i3
 
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
-    fn GetApplicationEventTarget() -> *mut c_void;
+    fn GetEventDispatcherTarget() -> *mut c_void;
     fn InstallEventHandler(
         target: *mut c_void,
         handler: Handler,
@@ -197,9 +241,9 @@ unsafe extern "C" fn pressed(_: *mut c_void, event: *mut c_void, _: *mut c_void)
         return -9874;
     }
     if MainThreadMarker::new().is_some() {
-        crate::menu::show_from_hotkey();
+        crate::menu::toggle_from_hotkey();
     } else {
-        dispatch2::DispatchQueue::main().exec_async(crate::menu::show_from_hotkey);
+        dispatch2::DispatchQueue::main().exec_async(crate::menu::toggle_from_hotkey);
     }
     0
 }
@@ -221,7 +265,7 @@ impl Registration {
         // SAFETY: SDK signatures match the FFI declarations. Registration and
         // teardown are main-thread-only. The callback has no borrowed user data.
         unsafe {
-            let target = GetApplicationEventTarget();
+            let target = GetEventDispatcherTarget();
             let event_type = EventType {
                 class: u32::from_be_bytes(*b"keyb"),
                 kind: 5,
@@ -286,6 +330,11 @@ mod tests {
         .unwrap();
         assert_eq!(key.modifiers, COMMAND | OPTION);
         assert_eq!(key.label(), "⌥⌘K");
+        assert_eq!(key.menu_key_equivalent(), "k");
+        assert_eq!(
+            key.cocoa_modifiers(),
+            NSEventModifierFlags::Command | NSEventModifierFlags::Option
+        );
         assert_eq!(Shortcut::decode(&key.encode()), Some(key));
         assert_eq!(
             Shortcut::from_event(49, NSEventModifierFlags::Control, " ")
@@ -312,6 +361,32 @@ mod tests {
             r#"{"keyCode":40,"modifiers":256,"keyName":"\n"}"#,
         ] {
             assert!(Shortcut::decode(value).is_none());
+        }
+    }
+
+    #[test]
+    fn native_menu_equivalents_use_event_characters_instead_of_display_symbols() {
+        for (code, name, equivalent) in [
+            (44, "/", "/"),
+            (49, " ", " "),
+            (123, "", "\u{f702}"),
+            (36, "", "\r"),
+            (51, "", "\u{7f}"),
+            (117, "", "\u{f728}"),
+            (122, "", "\u{f704}"),
+            (90, "", "\u{f717}"),
+        ] {
+            let shortcut = Shortcut::from_event(
+                code,
+                NSEventModifierFlags::Control | NSEventModifierFlags::Shift,
+                name,
+            )
+            .unwrap();
+            assert_eq!(shortcut.menu_key_equivalent(), equivalent);
+            assert_eq!(
+                shortcut.cocoa_modifiers(),
+                NSEventModifierFlags::Control | NSEventModifierFlags::Shift
+            );
         }
     }
 }
