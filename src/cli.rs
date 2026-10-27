@@ -14,6 +14,12 @@ pub struct Cli {
 pub enum Command {
     /// Process a Codex PermissionRequest event from JSON on stdin.
     Hook,
+    /// Open the sessions window and keep an icon in the macOS menu bar.
+    Sessions {
+        /// Print only currently open sessions as JSON without opening the window.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a test notification without granting any Codex permissions.
     #[command(long_flag = "test")]
     Test {
@@ -41,6 +47,8 @@ pub enum Command {
     /// Ask macOS for notification permission.
     #[command(long_flag = "setup")]
     Setup,
+    /// Print the macOS notification authorization and banner settings as JSON.
+    NotificationSettings,
     /// Open a project using its VS Code URL.
     #[command(long_flag = "open-target")]
     OpenTarget {
@@ -74,7 +82,9 @@ pub struct Message {
 
 pub enum NativeCommand {
     Listen,
+    Sessions,
     Setup,
+    NotificationSettings,
     OpenTarget(String),
     Send {
         message: Message,

@@ -317,6 +317,7 @@ pub fn deliver(event: &Value, approval: bool) -> Result<Option<Action>> {
     if approval {
         let directory = approval_directory()?;
         let response = directory.path().join("response");
+        crate::pending::publish(directory.path(), event, &content.body, WAIT.as_secs())?;
         if matches!(send(Some(&response)), Ok(true)) {
             return Ok(wait_response(&response, WAIT));
         }

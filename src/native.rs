@@ -14,7 +14,7 @@ use objc2_foundation::{
     NSArray, NSDictionary, NSError, NSObject, NSObjectProtocol, NSSet, NSString, NSURL, ns_string,
 };
 use objc2_user_notifications::*;
-use std::{path::Path, ptr::NonNull, time::Duration};
+use std::{path::Path, ptr::NonNull};
 
 pub fn open_target(value: &str) -> bool {
     let Ok(url) = url::Url::parse(value) else {
@@ -91,7 +91,9 @@ define_class!(
                 if should_open {
                     open_target(&target);
                 }
-                std::process::exit(0);
+                if !crate::menu::is_resident() {
+                    std::process::exit(0);
+                }
             });
         }
 
@@ -113,7 +115,42 @@ fn fail(message: impl std::fmt::Display) -> ! {
     std::process::exit(2)
 }
 
+fn remove_notification(identifier: &str) {
+    let identifiers = NSArray::from_slice(&[&*NSString::from_str(identifier)]);
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+    center.removePendingNotificationRequestsWithIdentifiers(&identifiers);
+    center.removeDeliveredNotificationsWithIdentifiers(&identifiers);
+}
+
+pub fn dismiss_approval(response: &Path) {
+    let Some(identifier) = crate::pending::notification_id(response) else {
+        return;
+    };
+    remove_notification(&identifier);
+    // Match pre-update notifications too: those used random identifiers but
+    // already included the exact response path in their property-list userInfo.
+    let callback = RcBlock::new(move |notifications: NonNull<NSArray<UNNotification>>| {
+        // SAFETY: The notification center supplies a live array for this callback.
+        let notifications = unsafe { notifications.as_ref() };
+        for index in 0..notifications.count() {
+            let request = notifications.objectAtIndex(index).request();
+            let stored = info_string(&request.content().userInfo(), ns_string!("response"));
+            if crate::pending::notification_id(Path::new(&stored)).as_deref()
+                == Some(identifier.as_str())
+            {
+                remove_notification(&request.identifier().to_string());
+            }
+        }
+    });
+    UNUserNotificationCenter::currentNotificationCenter()
+        .getDeliveredNotificationsWithCompletionHandler(&callback);
+}
+
 fn send(message: &Message, response: Option<&str>) {
+    // The panel may answer while notification authorization/delivery is in flight.
+    if response.is_some_and(|path| crate::pending::is_resolved(Path::new(path))) {
+        std::process::exit(0);
+    }
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(&message.title));
     content.setSubtitle(&NSString::from_str(&message.subtitle));
@@ -134,23 +171,34 @@ fn send(message: &Message, response: Option<&str>) {
     if response.is_some() {
         content.setCategoryIdentifier(ns_string!("CODEX_APPROVAL"));
     }
-    let identifier = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
+    let identifier = response
+        .and_then(|path| crate::pending::notification_id(Path::new(path)))
+        .unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+        });
     let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
         &NSString::from_str(&identifier),
         &content,
         None,
     );
-    let callback = RcBlock::new(|error: *mut NSError| {
+    let response_path = response.map(std::path::PathBuf::from);
+    let callback = RcBlock::new(move |error: *mut NSError| {
         // SAFETY: Apple guarantees a valid NSError pointer (or null) for this callback.
         if let Some(error) = unsafe { error.as_ref() } {
             fail(error.localizedDescription());
+        }
+        if response_path
+            .as_deref()
+            .is_some_and(crate::pending::is_resolved)
+        {
+            remove_notification(&identifier);
         }
         std::process::exit(0);
     });
@@ -162,6 +210,11 @@ pub fn run(command: NativeCommand) -> Result<()> {
     let mtm = MainThreadMarker::new().expect("native UI must start on main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    if matches!(command, NativeCommand::Listen | NativeCommand::Sessions)
+        && !crate::menu::start(mtm, matches!(command, NativeCommand::Sessions))?
+    {
+        return Ok(());
+    }
     let center = UNUserNotificationCenter::currentNotificationCenter();
     // SAFETY: This NSObject subclass has no custom initialization or ivars.
     let delegate: Retained<NotificationDelegate> =
@@ -180,6 +233,43 @@ pub fn run(command: NativeCommand) -> Result<()> {
     );
     center.setNotificationCategories(&NSSet::from_slice(&[&*category]));
     match command {
+        NativeCommand::NotificationSettings => {
+            let callback = RcBlock::new(|settings: NonNull<UNNotificationSettings>| {
+                // SAFETY: The framework supplies a valid settings object for this callback.
+                let settings = unsafe { settings.as_ref() };
+                let enabled = |value: UNNotificationSetting| match value {
+                    UNNotificationSetting::Enabled => "enabled",
+                    UNNotificationSetting::Disabled => "disabled",
+                    _ => "unsupported",
+                };
+                let authorization = match settings.authorizationStatus() {
+                    UNAuthorizationStatus::Authorized => "authorized",
+                    UNAuthorizationStatus::Provisional => "provisional",
+                    UNAuthorizationStatus::Denied => "denied",
+                    UNAuthorizationStatus::NotDetermined => "notDetermined",
+                    _ => "unknown",
+                };
+                let style = match settings.alertStyle() {
+                    UNAlertStyle::Banner => "banner",
+                    UNAlertStyle::Alert => "alert",
+                    _ => "none",
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authorization": authorization,
+                        "alertStyle": style,
+                        "alerts": enabled(settings.alertSetting()),
+                        "notificationCenter": enabled(settings.notificationCenterSetting()),
+                        "sound": enabled(settings.soundSetting()),
+                        "timeSensitive": enabled(settings.timeSensitiveSetting()),
+                        "scheduledDelivery": enabled(settings.scheduledDeliverySetting()),
+                    })
+                );
+                std::process::exit(0);
+            });
+            center.getNotificationSettingsWithCompletionHandler(&callback);
+        }
         NativeCommand::Setup => {
             let callback = RcBlock::new(|allowed: Bool, error: *mut NSError| {
                 // SAFETY: The pointer is valid (or null) for the lifetime of the callback.
@@ -211,14 +301,7 @@ pub fn run(command: NativeCommand) -> Result<()> {
             }
             return Ok(());
         }
-        NativeCommand::Listen => {
-            // macOS relaunches the app without arguments when a notification is
-            // clicked, even though the original notification sender has exited.
-            std::thread::spawn(|| {
-                std::thread::sleep(Duration::from_secs(15));
-                std::process::exit(0);
-            });
-        }
+        NativeCommand::Listen | NativeCommand::Sessions => {}
     }
     app.run();
     // Keep the weak delegate alive for the entire run loop.

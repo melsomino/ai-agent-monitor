@@ -1,7 +1,17 @@
 mod cli;
 mod core;
 #[cfg(target_os = "macos")]
+mod menu;
+#[cfg(target_os = "macos")]
+mod motion;
+#[cfg(target_os = "macos")]
 mod native;
+mod pending;
+#[cfg(target_os = "macos")]
+mod pointer;
+mod sessions;
+#[cfg(target_os = "macos")]
+mod settings;
 #[cfg(test)]
 mod tests;
 mod tools;
@@ -39,6 +49,20 @@ fn run(command: Option<Command>) -> Result<()> {
             }
         }
         Some(Command::Bundle) => tools::bundle()?,
+        Some(Command::Sessions { json: true }) => {
+            let sessions = sessions::open(&core::codex_home())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "sessions": sessions.iter().map(|session| serde_json::json!({
+                        "id":session.id,"title":session.title,"cwd":session.cwd,"updatedAt":session.updated_at,
+                        "client":session.client.label(),"status":session.activity.label(),"lastMessage":session.last_message,
+                        "approval":session.approval.as_ref().map(|request| serde_json::json!({"body":request.body,"expiresAt":request.expires}))
+                    })).collect::<Vec<_>>()
+                }))?
+            );
+        }
+        Some(Command::Sessions { json: false }) => run_native(NativeCommand::Sessions)?,
         Some(Command::Install { codex_home }) => {
             let home = codex_home.unwrap_or_else(core::codex_home);
             let executable = core::bundle_executable();
@@ -62,6 +86,7 @@ fn run(command: Option<Command>) -> Result<()> {
         }
         Some(Command::CheckHooks { binary }) => tools::check_hooks(&binary)?,
         Some(Command::Setup) => run_native(NativeCommand::Setup)?,
+        Some(Command::NotificationSettings) => run_native(NativeCommand::NotificationSettings)?,
         Some(Command::OpenTarget { target }) => run_native(NativeCommand::OpenTarget(target))?,
         Some(Command::Send(message)) => run_native(NativeCommand::Send {
             message,
