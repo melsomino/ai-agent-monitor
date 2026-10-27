@@ -7,6 +7,17 @@ pub struct Area {
     pub height: f64,
 }
 impl Area {
+    pub fn intersected(self, clip: Self) -> Self {
+        let x = self.x.max(clip.x);
+        let y = self.y.max(clip.y);
+        Self {
+            x,
+            y,
+            width: ((self.x + self.width).min(clip.x + clip.width) - x).max(0.0),
+            height: ((self.y + self.height).min(clip.y + clip.height) - y).max(0.0),
+        }
+    }
+
     pub fn contains(self, point: (f64, f64)) -> bool {
         point.0 >= self.x
             && point.0 < self.x + self.width
@@ -113,6 +124,51 @@ pub fn target_at(
 #[cfg(test)]
 mod target_tests {
     use super::*;
+    #[test]
+    fn drawing_visibility_cannot_expand_a_buttons_hover_target() {
+        let window = Area {
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 800.0,
+        };
+        let bounds = Area {
+            x: 324.0,
+            y: 8.0,
+            width: 24.0,
+            height: 24.0,
+        };
+        // AppKit's visible drawing rectangle can extend beyond an unclipped view.
+        let toolbar = [bounds.intersected(window)];
+        let resolve = |point| target_at(point, window, window, &toolbar, &[], &[]);
+        assert_eq!(resolve((330.0, 16.0)), Some(Target::Button(0)));
+        assert_eq!(resolve((100.0, 16.0)), None);
+        assert_eq!(resolve((330.0, 200.0)), None);
+        assert_eq!(resolve((350.0, 16.0)), None);
+
+        let footer = Area {
+            x: 274.0,
+            y: 300.0,
+            width: 70.0,
+            height: 28.0,
+        };
+        let reveal = Area {
+            x: 0.0,
+            y: 48.0,
+            width: 372.0,
+            height: 264.0,
+        };
+        let buttons = [footer.intersected(reveal)];
+        assert_eq!(
+            target_at((300.0, 305.0), window, window, &[], &buttons, &[]),
+            Some(Target::Button(0))
+        );
+        assert_eq!(
+            target_at((300.0, 320.0), window, window, &[], &buttons, &[]),
+            None
+        );
+    }
+
     #[test]
     fn a_single_target_moves_between_row_button_arrow_and_outside() {
         let window = Area {

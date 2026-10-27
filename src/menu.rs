@@ -1538,7 +1538,13 @@ impl MenuController {
         let p = list.convertPoint_fromView(point, None);
         let button_area = |item: &ButtonHover| {
             if item.button.isEnabled() && !item.button.isHiddenOrHasHiddenAncestor() {
-                area(list.convertRect_fromView(item.button.visibleRect(), Some(&item.button)))
+                // visibleRect describes drawing visibility and may exceed the
+                // view's bounds when clipping is disabled. Never let it enlarge
+                // a hover target; use it only to clip the button's actual bounds.
+                area(list.convertRect_fromView(item.button.bounds(), Some(&item.button)))
+                    .intersected(area(
+                        list.convertRect_fromView(item.button.visibleRect(), Some(&item.button)),
+                    ))
             } else {
                 pointer::Area {
                     x: 0.0,
