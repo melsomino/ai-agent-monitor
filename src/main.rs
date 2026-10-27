@@ -37,7 +37,7 @@ fn run(command: Option<Command>) -> Result<()> {
             session_id,
         }) => {
             let mut event = json!({"hook_event_name": "PermissionRequest", "cwd": env::current_dir()?,
-                "tool_name": "Bash", "tool_input": {"description": "Тест: уведомление отправлено из Rust. Allow не запускает команды."}});
+                "tool_name": "Bash", "tool_input": {"description": "Test notification sent from Rust. Allow does not run any commands."}});
             if let Some(id) = session_id {
                 event["session_id"] = id.into();
             }

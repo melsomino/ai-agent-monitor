@@ -61,7 +61,7 @@ pub fn set_launch_at_login(enabled: bool) -> Result<LoginStatus> {
         if let Some(error) = unsafe { error.as_ref() } {
             bail!("{}", error.localizedDescription());
         }
-        bail!("Не удалось изменить автозапуск");
+        bail!("Could not change launch at login");
     }
     Ok(status)
 }

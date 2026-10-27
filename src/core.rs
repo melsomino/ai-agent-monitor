@@ -199,7 +199,7 @@ pub fn notification(event: &Value) -> Option<Notification> {
         .as_str()
         .filter(|s| !s.is_empty())
         .or_else(|| input["justification"].as_str().filter(|s| !s.is_empty()))
-        .unwrap_or("Откройте Codex, чтобы проверить запрос.");
+        .unwrap_or("Open Codex to review the request.");
     Some(Notification {
         title: chat_title(event, &codex_home()),
         body: reason.trim().to_owned(),
@@ -375,7 +375,7 @@ pub fn install(home: &Path, executable: &Path, legacy_script: &Path) -> Result<b
         "{} hook",
         shlex::try_quote(executable.to_str().context("non-UTF8 executable path")?)?
     );
-    let handler = json!({"type": "command", "command": command, "timeout": 70, "statusMessage": "Уведомление macOS"});
+    let handler = json!({"type": "command", "command": command, "timeout": 70, "statusMessage": "macOS notification"});
     let mut found = false;
     let mut changed = false;
     for group in groups.iter_mut() {

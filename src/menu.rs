@@ -53,6 +53,7 @@ struct State {
     scroll: OnceCell<Retained<SessionScrollView>>,
     content_height: Cell<f64>,
     expanded: RefCell<HashSet<String>>,
+    opened_approvals: RefCell<HashSet<String>>,
     reveal: RefCell<HashMap<String, f64>>,
     motion: RefCell<Option<motion::Disclosure>>,
     animation_epoch: Cell<u64>,
@@ -78,6 +79,30 @@ impl State {
         self.motion.borrow_mut().take();
         self.expanded.borrow_mut().clear();
         self.reveal.borrow_mut().clear();
+        self.opened_approvals.borrow_mut().clear();
+    }
+
+    fn expand_approvals(&self, sessions: &[Session]) -> bool {
+        if !self.menu_open.get() {
+            return false;
+        }
+        let mut changed = false;
+        for session in sessions {
+            if let Some(request) = &session.approval
+                && self
+                    .opened_approvals
+                    .borrow_mut()
+                    .insert(request.response.to_string_lossy().into_owned())
+            {
+                self.expanded.borrow_mut().insert(session.id.clone());
+                self.reveal.borrow_mut().insert(session.id.clone(), 1.0);
+                if let Some(motion) = self.motion.borrow_mut().as_mut() {
+                    motion.show(&session.id);
+                }
+                changed = true;
+            }
+        }
+        changed
     }
 }
 
@@ -103,6 +128,9 @@ define_class!(
         fn will_open(&self, _menu: &NSMenu) {
             self.ivars().menu_open.set(true);
             self.receive_sessions();
+            if self.ivars().expand_approvals(&self.ivars().all.borrow()) {
+                self.render_rows(&self.ivars().all.borrow());
+            }
             self.refresh();
             self.start_pointer_tracking();
         }
@@ -149,7 +177,7 @@ define_class!(
             if let Some(request) = request {
                 let allowed = pending::allow(&request);
                 if allowed { native::dismiss_approval(&request.response); }
-                if let Some(button) = sender { button.setEnabled(false); button.setTitle(if allowed { ns_string!("Разрешено") } else { ns_string!("Запрос завершён") }); }
+                if let Some(button) = sender { button.setEnabled(false); button.setTitle(if allowed { ns_string!("Allowed") } else { ns_string!("Request completed") }); }
                 self.update_badge(pending::list().len());
                 self.refresh();
             }
@@ -178,7 +206,7 @@ define_class!(
             let result = settings::set_launch_at_login(sender.state() == NSControlStateValueOn);
             self.refresh_settings();
             if let Err(error) = result && let Some(note) = self.ivars().login_note.get() {
-                let message = NSString::from_str(&format!("Не удалось изменить автозапуск: {error}"));
+                let message = NSString::from_str(&format!("Could not change launch at login: {error}"));
                 note.setStringValue(&message);
                 note.setToolTip(Some(&message));
                 note.setTextColor(Some(&NSColor::systemRedColor()));
@@ -546,13 +574,15 @@ impl MenuController {
                 window.setReleasedWhenClosed(false);
                 window
             };
-            window.setTitle(ns_string!("Настройки Codex Notify"));
+            window.setTitle(ns_string!("Codex Notify Settings"));
+            window.setLevel(NSFloatingWindowLevel);
+            window.setHidesOnDeactivate(false);
             window.setDelegate(Some(ProtocolObject::from_ref(self)));
             let view =
                 NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 216.0));
             self.label(
                 &view,
-                "Запускать при входе в macOS",
+                "Launch at login",
                 rect(24.0, 166.0, 350.0, 22.0),
                 13.0,
                 0.23,
@@ -560,7 +590,7 @@ impl MenuController {
             );
             let note = self.label(
                 &view,
-                "Открывать Codex Notify автоматически",
+                "Open Codex Notify automatically",
                 rect(24.0, 144.0, 370.0, 18.0),
                 11.0,
                 0.0,
@@ -572,7 +602,7 @@ impl MenuController {
             view.addSubview(&separator);
             self.label(
                 &view,
-                "Анимация в менюбаре",
+                "Menu bar animation",
                 rect(24.0, 88.0, 350.0, 22.0),
                 13.0,
                 0.23,
@@ -580,7 +610,7 @@ impl MenuController {
             );
             self.label(
                 &view,
-                "Вращать стрелки, пока агент работает",
+                "Rotate the indicator while an agent is working",
                 rect(24.0, 66.0, 350.0, 18.0),
                 11.0,
                 0.0,
@@ -591,13 +621,13 @@ impl MenuController {
                     163.0,
                     sel!(toggleLogin:),
                     &state.login_switch,
-                    ns_string!("Запускать при входе в macOS"),
+                    ns_string!("Launch at login"),
                 ),
                 (
                     85.0,
                     sel!(toggleMenuAnimation:),
                     &state.animation_switch,
-                    ns_string!("Анимация в менюбаре"),
+                    ns_string!("Menu bar animation"),
                 ),
             ] {
                 let toggle = NSSwitch::initWithFrame(
@@ -618,7 +648,7 @@ impl MenuController {
             // SAFETY: This target and selector remain valid for the window's lifetime.
             let login_button = unsafe {
                 NSButton::buttonWithTitle_target_action(
-                    ns_string!("Открыть настройки входа…"),
+                    ns_string!("Open Login Items Settings…"),
                     Some(self),
                     Some(sel!(openLoginSettings:)),
                     self.mtm(),
@@ -676,13 +706,11 @@ impl MenuController {
         if let Some(note) = state.login_note.get() {
             note.setToolTip(None);
             note.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            note.setStringValue(ns_string!("Открывать Codex Notify автоматически"));
+            note.setStringValue(ns_string!("Open Codex Notify automatically"));
             if status == settings::LoginStatus::RequiresApproval {
-                note.setStringValue(ns_string!("Разрешите автозапуск в настройках macOS"));
+                note.setStringValue(ns_string!("Allow launch at login in macOS settings"));
             } else if status == settings::LoginStatus::Unavailable {
-                note.setStringValue(ns_string!(
-                    "Автозапуск недоступен для этой копии приложения"
-                ));
+                note.setStringValue(ns_string!("Launch at login is unavailable for this copy"));
             }
         }
         if let Some(button) = state.login_settings_button.get() {
@@ -700,12 +728,12 @@ impl MenuController {
             };
             let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
                 ns_string!("sparkles.rectangle.stack"),
-                Some(ns_string!("Сессии Codex")),
+                Some(ns_string!("Codex Sessions")),
             )
             .or_else(|| {
                 NSImage::imageWithSystemSymbolName_accessibilityDescription(
                     ns_string!("rectangle.stack"),
-                    Some(ns_string!("Сессии Codex")),
+                    Some(ns_string!("Codex Sessions")),
                 )
             });
             if let Some(image) = image {
@@ -869,11 +897,11 @@ impl MenuController {
             center_label(label, badge_y + 6.0);
         }
         let tooltip = if working {
-            "Сессии Codex · Работает".to_owned()
+            "Codex Sessions · Working".to_owned()
         } else if count == 0 {
-            "Сессии Codex".to_owned()
+            "Codex Sessions".to_owned()
         } else {
-            format!("Сессии Codex · Ожидают подтверждения: {count}")
+            format!("Codex Sessions · Pending approvals: {count}")
         };
         button.setToolTip(Some(&NSString::from_str(&tooltip)));
     }
@@ -926,8 +954,8 @@ impl MenuController {
         let caption = self.label(&toolbar, "", rect(20.0, 7.0, 286.0, 18.0), 10.0, 0.0, true);
         caption.setHidden(true);
         for (symbol, action, x, tooltip) in [
-            ("gearshape", sel!(settings:), 324.0, "Настройки"),
-            ("power", sel!(quit:), 356.0, "Завершить Codex Notify"),
+            ("gearshape", sel!(settings:), 324.0, "Settings"),
+            ("power", sel!(quit:), 356.0, "Quit Codex Notify"),
         ] {
             let button =
                 self.action_button(&toolbar, "", action, "", rect(x, 4.0, 24.0, 24.0), false);
@@ -1263,8 +1291,8 @@ impl MenuController {
         let viewport = area(list.convertRect_fromView(clip.bounds(), Some(&clip)));
         let p = list.convertPoint_fromView(point, None);
         let button_area = |item: &ButtonHover| {
-            if item.button.isEnabled() {
-                area(list.convertRect_fromView(item.button.bounds(), Some(&item.button)))
+            if item.button.isEnabled() && !item.button.isHiddenOrHasHiddenAncestor() {
+                area(list.convertRect_fromView(item.button.visibleRect(), Some(&item.button)))
             } else {
                 pointer::Area {
                     x: 0.0,
@@ -1471,7 +1499,7 @@ impl MenuController {
                 let gap = if group.is_some() { 6.0 } else { 0.0 };
                 y += gap;
                 let name = if session.client == Client::Unknown {
-                    "Другие приложения"
+                    "Other Apps"
                 } else {
                     session.client.label()
                 };
@@ -1507,7 +1535,7 @@ impl MenuController {
                     .map(|request| request.body.as_str())
                     .unwrap_or(&session.last_message);
                 let text = if text.is_empty() {
-                    "Сообщений пока нет"
+                    "No messages yet"
                 } else {
                     text
                 };
@@ -1532,15 +1560,19 @@ impl MenuController {
             };
             let detail_height = detail
                 .as_ref()
-                .map(|(_, height)| height + 16.0)
+                .map(|(_, height)| {
+                    height
+                        + 16.0
+                        + if session.approval.is_some() {
+                            40.0
+                        } else {
+                            0.0
+                        }
+                })
                 .unwrap_or(0.0);
             let height = 48.0 + detail_height;
             let row = SessionRowView::create(self.mtm(), rect(12.0, y, 372.0, height));
-            let text_width = if session.approval.is_some() {
-                196.0
-            } else {
-                274.0
-            };
+            let text_width = 274.0;
             let title = self.label(
                 &row,
                 &session.title,
@@ -1573,7 +1605,7 @@ impl MenuController {
                 true,
             );
             open.setToolTip(Some(&NSString::from_str(&format!(
-                "{} · {}\n{}\nОткрыть проект в VS Code",
+                "{} · {}\n{}\nOpen project in VS Code",
                 session.title,
                 session.client.label(),
                 session.cwd.display()
@@ -1589,7 +1621,7 @@ impl MenuController {
             let mut arrow_icon = None;
             if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
                 ns_string!("chevron.right"),
-                Some(ns_string!("Подробности сессии")),
+                Some(ns_string!("Session details")),
             ) {
                 image.setTemplate(true);
                 // SAFETY: This NSView subclass has no ivars or custom initialization.
@@ -1605,22 +1637,10 @@ impl MenuController {
             }
             arrow.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
             arrow.setToolTip(Some(if is_expanded {
-                ns_string!("Свернуть")
+                ns_string!("Collapse")
             } else {
-                ns_string!("Показать подробности")
+                ns_string!("Show details")
             }));
-            if let Some(request) = &session.approval {
-                let allow = self.action_button(
-                    &row,
-                    "Allow",
-                    sel!(allowSession:),
-                    &request.response.to_string_lossy(),
-                    rect(232.0, height - 29.0, 70.0, 28.0),
-                    false,
-                );
-                allow.setBordered(false);
-                allow.setBezelStyle(NSBezelStyle::Push);
-            }
             // Header controls remain pinned to the top while the detail grows below.
             let header_children = row.subviews();
             for index in 0..header_children.count() {
@@ -1629,7 +1649,7 @@ impl MenuController {
                     .setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
             }
             let mut detail_clip = None;
-            if let Some((label, _)) = detail {
+            if let Some((label, text_height)) = detail {
                 // The clip only reveals content; the main list is the sole scroller.
                 // SAFETY: NSClipView initializes this ivar-free subclass.
                 let clip: Retained<RevealClipView> = unsafe {
@@ -1642,6 +1662,17 @@ impl MenuController {
                 };
                 label.setFrameOrigin(NSPoint::new(26.0, 8.0));
                 document.addSubview(&label);
+                if let Some(request) = &session.approval {
+                    let allow = self.action_button(
+                        &document,
+                        "Allow",
+                        sel!(allowSession:),
+                        &request.response.to_string_lossy(),
+                        rect(274.0, text_height + 16.0, 70.0, 28.0),
+                        false,
+                    );
+                    allow.setBezelStyle(NSBezelStyle::Push);
+                }
                 self.separator(&document, detail_height - 1.0, 332.0);
                 clip.setDocumentView(Some(&document));
                 row.addSubview(&clip);
@@ -1757,7 +1788,7 @@ impl MenuController {
                 state.all.borrow_mut().clear();
                 self.filter();
                 if let Some(caption) = state.caption.get() {
-                    caption.setStringValue(ns_string!("Не удалось обновить сессии"));
+                    caption.setStringValue(ns_string!("Could not refresh sessions"));
                     caption.setHidden(false);
                 }
             }
@@ -1770,7 +1801,8 @@ impl MenuController {
         let visible = state.all.borrow().clone();
         let count = visible.len();
         let previous = state.visible.borrow();
-        let changed = previous.len() != visible.len()
+        let changed = state.expand_approvals(&visible)
+            || previous.len() != visible.len()
             || previous.iter().zip(&visible).any(|(a, b)| {
                 a.id != b.id
                     || a.title != b.title
@@ -1786,11 +1818,7 @@ impl MenuController {
             *state.visible.borrow_mut() = visible;
         }
         if let Some(caption) = state.caption.get() {
-            let text = if count == 0 {
-                "Нет открытых сессий"
-            } else {
-                ""
-            };
+            let text = if count == 0 { "No open sessions" } else { "" };
             caption.setStringValue(&NSString::from_str(text));
             caption.setHidden(text.is_empty());
         }
@@ -1873,6 +1901,74 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<bool> {
 #[cfg(test)]
 mod close_tests {
     use super::*;
+
+    fn session(id: &str, approval: Option<&str>) -> Session {
+        Session {
+            id: id.into(),
+            title: id.into(),
+            cwd: "/project".into(),
+            updated_at: 0,
+            client: Client::VSCode,
+            activity: if approval.is_some() {
+                Activity::Confirmation
+            } else {
+                Activity::Idle
+            },
+            last_message: String::new(),
+            approval: approval.map(|path| pending::Request {
+                session_id: id.into(),
+                body: "Подтверждение".into(),
+                response: path.into(),
+                expires: u64::MAX,
+            }),
+        }
+    }
+
+    #[test]
+    fn approvals_expand_on_open_and_after_async_discovery_but_respect_manual_collapse() {
+        let state = State::default();
+        let mut sessions = vec![
+            session("waiting", Some("/tmp/request-one/response")),
+            session("idle", None),
+        ];
+        assert!(!state.expand_approvals(&sessions));
+        state.menu_open.set(true);
+        assert!(state.expand_approvals(&sessions));
+        assert_eq!(*state.expanded.borrow(), HashSet::from(["waiting".into()]));
+        state.expanded.borrow_mut().remove("waiting");
+        state.reveal.borrow_mut().insert("waiting".into(), 0.0);
+        assert!(!state.expand_approvals(&sessions));
+        assert!(!state.expanded.borrow().contains("waiting"));
+        sessions.push(session("late", Some("/tmp/request-two/response")));
+        assert!(state.expand_approvals(&sessions));
+        assert!(state.expanded.borrow().contains("late"));
+        assert!(!state.expanded.borrow().contains("waiting"));
+        state.menu_open.set(false);
+        state.reset_disclosures();
+        state.menu_open.set(true);
+        assert!(state.expand_approvals(&sessions));
+        assert!(state.expanded.borrow().contains("waiting"));
+    }
+
+    #[test]
+    fn a_new_request_in_the_same_session_stays_expanded_during_an_existing_animation() {
+        let state = State::default();
+        state.menu_open.set(true);
+        state.expand_approvals(&[session("chat", Some("/tmp/first/response"))]);
+        state.expanded.borrow_mut().remove("chat");
+        let now = Instant::now();
+        *state.motion.borrow_mut() = Some(motion::Disclosure::new(
+            HashMap::from([("chat".into(), 1.0), ("other".into(), 0.0)]),
+            HashMap::from([("chat".into(), 0.0), ("other".into(), 1.0)]),
+            now,
+        ));
+        assert!(state.expand_approvals(&[session("chat", Some("/tmp/second/response"))]));
+        let motion = state.motion.borrow();
+        let (sample, _) = motion.as_ref().unwrap().sample(now + motion::DURATION / 2);
+        assert_eq!(sample["chat"], 1.0);
+        assert!(sample["other"] > 0.0 && sample["other"] < 1.0);
+    }
+
     #[test]
     fn closing_mid_animation_collapses_every_session_and_invalidates_queued_frames() {
         let state = State::default();
@@ -1895,5 +1991,6 @@ mod close_tests {
         assert!(state.expanded.borrow().is_empty());
         assert!(state.reveal.borrow().is_empty());
         assert!(state.motion.borrow().is_none());
+        assert!(state.opened_approvals.borrow().is_empty());
     }
 }

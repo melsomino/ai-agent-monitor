@@ -281,9 +281,9 @@ pub fn run(command: NativeCommand) -> Result<()> {
                 }
                 send(
                     &Message {
-                        title: "Уведомления готовы".into(),
+                        title: "Notifications are ready".into(),
                         subtitle: String::new(),
-                        body: "Сообщу, когда агенту понадобится разрешение.".into(),
+                        body: "You will be notified when an agent needs approval.".into(),
                         target: String::new(),
                     },
                     None,

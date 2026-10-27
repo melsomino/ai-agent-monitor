@@ -15,6 +15,10 @@ impl Disclosure {
     pub fn new(from: HashMap<String, f64>, to: HashMap<String, f64>, started: Instant) -> Self {
         Self { from, to, started }
     }
+    pub fn show(&mut self, id: &str) {
+        self.from.insert(id.to_owned(), 1.0);
+        self.to.insert(id.to_owned(), 1.0);
+    }
     pub fn sample(&self, now: Instant) -> (HashMap<String, f64>, bool) {
         let t = (now.saturating_duration_since(self.started).as_secs_f64()
             / DURATION.as_secs_f64())

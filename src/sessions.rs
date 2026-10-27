@@ -19,7 +19,7 @@ pub fn open(home: &Path) -> Result<Vec<Session>> {
     let (status, output, errors) = output_with_timeout(&mut command, Duration::from_secs(3))?;
     anyhow::ensure!(
         status == Some(0) || (status == Some(1) && errors.trim().is_empty()),
-        "Не удалось прочитать открытые сессии Codex: {}",
+        "Could not read open Codex sessions: {}",
         errors.trim()
     );
     let files = open_files(&output, home);
@@ -153,7 +153,7 @@ pub enum Client {
 impl Client {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Terminal => "Терминал",
+            Self::Terminal => "Terminal",
             Self::VSCode => "VS Code",
             Self::Desktop => "Codex",
             Self::Unknown => "Codex",
@@ -171,10 +171,10 @@ pub enum Activity {
 impl Activity {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Working => "Работает",
-            Self::Idle => "Ожидает",
-            Self::Confirmation => "Подтверждение",
-            Self::Unknown => "Статус неизвестен",
+            Self::Working => "Working",
+            Self::Idle => "Idle",
+            Self::Confirmation => "Needs approval",
+            Self::Unknown => "Unknown status",
         }
     }
 }
@@ -243,9 +243,9 @@ fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
         "Unsupported session database schema"
     );
     let title = if has("name") {
-        "COALESCE(NULLIF(TRIM(name), ''), NULLIF(TRIM(title), ''), 'Без названия')"
+        "COALESCE(NULLIF(TRIM(name), ''), NULLIF(TRIM(title), ''), 'Untitled')"
     } else {
-        "COALESCE(NULLIF(TRIM(title), ''), 'Без названия')"
+        "COALESCE(NULLIF(TRIM(title), ''), 'Untitled')"
     };
     let cwd = if has("cwd") {
         "COALESCE(cwd, '')"
@@ -466,7 +466,7 @@ mod tests {
         )
         .unwrap();
         let sessions = read_open(home.path(), &ids).unwrap();
-        assert_eq!(sessions[0].title, "Без названия");
+        assert_eq!(sessions[0].title, "Untitled");
         assert_eq!(sessions[0].updated_at, 0);
         assert!(read_open(home.path(), &HashSet::new()).unwrap().is_empty());
     }
