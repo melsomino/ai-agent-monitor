@@ -82,6 +82,7 @@ struct State {
     content_height: Cell<f64>,
     expanded: RefCell<HashSet<String>>,
     opened_approvals: RefCell<HashSet<String>>,
+    opened_working: RefCell<HashSet<String>>,
     reveal: RefCell<HashMap<String, f64>>,
     motion: RefCell<Option<motion::Disclosure>>,
     animation_epoch: Cell<u64>,
@@ -108,20 +109,25 @@ impl State {
         self.expanded.borrow_mut().clear();
         self.reveal.borrow_mut().clear();
         self.opened_approvals.borrow_mut().clear();
+        self.opened_working.borrow_mut().clear();
     }
 
-    fn expand_approvals(&self, sessions: &[Session]) -> bool {
+    fn expand_active_sessions(&self, sessions: &[Session]) -> bool {
         if !self.menu_open.get() {
             return false;
         }
         let mut changed = false;
         for session in sessions {
-            if let Some(request) = &session.approval
-                && self
-                    .opened_approvals
+            let newly_active = if let Some(request) = &session.approval {
+                self.opened_approvals
                     .borrow_mut()
                     .insert(request.response.to_string_lossy().into_owned())
-            {
+            } else if session.activity == Activity::Working {
+                self.opened_working.borrow_mut().insert(session.id.clone())
+            } else {
+                false
+            };
+            if newly_active {
                 self.expanded.borrow_mut().insert(session.id.clone());
                 self.reveal.borrow_mut().insert(session.id.clone(), 1.0);
                 if let Some(motion) = self.motion.borrow_mut().as_mut() {
@@ -168,7 +174,7 @@ define_class!(
             // tracking ends, reopening the menu instead of closing it.
             self.ivars().shortcut_registration.borrow_mut().take();
             self.receive_sessions();
-            if self.ivars().expand_approvals(&self.ivars().all.borrow()) {
+            if self.ivars().expand_active_sessions(&self.ivars().all.borrow()) {
                 self.render_rows(&self.ivars().all.borrow());
             }
             self.refresh();
@@ -2123,7 +2129,7 @@ impl MenuController {
         let visible = state.all.borrow().clone();
         let count = visible.len();
         let previous = state.visible.borrow();
-        let changed = state.expand_approvals(&visible)
+        let changed = state.expand_active_sessions(&visible)
             || previous.len() != visible.len()
             || previous.iter().zip(&visible).any(|(a, b)| {
                 a.id != b.id
@@ -2247,36 +2253,51 @@ mod close_tests {
     }
 
     #[test]
-    fn approvals_expand_on_open_and_after_async_discovery_but_respect_manual_collapse() {
+    fn active_sessions_expand_on_open_and_after_async_discovery_but_respect_manual_collapse() {
         let state = State::default();
+        let mut working = session("working", None);
+        working.activity = Activity::Working;
+        let mut unknown = session("unknown", None);
+        unknown.activity = Activity::Unknown;
         let mut sessions = vec![
             session("waiting", Some("/tmp/request-one/response")),
             session("idle", None),
+            working,
+            unknown,
         ];
-        assert!(!state.expand_approvals(&sessions));
+        assert!(!state.expand_active_sessions(&sessions));
         state.menu_open.set(true);
-        assert!(state.expand_approvals(&sessions));
-        assert_eq!(*state.expanded.borrow(), HashSet::from(["waiting".into()]));
+        assert!(state.expand_active_sessions(&sessions));
+        assert_eq!(
+            *state.expanded.borrow(),
+            HashSet::from(["waiting".into(), "working".into()])
+        );
         state.expanded.borrow_mut().remove("waiting");
+        state.expanded.borrow_mut().remove("working");
         state.reveal.borrow_mut().insert("waiting".into(), 0.0);
-        assert!(!state.expand_approvals(&sessions));
+        state.reveal.borrow_mut().insert("working".into(), 0.0);
+        assert!(!state.expand_active_sessions(&sessions));
         assert!(!state.expanded.borrow().contains("waiting"));
+        assert!(!state.expanded.borrow().contains("working"));
         sessions.push(session("late", Some("/tmp/request-two/response")));
-        assert!(state.expand_approvals(&sessions));
+        assert!(state.expand_active_sessions(&sessions));
         assert!(state.expanded.borrow().contains("late"));
         assert!(!state.expanded.borrow().contains("waiting"));
         state.menu_open.set(false);
         state.reset_disclosures();
         state.menu_open.set(true);
-        assert!(state.expand_approvals(&sessions));
+        assert!(state.expand_active_sessions(&sessions));
         assert!(state.expanded.borrow().contains("waiting"));
+        assert!(state.expanded.borrow().contains("working"));
+        assert!(!state.expanded.borrow().contains("idle"));
+        assert!(!state.expanded.borrow().contains("unknown"));
     }
 
     #[test]
     fn a_new_request_in_the_same_session_stays_expanded_during_an_existing_animation() {
         let state = State::default();
         state.menu_open.set(true);
-        state.expand_approvals(&[session("chat", Some("/tmp/first/response"))]);
+        state.expand_active_sessions(&[session("chat", Some("/tmp/first/response"))]);
         state.expanded.borrow_mut().remove("chat");
         let now = Instant::now();
         *state.motion.borrow_mut() = Some(motion::Disclosure::new(
@@ -2284,7 +2305,7 @@ mod close_tests {
             HashMap::from([("chat".into(), 0.0), ("other".into(), 1.0)]),
             now,
         ));
-        assert!(state.expand_approvals(&[session("chat", Some("/tmp/second/response"))]));
+        assert!(state.expand_active_sessions(&[session("chat", Some("/tmp/second/response"))]));
         let motion = state.motion.borrow();
         let (sample, _) = motion.as_ref().unwrap().sample(now + motion::DURATION / 2);
         assert_eq!(sample["chat"], 1.0);
@@ -2314,5 +2335,6 @@ mod close_tests {
         assert!(state.reveal.borrow().is_empty());
         assert!(state.motion.borrow().is_none());
         assert!(state.opened_approvals.borrow().is_empty());
+        assert!(state.opened_working.borrow().is_empty());
     }
 }
