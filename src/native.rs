@@ -9,7 +9,10 @@ use objc2::{
     rc::Retained,
     runtime::{Bool, ProtocolObject},
 };
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSWorkspace};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
+    NSRunningApplication, NSWorkspace,
+};
 use objc2_foundation::{
     NSArray, NSDictionary, NSError, NSObject, NSObjectProtocol, NSSet, NSString, NSURL, ns_string,
 };
@@ -17,18 +20,26 @@ use objc2_user_notifications::*;
 use std::{path::Path, ptr::NonNull};
 
 pub fn open_target(value: &str) -> bool {
-    let Ok(url) = url::Url::parse(value) else {
+    let Some(path) = core::vscode_path(value) else {
         return false;
     };
-    if url.scheme() != "vscode"
-        || url.host_str() != Some("file")
-        || !url.path().starts_with('/')
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return false;
+    if !path.exists() {
+        // A loaded chat can outlive its deleted worktree. Focus VS Code without
+        // asking it to open a path that would produce a "Path does not exist" dialog.
+        let applications = NSRunningApplication::runningApplicationsWithBundleIdentifier(
+            ns_string!("com.microsoft.VSCode"),
+        );
+        for index in 0..applications.count() {
+            if applications
+                .objectAtIndex(index)
+                .activateWithOptions(NSApplicationActivationOptions::empty())
+            {
+                return true;
+            }
+        }
+        return NSWorkspace::sharedWorkspace()
+            .URLForApplicationWithBundleIdentifier(ns_string!("com.microsoft.VSCode"))
+            .is_some_and(|url| NSWorkspace::sharedWorkspace().openURL(&url));
     }
     let Some(url) = NSURL::URLWithString(&NSString::from_str(value)) else {
         return false;

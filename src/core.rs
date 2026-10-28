@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     env, fs,
     io::{self, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -128,6 +129,12 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 }
 
 pub fn vscode_target(event: &Value, storage: &Path) -> String {
+    if let Some(id) = event["session_id"].as_str() {
+        let ids = HashSet::from([id.to_owned()]);
+        if let Some(workspace) = crate::vscode::workspaces(&ids, storage).remove(id) {
+            return vscode_file_target(&workspace);
+        }
+    }
     let Some(cwd) = event["cwd"]
         .as_str()
         .map(PathBuf::from)
@@ -173,7 +180,11 @@ pub fn vscode_target(event: &Value, storage: &Path) -> String {
         .max_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
         .map(|item| item.2)
         .unwrap_or(cwd);
-    Url::from_file_path(target)
+    vscode_file_target(&target)
+}
+
+pub fn vscode_file_target(path: &Path) -> String {
+    Url::from_file_path(path)
         .map(|url| {
             format!(
                 "vscode://file{}",
@@ -181,6 +192,24 @@ pub fn vscode_target(event: &Value, storage: &Path) -> String {
             )
         })
         .unwrap_or_default()
+}
+
+pub fn vscode_path(value: &str) -> Option<PathBuf> {
+    let url = Url::parse(value).ok()?;
+    if url.scheme() != "vscode"
+        || url.host_str() != Some("file")
+        || !url.path().starts_with('/')
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    Url::parse(&format!("file://{}", url.path()))
+        .ok()?
+        .to_file_path()
+        .ok()
 }
 
 #[derive(Debug)]

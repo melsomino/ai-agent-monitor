@@ -4,11 +4,13 @@ use rusqlite::{Connection, OpenFlags};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{BufReader, Read, Seek, SeekFrom},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub fn open(home: &Path) -> Result<Vec<Session>> {
@@ -39,10 +41,21 @@ pub fn open(home: &Path) -> Result<Vec<Session>> {
             session.activity = Activity::Confirmation;
         }
     }
+    let vscode_ids = sessions
+        .iter()
+        .filter(|session| session.client == Client::VSCode)
+        .map(|session| session.id.clone())
+        .collect();
+    let storage =
+        crate::core::home().join("Library/Application Support/Code/User/workspaceStorage");
+    let mut workspaces = crate::vscode::workspaces(&vscode_ids, &storage);
+    for session in &mut sessions {
+        session.workspace = workspaces.remove(&session.id);
+    }
     Ok(sessions)
 }
 
-fn output_with_timeout(
+pub(crate) fn output_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<(Option<i32>, String, String)> {
@@ -184,11 +197,26 @@ pub struct Session {
     pub id: String,
     pub title: String,
     pub cwd: PathBuf,
+    pub workspace: Option<PathBuf>,
     pub updated_at: i64,
     pub client: Client,
     pub activity: Activity,
     pub last_message: String,
     pub approval: Option<crate::pending::Request>,
+}
+
+impl Session {
+    pub fn project_path(&self) -> &Path {
+        self.workspace.as_deref().unwrap_or(&self.cwd)
+    }
+
+    pub fn vscode_target(&self, storage: &Path) -> String {
+        if let Some(workspace) = &self.workspace {
+            crate::core::vscode_file_target(workspace)
+        } else {
+            crate::core::vscode_target(&serde_json::json!({"cwd": self.cwd}), storage)
+        }
+    }
 }
 
 fn read_open(home: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
@@ -275,6 +303,7 @@ fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 cwd: PathBuf::from(row.get::<_, String>(2)?),
+                workspace: None,
                 updated_at: row.get(3)?,
                 client: Client::Unknown,
                 activity: Activity::Unknown,
@@ -309,9 +338,10 @@ fn enrich(session: &mut Session, path: &Path) {
             }
         };
     }
-    let Ok(length) = file.metadata().map(|m| m.len()) else {
+    let Ok(metadata) = file.metadata() else {
         return;
     };
+    let length = metadata.len();
     let start = length.saturating_sub(4 * 1024 * 1024);
     if file.seek(SeekFrom::Start(start)).is_err() {
         return;
@@ -319,11 +349,184 @@ fn enrich(session: &mut Session, path: &Path) {
     let mut tail = String::new();
     // Read bytes so a seek into a multibyte character does not invalidate the tail.
     let mut bytes = Vec::new();
-    if file.take(4 * 1024 * 1024).read_to_end(&mut bytes).is_err() {
+    if (&mut file)
+        .take(length - start)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 != length - start
+    {
         return;
     }
     tail.push_str(&String::from_utf8_lossy(&bytes));
+    session.activity = Activity::Unknown;
     parse_events(session, &tail);
+    session.activity =
+        recover_activity(&mut file, path, &metadata, start, &bytes, session.activity);
+}
+
+#[derive(Clone, Copy)]
+struct ActivityCheckpoint {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: Option<SystemTime>,
+    complete_end: u64,
+    anchor_end: u64,
+    anchor: [u8; 128],
+    activity: Activity,
+}
+
+static ACTIVITY_CACHE: OnceLock<Mutex<HashMap<PathBuf, ActivityCheckpoint>>> = OnceLock::new();
+
+fn recover_activity(
+    file: &mut fs::File,
+    path: &Path,
+    metadata: &fs::Metadata,
+    tail_start: u64,
+    tail: &[u8],
+    activity: Activity,
+) -> Activity {
+    let cache = ACTIVITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let previous = cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(path)
+        .copied();
+    let previous = previous.filter(|checkpoint| {
+        checkpoint.device == metadata.dev()
+            && checkpoint.inode == metadata.ino()
+            && (metadata.len() > checkpoint.length
+                || (metadata.len() == checkpoint.length
+                    && metadata.modified().ok() == checkpoint.modified))
+            && activity_anchor(file, checkpoint.anchor_end)
+                .is_ok_and(|bytes| bytes == checkpoint.anchor)
+    });
+    let lower = previous
+        .map(|checkpoint| checkpoint.complete_end)
+        .unwrap_or(0);
+    let complete_end = tail
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| tail_start + index as u64 + 1)
+        .unwrap_or(lower);
+    let activity = if activity != Activity::Unknown {
+        activity
+    } else {
+        // Include the record crossing the 4 MiB boundary: it may itself be a
+        // large completion event. New data outside the tail must also be checked
+        // before using a checkpoint; a single tool output can exceed 4 MiB.
+        let search_end = tail
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| tail_start + index as u64 + 1)
+            .unwrap_or(metadata.len());
+        let found = if search_end > lower {
+            match last_activity_before(file, search_end, lower) {
+                Ok(activity) => activity,
+                Err(_) => return Activity::Unknown,
+            }
+        } else {
+            None
+        };
+        found
+            .or(previous.map(|checkpoint| checkpoint.activity))
+            .unwrap_or(Activity::Unknown)
+    };
+    let anchor_end = if complete_end > 0 {
+        complete_end
+    } else {
+        metadata.len().min(128)
+    };
+    let Ok(anchor) = activity_anchor(file, anchor_end) else {
+        return activity;
+    };
+    let checkpoint = ActivityCheckpoint {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        complete_end,
+        anchor_end,
+        anchor,
+        activity,
+    };
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if cache.len() >= 512 && !cache.contains_key(path) {
+        cache.clear();
+    }
+    cache.insert(path.to_owned(), checkpoint);
+    activity
+}
+
+fn activity_anchor(file: &mut fs::File, end: u64) -> std::io::Result<[u8; 128]> {
+    let start = end.saturating_sub(128);
+    let mut bytes = [0; 128];
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut bytes[..(end - start) as usize])?;
+    Ok(bytes)
+}
+
+#[derive(serde::Deserialize)]
+struct ActivityRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: ActivityPayload,
+}
+
+#[derive(serde::Deserialize)]
+struct ActivityPayload {
+    #[serde(rename = "type", default)]
+    kind: String,
+}
+
+fn activity_record(file: &mut fs::File, start: u64, end: u64) -> std::io::Result<Option<Activity>> {
+    file.seek(SeekFrom::Start(start))?;
+    // The small typed envelope ignores message/tool contents while streaming;
+    // even an oversized JSONL record does not allocate its output as a String.
+    let reader = BufReader::new((&mut *file).take(end - start));
+    let Ok(record) = serde_json::from_reader::<_, ActivityRecord>(reader) else {
+        return Ok(None);
+    };
+    Ok(if record.kind == "event_msg" {
+        match record.payload.kind.as_str() {
+            "task_started" | "turn_started" => Some(Activity::Working),
+            "task_complete" | "turn_complete" | "turn_aborted" => Some(Activity::Idle),
+            _ => None,
+        }
+    } else {
+        None
+    })
+}
+
+fn last_activity_before(
+    file: &mut fs::File,
+    end: u64,
+    lower: u64,
+) -> std::io::Result<Option<Activity>> {
+    let mut buffer = vec![0; 64 * 1024];
+    let mut position = end;
+    let mut record_end = end;
+    while position > lower {
+        let start = position.saturating_sub(buffer.len() as u64).max(lower);
+        let count = (position - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..count])?;
+        for index in (0..count).rev().filter(|index| buffer[*index] == b'\n') {
+            let newline = start + index as u64;
+            if newline + 1 < record_end
+                && let Some(activity) = activity_record(file, newline + 1, record_end)?
+            {
+                return Ok(Some(activity));
+            }
+            record_end = newline;
+        }
+        position = start;
+    }
+    if record_end > lower {
+        activity_record(file, lower, record_end)
+    } else {
+        Ok(None)
+    }
 }
 
 fn parse_events(session: &mut Session, tail: &str) {
@@ -367,6 +570,63 @@ fn parse_events(session: &mut Session, tail: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn activity_survives_oversized_records_and_cached_gaps_without_guessing_from_tool_output() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("large.jsonl");
+        let mut session = Session {
+            id: "one".into(),
+            title: "Chat".into(),
+            cwd: PathBuf::new(),
+            workspace: None,
+            updated_at: 0,
+            client: Client::Unknown,
+            activity: Activity::Unknown,
+            last_message: String::new(),
+            approval: None,
+        };
+        let oversized = serde_json::json!({"type":"response_item", "payload":{
+            "type":"function_call_output", "output": "x".repeat(5 * 1024 * 1024)
+                + r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#
+        }})
+        .to_string();
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"event_msg","payload":{{"type":"task_started"}}}}"#
+        )
+        .unwrap();
+        writeln!(file, "{oversized}").unwrap();
+        file.flush().unwrap();
+        enrich(&mut session, &path);
+        assert_eq!(session.activity, Activity::Working);
+
+        // A new completion also falls outside the tail. A previous cached
+        // Working state must not hide that completion after a large append.
+        writeln!(
+            file,
+            r#"{{"type":"event_msg","payload":{{"type":"task_complete"}}}}"#
+        )
+        .unwrap();
+        writeln!(file, "{oversized}").unwrap();
+        file.flush().unwrap();
+        enrich(&mut session, &path);
+        assert_eq!(session.activity, Activity::Idle);
+
+        // Truncation invalidates the checkpoint rather than reusing Idle.
+        fs::write(
+            &path,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_started\"}}\n",
+        )
+        .unwrap();
+        enrich(&mut session, &path);
+        assert_eq!(session.activity, Activity::Working);
+        fs::write(&path, format!("{oversized}\n")).unwrap();
+        enrich(&mut session, &path);
+        assert_eq!(session.activity, Activity::Unknown);
+    }
 
     #[test]
     fn reads_activity_and_last_assistant_message_without_tool_output() {
@@ -374,6 +634,7 @@ mod tests {
             id: "one".into(),
             title: "Chat".into(),
             cwd: PathBuf::new(),
+            workspace: None,
             updated_at: 0,
             client: Client::Unknown,
             activity: Activity::Unknown,

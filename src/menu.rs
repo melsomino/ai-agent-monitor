@@ -244,8 +244,7 @@ define_class!(
             let Some(id) = sender.and_then(|button| button.identifier()) else { return; };
             let data = self.ivars().all.borrow();
             if let Some(session) = data.iter().find(|session| session.id == id.to_string()) {
-                let target = core::vscode_target(&serde_json::json!({"cwd":session.cwd}),
-                    &core::home().join("Library/Application Support/Code/User/workspaceStorage"));
+                let target = session.vscode_target(&core::home().join("Library/Application Support/Code/User/workspaceStorage"));
                 self.dismiss_menu();
                 native::open_target(&target);
             }
@@ -1911,7 +1910,7 @@ impl MenuController {
             );
             center_label(&title, height - 15.0);
             let project = session
-                .cwd
+                .project_path()
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
@@ -1933,10 +1932,15 @@ impl MenuController {
                 true,
             );
             open.setToolTip(Some(&NSString::from_str(&format!(
-                "{} · {}\n{}\nOpen project in VS Code",
+                "{} · {}\n{}\n{}",
                 session.title,
                 session.client.label(),
-                session.cwd.display()
+                session.project_path().display(),
+                if session.project_path().exists() {
+                    "Open project in VS Code"
+                } else {
+                    "Folder no longer exists. Switch to VS Code."
+                }
             ))));
             let arrow = self.action_button(
                 &row,
@@ -2135,6 +2139,7 @@ impl MenuController {
                 a.id != b.id
                     || a.title != b.title
                     || a.cwd != b.cwd
+                    || a.workspace != b.workspace
                     || a.client != b.client
                     || a.activity != b.activity
                     || a.last_message != b.last_message
@@ -2235,6 +2240,7 @@ mod close_tests {
             id: id.into(),
             title: id.into(),
             cwd: "/project".into(),
+            workspace: None,
             updated_at: 0,
             client: Client::VSCode,
             activity: if approval.is_some() {

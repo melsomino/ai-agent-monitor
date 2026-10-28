@@ -17,6 +17,7 @@ mod settings;
 #[cfg(test)]
 mod tests;
 mod tools;
+mod vscode;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -57,7 +58,7 @@ fn run(command: Option<Command>) -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "sessions": sessions.iter().map(|session| serde_json::json!({
-                        "id":session.id,"title":session.title,"cwd":session.cwd,"updatedAt":session.updated_at,
+                        "id":session.id,"title":session.title,"cwd":session.cwd,"workspace":session.workspace,"updatedAt":session.updated_at,
                         "client":session.client.label(),"status":session.activity.label(),"lastMessage":session.last_message,
                         "approval":session.approval.as_ref().map(|request| serde_json::json!({"body":request.body,"expiresAt":request.expires}))
                     })).collect::<Vec<_>>()

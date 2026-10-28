@@ -183,6 +183,30 @@ fn target_falls_back_to_cwd_and_ignores_remote_or_invalid_cache() {
 }
 
 #[test]
+fn vscode_paths_decode_local_targets_and_distinguish_deleted_folders_from_invalid_urls() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("removed worktree #1 %");
+    let value = target(&path);
+    assert_eq!(core::vscode_path(&value), Some(path.clone()));
+    assert!(!core::vscode_path(&value).unwrap().exists());
+    fs::create_dir(&path).unwrap();
+    assert!(core::vscode_path(&value).unwrap().is_dir());
+    fs::remove_dir(&path).unwrap();
+    assert!(!core::vscode_path(&value).unwrap().exists());
+    for invalid in [
+        "",
+        "https://example.com",
+        "vscode://remote/work",
+        "vscode://file",
+        "vscode://user@file/work",
+        "vscode://file/work?command=example",
+        "vscode://file/work#fragment",
+    ] {
+        assert!(core::vscode_path(invalid).is_none());
+    }
+}
+
+#[test]
 fn only_explicit_allow_emits_one_time_decision_and_tests_never_grant_access() {
     assert!(core::decision(None, false).is_none());
     assert!(core::decision(Some(Action::Open), false).is_none());
