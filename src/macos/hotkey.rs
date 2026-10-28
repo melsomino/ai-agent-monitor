@@ -241,9 +241,9 @@ unsafe extern "C" fn pressed(_: *mut c_void, event: *mut c_void, _: *mut c_void)
         return -9874;
     }
     if MainThreadMarker::new().is_some() {
-        crate::menu::toggle_from_hotkey();
+        crate::macos::menu::toggle_from_hotkey();
     } else {
-        dispatch2::DispatchQueue::main().exec_async(crate::menu::toggle_from_hotkey);
+        dispatch2::DispatchQueue::main().exec_async(crate::macos::menu::toggle_from_hotkey);
     }
     0
 }

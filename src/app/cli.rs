@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 /// Native macOS notifications for Codex approval requests.
 #[derive(Debug, Parser)]
-#[command(name = "CodexNotify", version)]
+#[command(name = "AIAgentMonitor", version)]
 pub struct Cli {
     // No command is intentional: macOS relaunches the app this way on a click.
     #[command(subcommand)]
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn no_arguments_preserves_notification_click_launch() {
         assert!(
-            Cli::try_parse_from(["CodexNotify"])
+            Cli::try_parse_from(["AIAgentMonitor"])
                 .unwrap()
                 .command
                 .is_none()
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn native_sender_preserves_empty_fields_and_flag_like_text() {
         let cli = Cli::try_parse_from([
-            "CodexNotify",
+            "AIAgentMonitor",
             "--send-approval",
             "--help",
             "",
@@ -139,21 +139,26 @@ mod tests {
     #[test]
     fn legacy_flags_and_subcommands_select_the_same_operations() {
         for command in ["test", "--test"] {
-            let cli =
-                Cli::try_parse_from(["CodexNotify", command, "--approval", "--session-id", "one"])
-                    .unwrap();
+            let cli = Cli::try_parse_from([
+                "AIAgentMonitor",
+                command,
+                "--approval",
+                "--session-id",
+                "one",
+            ])
+            .unwrap();
             assert!(
                 matches!(cli.command, Some(Command::Test { approval: true, session_id: Some(id) }) if id == "one")
             );
         }
         assert!(matches!(
-            Cli::try_parse_from(["CodexNotify", "--setup"])
+            Cli::try_parse_from(["AIAgentMonitor", "--setup"])
                 .unwrap()
                 .command,
             Some(Command::Setup)
         ));
         assert!(
-            matches!(Cli::try_parse_from(["CodexNotify", "--open-target", "vscode://file/work"]).unwrap().command,
+            matches!(Cli::try_parse_from(["AIAgentMonitor", "--open-target", "vscode://file/work"]).unwrap().command,
                          Some(Command::OpenTarget { target }) if target == "vscode://file/work")
         );
     }
@@ -161,12 +166,12 @@ mod tests {
     #[test]
     fn missing_values_and_unknown_arguments_are_rejected() {
         for args in [
-            vec!["CodexNotify", "install", "--codex-home"],
-            vec!["CodexNotify", "test", "--session-id"],
-            vec!["CodexNotify", "check-hooks", "--binary"],
-            vec!["CodexNotify", "hook", "--approval"],
-            vec!["CodexNotify", "test", "--unknown"],
-            vec!["CodexNotify", "--send", "title"],
+            vec!["AIAgentMonitor", "install", "--codex-home"],
+            vec!["AIAgentMonitor", "test", "--session-id"],
+            vec!["AIAgentMonitor", "check-hooks", "--binary"],
+            vec!["AIAgentMonitor", "hook", "--approval"],
+            vec!["AIAgentMonitor", "test", "--unknown"],
+            vec!["AIAgentMonitor", "--send", "title"],
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }

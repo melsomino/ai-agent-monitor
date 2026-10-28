@@ -75,3 +75,98 @@ mod tests {
         assert_eq!(closing.sample(halfway + DURATION).0["chat"], 0.0);
     }
 }
+
+/// Eight brightness steps for the left and right menu bar eyes.
+/// Repeated discovery updates must not restart the sequence.
+#[derive(Default)]
+pub struct WorkingEyes {
+    active: bool,
+    animate: bool,
+    phase: usize,
+}
+impl WorkingEyes {
+    pub fn update(&mut self, active: bool, animate: bool) {
+        if active && !self.active {
+            self.phase = 0;
+        }
+        self.active = active;
+        self.animate = active && animate;
+    }
+
+    pub fn tick(&mut self) {
+        if self.animate {
+            self.phase = (self.phase + 1) % 8;
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    pub fn levels(&self) -> [f64; 2] {
+        const STEPS: [[f64; 2]; 8] = [
+            [0.5, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.5],
+            [1.0, 1.0],
+            [0.5, 1.0],
+            [0.0, 1.0],
+            [0.0, 0.5],
+            [0.0, 0.0],
+        ];
+        if !self.active {
+            [0.0, 0.0]
+        } else if !self.animate {
+            [1.0, 1.0]
+        } else {
+            STEPS[self.phase]
+        }
+    }
+}
+
+#[cfg(test)]
+mod eyes_tests {
+    use super::WorkingEyes;
+
+    #[test]
+    fn cycles_eight_brightness_steps_without_resetting_on_refresh() {
+        let mut eyes = WorkingEyes::default();
+        assert_eq!(eyes.levels(), [0.0, 0.0]);
+        eyes.update(true, true);
+        for expected in [
+            [0.5, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.5],
+            [1.0, 1.0],
+            [0.5, 1.0],
+            [0.0, 1.0],
+            [0.0, 0.5],
+            [0.0, 0.0],
+            [0.5, 0.0],
+        ] {
+            eyes.update(true, true);
+            assert!(eyes.active());
+            assert_eq!(eyes.levels(), expected);
+            eyes.tick();
+        }
+        eyes.update(false, false);
+        assert!(!eyes.active());
+        eyes.tick();
+        assert_eq!(eyes.levels(), [0.0, 0.0]);
+        eyes.update(true, true);
+        assert_eq!(eyes.levels(), [0.5, 0.0]);
+    }
+
+    #[test]
+    fn disabled_animation_keeps_both_eyes_green_only_while_working() {
+        let mut eyes = WorkingEyes::default();
+        eyes.update(true, false);
+        for _ in 0..10 {
+            eyes.tick();
+            assert_eq!(eyes.levels(), [1.0, 1.0]);
+        }
+        eyes.update(false, false);
+        assert!(!eyes.active());
+        assert_eq!(eyes.levels(), [0.0, 0.0]);
+    }
+}

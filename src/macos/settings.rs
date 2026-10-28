@@ -86,12 +86,12 @@ pub fn set_menu_animation(enabled: bool) {
     NSUserDefaults::standardUserDefaults().setBool_forKey(enabled, ns_string!("AnimateMenuBar"));
 }
 
-pub fn menu_shortcut() -> Option<crate::hotkey::Shortcut> {
+pub fn menu_shortcut() -> Option<crate::macos::hotkey::Shortcut> {
     let value = NSUserDefaults::standardUserDefaults().stringForKey(ns_string!("MenuShortcut"))?;
-    crate::hotkey::Shortcut::decode(&value.to_string())
+    crate::macos::hotkey::Shortcut::decode(&value.to_string())
 }
 
-pub fn set_menu_shortcut(shortcut: Option<&crate::hotkey::Shortcut>) {
+pub fn set_menu_shortcut(shortcut: Option<&crate::macos::hotkey::Shortcut>) {
     let defaults = NSUserDefaults::standardUserDefaults();
     let key = ns_string!("MenuShortcut");
     if let Some(shortcut) = shortcut {

@@ -1,10 +1,10 @@
 [package]
-name = "codex-notify"
+name = "ai-agent-monitor"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "CodexNotify"
+name = "AIAgentMonitor"
 path = "src/main.rs"
 
 [dependencies]
@@ -24,7 +24,7 @@ block2 = "0.6"
 dispatch2 = "0.3"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSAppearance", "NSColorList", "NSAccessibility", "NSSwitch", "NSBezierPath", "NSAffineTransform", "NSGraphicsContext", "NSApplication", "NSAnimationContext", "NSResponder", "NSRunningApplication", "NSWorkspace", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSWindow", "NSScreen", "NSView", "NSEvent", "NSControl", "NSButton", "NSButtonCell", "NSImage", "NSTextField", "NSText", "NSImageView", "NSScrollView", "NSClipView", "NSCell", "NSTextFieldCell", "NSParagraphStyle", "NSMenu", "NSMenuItem", "NSBox", "NSUserInterfaceItemIdentification", "NSFont", "NSFontDescriptor", "objc2-core-foundation", "NSColor", "NSGraphics", "block2"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSUserDefaults", "NSArray", "NSDictionary", "NSError", "NSObject", "NSSet", "NSString", "NSURL", "NSRunLoop", "NSTimer", "NSDate", "NSDateFormatter", "NSNotification", "NSDistributedNotificationCenter", "NSIndexSet", "block2"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSUserDefaults", "NSArray", "NSDictionary", "NSError", "NSObject", "NSSet", "NSString", "NSURL", "NSRunLoop", "NSTimer", "NSDate", "NSDateFormatter", "NSNotification", "NSDistributedNotificationCenter", "NSIndexSet", "block2"] }
 objc2-user-notifications = { version = "0.3", features = ["block2"] }
 
 [profile.release]

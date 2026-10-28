@@ -1,4 +1,4 @@
-use crate::core::{self, Action};
+use crate::app::core::{self, Action};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
@@ -264,7 +264,7 @@ fn install_migrates_python_preserves_other_hooks_and_is_idempotent() {
     }});
     let before = old.to_string();
     fs::write(&path, &before).unwrap();
-    let executable = Path::new("/new project/CodexNotify");
+    let executable = Path::new("/new project/AIAgentMonitor");
     assert!(core::install(home.path(), executable, Path::new("/old project/notify.py")).unwrap());
     let once = fs::read(&path).unwrap();
     assert!(!core::install(home.path(), executable, Path::new("/old project/notify.py")).unwrap());
@@ -274,7 +274,7 @@ fn install_migrates_python_preserves_other_hooks_and_is_idempotent() {
     let groups = config["hooks"]["PermissionRequest"].as_array().unwrap();
     assert_eq!(groups.len(), 1);
     let args = shlex::split(groups[0]["hooks"][0]["command"].as_str().unwrap()).unwrap();
-    assert_eq!(args, vec!["/new project/CodexNotify", "hook"]);
+    assert_eq!(args, vec!["/new project/AIAgentMonitor", "hook"]);
     let backup = fs::read_dir(home.path())
         .unwrap()
         .flatten()
@@ -300,4 +300,30 @@ fn install_refuses_invalid_or_symlinked_config() {
     fs::remove_file(&path).unwrap();
     symlink(home.path().join("missing"), &path).unwrap();
     assert!(core::install(home.path(), Path::new("/new"), Path::new("/old")).is_err());
+}
+
+#[test]
+fn install_migrates_the_old_app_path_without_replacing_unrelated_codex_hooks() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("hooks.json");
+    let executable = Path::new("/project/build/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor");
+    let unrelated = "'/other/Codex Notify.app/Contents/MacOS/CodexNotify' hook";
+    fs::write(&path, json!({"hooks":{"PermissionRequest":[{"hooks":[
+        {"type":"command","command":"'/project/build/Codex Notify.app/Contents/MacOS/CodexNotify' hook"},
+        {"type":"command","command":unrelated}
+    ]}]}}).to_string()).unwrap();
+    assert!(core::install(home.path(), executable, Path::new("/project/notify.py")).unwrap());
+    let data = fs::read(&path).unwrap();
+    let config: Value = serde_json::from_slice(&data).unwrap();
+    let handlers = config["hooks"]["PermissionRequest"][0]["hooks"]
+        .as_array()
+        .unwrap();
+    assert_eq!(handlers.len(), 2);
+    assert_eq!(
+        shlex::split(handlers[0]["command"].as_str().unwrap()).unwrap(),
+        vec![executable.to_str().unwrap(), "hook"]
+    );
+    assert_eq!(handlers[1]["command"], unrelated);
+    assert!(!core::install(home.path(), executable, Path::new("/project/notify.py")).unwrap());
+    assert_eq!(fs::read(path).unwrap(), data);
 }

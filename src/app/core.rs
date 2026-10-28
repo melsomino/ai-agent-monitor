@@ -14,7 +14,7 @@ use std::{
 use url::Url;
 
 pub const WAIT: Duration = Duration::from_secs(60);
-pub const APP_NAME: &str = "Codex Notify.app";
+pub const APP_NAME: &str = "AI Agent Monitor.app";
 
 pub fn home() -> PathBuf {
     env::var_os("HOME")
@@ -36,7 +36,7 @@ pub fn bundle_executable() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("build")
             .join(APP_NAME)
-            .join("Contents/MacOS/CodexNotify")
+            .join("Contents/MacOS/AIAgentMonitor")
     }
 }
 
@@ -131,7 +131,8 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 pub fn vscode_target(event: &Value, storage: &Path) -> String {
     if let Some(id) = event["session_id"].as_str() {
         let ids = HashSet::from([id.to_owned()]);
-        if let Some(workspace) = crate::vscode::workspaces(&ids, storage).remove(id) {
+        if let Some(workspace) = crate::agents::codex::vscode::workspaces(&ids, storage).remove(id)
+        {
             return vscode_file_target(&workspace);
         }
     }
@@ -346,7 +347,12 @@ pub fn deliver(event: &Value, approval: bool) -> Result<Option<Action>> {
     if approval {
         let directory = approval_directory()?;
         let response = directory.path().join("response");
-        crate::pending::publish(directory.path(), event, &content.body, WAIT.as_secs())?;
+        crate::agents::codex::pending::publish(
+            directory.path(),
+            event,
+            &content.body,
+            WAIT.as_secs(),
+        )?;
         if matches!(send(Some(&response)), Ok(true)) {
             return Ok(wait_response(&response, WAIT));
         }
@@ -400,6 +406,9 @@ pub fn install(home: &Path, executable: &Path, legacy_script: &Path) -> Result<b
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .context("PermissionRequest must be an array")?;
+    let legacy_executable = legacy_script
+        .parent()
+        .map(|root| root.join("build/Codex Notify.app/Contents/MacOS/CodexNotify"));
     let command = format!(
         "{} hook",
         shlex::try_quote(executable.to_str().context("non-UTF8 executable path")?)?
@@ -418,8 +427,10 @@ pub fn install(home: &Path, executable: &Path, legacy_script: &Path) -> Result<b
                     .as_str()
                     .and_then(shlex::split)
                     .is_some_and(|args| {
-                        args.first().is_some_and(|p| Path::new(p) == executable)
-                            || args.get(1).is_some_and(|p| Path::new(p) == legacy_script)
+                        args.first().is_some_and(|p| {
+                            let path = Path::new(p);
+                            path == executable || legacy_executable.as_deref() == Some(path)
+                        }) || args.get(1).is_some_and(|p| Path::new(p) == legacy_script)
                     });
             if ours {
                 if found {

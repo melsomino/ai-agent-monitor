@@ -1,5 +1,12 @@
-//! Read the local session index without resuming conversations or running models.
-use anyhow::{Context, Result};
+//! Codex backend and its hook/VS Code integrations.
+pub(crate) mod pending;
+pub(crate) mod vscode;
+
+use crate::{
+    agents::sessions::{Activity, Approval, Client, Session, SessionProvider},
+    app::process::output_with_timeout,
+};
+use anyhow::Result;
 use rusqlite::{Connection, OpenFlags};
 use std::{
     collections::{HashMap, HashSet},
@@ -7,13 +14,72 @@ use std::{
     io::{BufReader, Read, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{Mutex, OnceLock},
-    thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
-pub fn open(home: &Path) -> Result<Vec<Session>> {
+/// Codex database, transcript, hook and VS Code integration.
+pub struct Codex;
+
+const DESKTOP: Client = Client::Desktop {
+    name: "Codex",
+    app_path: "/Applications/ChatGPT.app",
+};
+
+fn approval(request: &crate::agents::codex::pending::Request) -> Approval {
+    Approval {
+        id: request.response.to_string_lossy().into_owned(),
+        body: request.body.clone(),
+        expires: request.expires,
+    }
+}
+
+impl SessionProvider for Codex {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn sessions(&self) -> Result<Vec<Session>> {
+        open(&crate::app::core::codex_home())
+    }
+
+    fn pending_count(&self) -> usize {
+        crate::agents::codex::pending::list().len()
+    }
+
+    fn open_target(&self, session: &Session) -> String {
+        let storage =
+            crate::app::core::home().join("Library/Application Support/Code/User/workspaceStorage");
+        if let Some(workspace) = &session.workspace {
+            crate::app::core::vscode_file_target(workspace)
+        } else {
+            crate::app::core::vscode_target(&serde_json::json!({"cwd": session.cwd}), &storage)
+        }
+    }
+
+    fn allow(&self, session: &Session) -> bool {
+        let Some(snapshot) = session.approval.as_ref() else {
+            return false;
+        };
+        // Resolve the opaque token and compare the complete current snapshot.
+        // pending::allow revalidates once more at the write boundary.
+        let Some(request) = crate::agents::codex::pending::list()
+            .into_iter()
+            .find(|request| request.session_id == session.id && approval(request) == *snapshot)
+        else {
+            return false;
+        };
+        if !crate::agents::codex::pending::allow(&request) {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        crate::macos::native::dismiss_approval(&request.response);
+        true
+    }
+}
+
+fn open(home: &Path) -> Result<Vec<Session>> {
     // SAFETY: geteuid has no preconditions and scopes discovery to this user.
     let uid = unsafe { libc::geteuid() }.to_string();
     let mut command = Command::new("/usr/sbin/lsof");
@@ -27,7 +93,7 @@ pub fn open(home: &Path) -> Result<Vec<Session>> {
     let files = open_files(&output, home);
     let ids = files.keys().cloned().collect();
     let mut sessions = read_open(home, &ids)?;
-    let pending = crate::pending::list();
+    let pending = crate::agents::codex::pending::list();
     for session in &mut sessions {
         if let Some(path) = files.get(&session.id) {
             enrich(session, path);
@@ -36,7 +102,7 @@ pub fn open(home: &Path) -> Result<Vec<Session>> {
             .iter()
             .filter(|request| request.session_id == session.id)
             .max_by_key(|request| request.expires)
-            .cloned();
+            .map(approval);
         if session.approval.is_some() {
             session.activity = Activity::Confirmation;
         }
@@ -47,55 +113,12 @@ pub fn open(home: &Path) -> Result<Vec<Session>> {
         .map(|session| session.id.clone())
         .collect();
     let storage =
-        crate::core::home().join("Library/Application Support/Code/User/workspaceStorage");
-    let mut workspaces = crate::vscode::workspaces(&vscode_ids, &storage);
+        crate::app::core::home().join("Library/Application Support/Code/User/workspaceStorage");
+    let mut workspaces = crate::agents::codex::vscode::workspaces(&vscode_ids, &storage);
     for session in &mut sessions {
         session.workspace = workspaces.remove(&session.id);
     }
     Ok(sessions)
-}
-
-pub(crate) fn output_with_timeout(
-    command: &mut Command,
-    timeout: Duration,
-) -> Result<(Option<i32>, String, String)> {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdout = child.stdout.take().context("missing process output")?;
-    let reader = thread::spawn(move || {
-        let mut output = String::new();
-        stdout.read_to_string(&mut output).map(|_| output)
-    });
-    let mut stderr = child
-        .stderr
-        .take()
-        .context("missing process error output")?;
-    let error_reader = thread::spawn(move || {
-        let mut errors = String::new();
-        stderr.read_to_string(&mut errors).map(|_| errors)
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
-    let output = reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("process output reader failed"))??;
-    let errors = error_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("process error reader failed"))??;
-    let status = status.context("session discovery timed out")?;
-    Ok((status.code(), output, errors))
 }
 
 fn session_id(path: &Path, home: &Path) -> Option<String> {
@@ -153,70 +176,6 @@ fn open_files(output: &str, home: &Path) -> HashMap<String, PathBuf> {
 #[cfg(test)]
 fn ids_from_open_files(output: &str, home: &Path) -> HashSet<String> {
     open_files(output, home).into_keys().collect()
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Client {
-    Terminal,
-    VSCode,
-    Desktop,
-    #[default]
-    Unknown,
-}
-impl Client {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Terminal => "Terminal",
-            Self::VSCode => "VS Code",
-            Self::Desktop => "Codex",
-            Self::Unknown => "Codex",
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Activity {
-    Working,
-    Idle,
-    Confirmation,
-    #[default]
-    Unknown,
-}
-impl Activity {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Working => "Working",
-            Self::Idle => "Idle",
-            Self::Confirmation => "Needs approval",
-            Self::Unknown => "Unknown status",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Session {
-    pub id: String,
-    pub title: String,
-    pub cwd: PathBuf,
-    pub workspace: Option<PathBuf>,
-    pub updated_at: i64,
-    pub client: Client,
-    pub activity: Activity,
-    pub last_message: String,
-    pub approval: Option<crate::pending::Request>,
-}
-
-impl Session {
-    pub fn project_path(&self) -> &Path {
-        self.workspace.as_deref().unwrap_or(&self.cwd)
-    }
-
-    pub fn vscode_target(&self, storage: &Path) -> String {
-        if let Some(workspace) = &self.workspace {
-            crate::core::vscode_file_target(workspace)
-        } else {
-            crate::core::vscode_target(&serde_json::json!({"cwd": self.cwd}), storage)
-        }
-    }
 }
 
 fn read_open(home: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
@@ -300,10 +259,12 @@ fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
     statement
         .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
             Ok(Session {
+                agent: "codex",
                 id: row.get(0)?,
                 title: row.get(1)?,
                 cwd: PathBuf::from(row.get::<_, String>(2)?),
                 workspace: None,
+                git_branch: None,
                 updated_at: row.get(3)?,
                 client: Client::Unknown,
                 activity: Activity::Unknown,
@@ -329,7 +290,7 @@ fn enrich(session: &mut Session, path: &Path) {
             .as_str()
             .is_some_and(|s| s.contains("Desktop"))
         {
-            Client::Desktop
+            DESKTOP
         } else {
             match meta["source"].as_str() {
                 Some("vscode") => Client::VSCode,
@@ -573,14 +534,52 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn approval_cannot_be_reassigned_to_another_session_or_changed_in_the_ui() {
+        let directory = crate::app::core::approval_directory().unwrap();
+        crate::agents::codex::pending::publish(
+            directory.path(),
+            &serde_json::json!({"session_id":"original"}),
+            "Approve?",
+            60,
+        )
+        .unwrap();
+        let response = directory.path().join("response");
+        let request = crate::agents::codex::pending::list()
+            .into_iter()
+            .find(|request| request.response == response)
+            .unwrap();
+        let mut session = Session {
+            agent: "codex",
+            id: "other".into(),
+            title: "Chat".into(),
+            cwd: PathBuf::new(),
+            workspace: None,
+            git_branch: None,
+            updated_at: 0,
+            client: Client::Terminal,
+            activity: Activity::Confirmation,
+            last_message: String::new(),
+            approval: Some(approval(&request)),
+        };
+        assert!(!Codex.allow(&session));
+        session.id = "original".into();
+        session.approval.as_mut().unwrap().body = "Changed".into();
+        assert!(!Codex.allow(&session));
+        assert!(!response.exists());
+        assert!(crate::agents::codex::pending::allow(&request));
+    }
+
+    #[test]
     fn activity_survives_oversized_records_and_cached_gaps_without_guessing_from_tool_output() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("large.jsonl");
         let mut session = Session {
+            agent: "codex",
             id: "one".into(),
             title: "Chat".into(),
             cwd: PathBuf::new(),
             workspace: None,
+            git_branch: None,
             updated_at: 0,
             client: Client::Unknown,
             activity: Activity::Unknown,
@@ -631,10 +630,12 @@ mod tests {
     #[test]
     fn reads_activity_and_last_assistant_message_without_tool_output() {
         let mut session = Session {
+            agent: "codex",
             id: "one".into(),
             title: "Chat".into(),
             cwd: PathBuf::new(),
             workspace: None,
+            git_branch: None,
             updated_at: 0,
             client: Client::Unknown,
             activity: Activity::Unknown,
@@ -679,7 +680,7 @@ mod tests {
         for (source, originator, client) in [
             ("cli", "codex-tui", Client::Terminal),
             ("vscode", "codex_vscode", Client::VSCode),
-            ("vscode", "Codex Desktop", Client::Desktop),
+            ("vscode", "Codex Desktop", DESKTOP),
         ] {
             fs::write(&transcript, serde_json::json!({"type":"session_meta","payload":{"source":source,"originator":originator}}).to_string()+"\n").unwrap();
             enrich(&mut session, &transcript);

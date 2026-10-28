@@ -1,12 +1,12 @@
 //! Resident menu bar item and native sessions menu.
 use crate::{
-    core, hotkey, motion, native, pending, pointer,
-    sessions::{self, Activity, Client, Session},
-    settings,
+    agents::sessions::{self, Activity, Client, Session},
+    app::core,
+    macos::{hotkey, motion, native, pointer, settings},
 };
 use anyhow::{Context, Result};
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
     sel,
@@ -21,6 +21,13 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+
+const SESSION_HEADER_HEIGHT: f64 = 24.0;
+const SESSION_SPACING: f64 = 12.0;
+const SESSION_HOVER_PADDING: f64 = 4.0;
+const SESSION_HOVER_LEFT: f64 = 14.0;
+const SESSION_HOVER_WIDTH: f64 = 354.0;
+const MESSAGE_TOP_GAP: f64 = 4.0;
 
 static RESIDENT: AtomicBool = AtomicBool::new(false);
 thread_local! { static CONTROLLER: RefCell<Option<Retained<MenuController>>> = const { RefCell::new(None) }; }
@@ -56,7 +63,10 @@ struct State {
     status_content: OnceCell<Retained<StatusContentView>>,
     status_badge: OnceCell<Retained<NSBox>>,
     status_count: OnceCell<Retained<NSTextField>>,
-    status_working: OnceCell<Retained<WorkingIconView>>,
+    status_icon: OnceCell<Retained<NSImageView>>,
+    status_base_images: OnceCell<[Retained<NSImage>; 2]>,
+    status_eyes: OnceCell<[Retained<NSImageView>; 2]>,
+    status_eye_animation: RefCell<motion::WorkingEyes>,
     status_timer: RefCell<Option<Retained<NSTimer>>>,
     settings_window: OnceCell<Retained<NSWindow>>,
     login_switch: OnceCell<Retained<NSSwitch>>,
@@ -118,20 +128,18 @@ impl State {
         }
         let mut changed = false;
         for session in sessions {
-            let newly_active = if let Some(request) = &session.approval {
-                self.opened_approvals
-                    .borrow_mut()
-                    .insert(request.response.to_string_lossy().into_owned())
+            let newly_active = if let Some(key) = session.approval_key() {
+                self.opened_approvals.borrow_mut().insert(key)
             } else if session.activity == Activity::Working {
-                self.opened_working.borrow_mut().insert(session.id.clone())
+                self.opened_working.borrow_mut().insert(session.key())
             } else {
                 false
             };
             if newly_active {
-                self.expanded.borrow_mut().insert(session.id.clone());
-                self.reveal.borrow_mut().insert(session.id.clone(), 1.0);
+                self.expanded.borrow_mut().insert(session.key());
+                self.reveal.borrow_mut().insert(session.key(), 1.0);
                 if let Some(motion) = self.motion.borrow_mut().as_mut() {
-                    motion.show(&session.id);
+                    motion.show(&session.key());
                 }
                 changed = true;
             }
@@ -200,10 +208,8 @@ define_class!(
         }
         #[unsafe(method(animateStatus:))]
         fn animate_status(&self, _timer: &NSTimer) {
-            if let Some(icon) = self.ivars().status_working.get() {
-                icon.ivars().angle.set(self.working_angle());
-                NSView::setNeedsDisplay(icon, true);
-            }
+            self.ivars().status_eye_animation.borrow_mut().tick();
+            self.paint_status_eyes();
         }
 
         #[unsafe(method(pollPointer:))]
@@ -229,12 +235,11 @@ define_class!(
         #[unsafe(method(allowSession:))]
         fn allow_session(&self, sender: Option<&NSButton>) {
             let Some(id) = sender.and_then(|button| button.identifier()).map(|id| id.to_string()) else { return; };
-            let request = self.ivars().all.borrow().iter().filter_map(|session| session.approval.as_ref()).find(|request| request.response.to_string_lossy() == id).cloned();
-            if let Some(request) = request {
-                let allowed = pending::allow(&request);
-                if allowed { native::dismiss_approval(&request.response); }
+            let session = self.ivars().all.borrow().iter().find(|session| session.approval_key().is_some_and(|key| key == id)).cloned();
+            if let Some(session) = session {
+                let allowed = session.allow();
                 if let Some(button) = sender { button.setEnabled(false); button.setTitle(if allowed { ns_string!("Allowed") } else { ns_string!("Request completed") }); }
-                self.update_badge(pending::list().len());
+                self.update_badge(sessions::pending_count());
                 self.refresh();
             }
         }
@@ -243,8 +248,8 @@ define_class!(
         fn open_session(&self, sender: Option<&NSButton>) {
             let Some(id) = sender.and_then(|button| button.identifier()) else { return; };
             let data = self.ivars().all.borrow();
-            if let Some(session) = data.iter().find(|session| session.id == id.to_string()) {
-                let target = session.vscode_target(&core::home().join("Library/Application Support/Code/User/workspaceStorage"));
+            if let Some(session) = data.iter().find(|session| session.key() == id.to_string()) {
+                let Some(target) = session.open_target() else { return; };
                 self.dismiss_menu();
                 native::open_target(&target);
             }
@@ -271,7 +276,7 @@ define_class!(
         #[unsafe(method(toggleMenuAnimation:))]
         fn toggle_menu_animation(&self, sender: &NSSwitch) {
             settings::set_menu_animation(sender.state() == NSControlStateValueOn);
-            self.update_badge(pending::list().len());
+            self.update_badge(sessions::pending_count());
         }
 
         #[unsafe(method(openLoginSettings:))]
@@ -298,7 +303,6 @@ define_class!(
 #[derive(Debug)]
 struct WorkingIconState {
     angle: Cell<f64>,
-    badge: bool,
 }
 
 define_class!(
@@ -316,45 +320,13 @@ define_class!(
             let x = bounds.origin.x + bounds.size.width / 2.0;
             let y = bounds.origin.y + bounds.size.height / 2.0;
             NSGraphicsContext::saveGraphicsState_class();
-            if self.ivars().badge {
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.25, 0.13, 1.0).setFill();
-                NSBezierPath::bezierPathWithOvalInRect(bounds).fill();
-            }
             let transform = NSAffineTransform::transform();
             transform.translateXBy_yBy(x, y);
             transform.rotateByDegrees(self.ivars().angle.get());
             transform.translateXBy_yBy(-x, -y);
             transform.concat();
-            if self.ivars().badge {
-                // Draw both opposed arrows around the exact same center as the
-                // background, avoiding independent symbol padding and view
-                // geometry for this small badge.
-                let color = NSColor::colorWithSRGBRed_green_blue_alpha(0.65, 1.0, 0.72, 1.0);
-                color.setStroke();
-                color.setFill();
-                let center = NSPoint::new(x, y);
-                for start in [-20.0_f64, 160.0] {
-                    let end = start + 130.0;
-                    let arc = NSBezierPath::bezierPath();
-                    arc.setLineWidth(1.2);
-                    arc.setLineCapStyle(NSLineCapStyle::Round);
-                    arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
-                        center, 3.6, start, end, false,
-                    );
-                    arc.stroke();
-                    let (sin, cos) = end.to_radians().sin_cos();
-                    let point = NSPoint::new(x + 3.6 * cos, y + 3.6 * sin);
-                    let head = NSBezierPath::bezierPath();
-                    head.moveToPoint(NSPoint::new(point.x - sin * 1.8, point.y + cos * 1.8));
-                    head.lineToPoint(NSPoint::new(point.x + sin * 0.5 + cos * 1.2, point.y - cos * 0.5 + sin * 1.2));
-                    head.lineToPoint(NSPoint::new(point.x + sin * 0.5 - cos * 1.2, point.y - cos * 0.5 - sin * 1.2));
-                    head.closePath();
-                    head.fill();
-                }
-            } else {
-                // SAFETY: Invoke NSImageView's drawing within the saved graphics state.
-                unsafe { let _: () = msg_send![super(self), drawRect: dirty]; }
-            }
+            // SAFETY: Invoke NSImageView's drawing within the saved graphics state.
+            unsafe { let _: () = msg_send![super(self), drawRect: dirty]; }
             NSGraphicsContext::restoreGraphicsState_class();
         }
     }
@@ -482,8 +454,19 @@ impl SessionRowView {
         let allocated = Self::alloc(mtm).set_ivars(HoverState::default());
         // SAFETY: NSView's initializer is valid for this subclass and its ivars.
         let row: Retained<Self> = unsafe { msg_send![super(allocated), initWithFrame: frame] };
-        let background =
-            hover_background(mtm, rect(4.0, frame.size.height - 46.0, 364.0, 44.0), 8.0);
+        if row.respondsToSelector(sel!(setClipsToBounds:)) {
+            row.setClipsToBounds(false);
+        }
+        let background = hover_background(
+            mtm,
+            rect(
+                SESSION_HOVER_LEFT,
+                frame.size.height - SESSION_HEADER_HEIGHT - SESSION_HOVER_PADDING,
+                SESSION_HOVER_WIDTH,
+                SESSION_HEADER_HEIGHT + SESSION_HOVER_PADDING * 2.0,
+            ),
+            16.0,
+        );
         row.addSubview(&background);
         row.ivars()
             .background
@@ -818,7 +801,7 @@ impl MenuController {
                 window.setReleasedWhenClosed(false);
                 window
             };
-            window.setTitle(ns_string!("Codex Notify Settings"));
+            window.setTitle(ns_string!("AI Agent Monitor Settings"));
             window.setLevel(NSFloatingWindowLevel);
             window.setHidesOnDeactivate(false);
             window.setDelegate(Some(ProtocolObject::from_ref(self)));
@@ -834,7 +817,7 @@ impl MenuController {
             );
             let note = self.label(
                 &view,
-                "Open Codex Notify automatically",
+                "Open AI Agent Monitor automatically",
                 rect(24.0, 232.0, 370.0, 18.0),
                 11.0,
                 0.0,
@@ -971,7 +954,7 @@ impl MenuController {
         if let Some(note) = state.login_note.get() {
             note.setToolTip(None);
             note.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            note.setStringValue(ns_string!("Open Codex Notify automatically"));
+            note.setStringValue(ns_string!("Open AI Agent Monitor automatically"));
             if status == settings::LoginStatus::RequiresApproval {
                 note.setStringValue(ns_string!("Allow launch at login in macOS settings"));
             } else if status == settings::LoginStatus::Unavailable {
@@ -1023,34 +1006,71 @@ impl MenuController {
             let content: Retained<StatusContentView> = unsafe {
                 msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(-3.0, 0.0, 26.0, height)]
             };
-            let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                ns_string!("sparkles.rectangle.stack"),
-                Some(ns_string!("Codex Sessions")),
-            )
-            .or_else(|| {
+            let data =
+                NSData::with_bytes(include_bytes!("../../assets/menubar/robots-template.pdf"));
+            let image = NSImage::initWithData(NSImage::alloc(), &data).or_else(|| {
                 NSImage::imageWithSystemSymbolName_accessibilityDescription(
                     ns_string!("rectangle.stack"),
-                    Some(ns_string!("Codex Sessions")),
+                    Some(ns_string!("Agent Sessions")),
                 )
             });
             if let Some(image) = image {
-                let configuration =
-                    NSImageSymbolConfiguration::configurationWithPointSize_weight(21.0, 0.0);
-                let image = image
-                    .imageWithSymbolConfiguration(&configuration)
-                    .unwrap_or(image);
+                image.setAccessibilityDescription(Some(ns_string!("Agent Sessions")));
                 image.setTemplate(true);
                 let icon = NSImageView::imageViewWithImage(&image, self.mtm());
-                image.setSize(NSSize::new(26.0, 22.0));
+                image.setSize(NSSize::new(24.0, 17.6));
                 icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-                icon.setFrame(rect(0.0, height / 2.0 - 11.0, 26.0, 22.0));
+                icon.setFrame(rect(1.0, height / 2.0 - 8.8, 24.0, 17.6));
                 icon.setAutoresizingMask(
                     NSAutoresizingMaskOptions::ViewMinYMargin
                         | NSAutoresizingMaskOptions::ViewMaxYMargin,
                 );
                 icon.setContentTintColor(Some(&NSColor::labelColor()));
                 content.addSubview(&icon);
+                let active_data =
+                    NSData::with_bytes(include_bytes!("../../assets/menubar/robots-working.pdf"));
+                let active_image = NSImage::initWithData(NSImage::alloc(), &active_data)
+                    .expect("embedded working icon is a valid PDF");
+                active_image.setTemplate(true);
+                active_image.setSize(NSSize::new(24.0, 17.6));
+                self.ivars()
+                    .status_base_images
+                    .set([image, active_image])
+                    .expect("base icons initialized once");
+                self.ivars()
+                    .status_icon
+                    .set(icon)
+                    .expect("status icon initialized once");
             }
+            let masks = [
+                include_bytes!("../../assets/menubar/eyes-left.pdf").as_slice(),
+                include_bytes!("../../assets/menubar/eyes-right.pdf").as_slice(),
+            ]
+            .map(|bytes| {
+                let data = NSData::with_bytes(bytes);
+                let image = NSImage::initWithData(NSImage::alloc(), &data)
+                    .expect("embedded eye mask is a valid PDF");
+                image.setTemplate(true);
+                image.setSize(NSSize::new(24.0, 17.6));
+                image
+            });
+            let eyes = masks.map(|image| {
+                let eyes = NSImageView::imageViewWithImage(&image, self.mtm());
+                eyes.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+                eyes.setFrame(rect(1.0, height / 2.0 - 8.8, 24.0, 17.6));
+                eyes.setAutoresizingMask(
+                    NSAutoresizingMaskOptions::ViewMinYMargin
+                        | NSAutoresizingMaskOptions::ViewMaxYMargin,
+                );
+                eyes.setContentTintColor(Some(&NSColor::systemGreenColor()));
+                eyes.setHidden(true);
+                content.addSubview(&eyes);
+                eyes
+            });
+            self.ivars()
+                .status_eyes
+                .set(eyes)
+                .expect("eye overlays initialized once");
             let badge = NSBox::initWithFrame(
                 NSBox::alloc(self.mtm()),
                 rect(14.0, (height / 2.0 - 10.0).max(1.0), 12.0, 12.0),
@@ -1065,19 +1085,6 @@ impl MenuController {
             count.setAlignment(NSTextAlignment::Center);
             count.setTextColor(Some(&NSColor::whiteColor()));
             center_label(&count, height / 2.0);
-            let allocated = WorkingIconView::alloc(self.mtm()).set_ivars(WorkingIconState {
-                angle: Cell::new(0.0),
-                badge: true,
-            });
-            // SAFETY: The image view's ivars are initialized before its designated initializer.
-            let icon: Retained<WorkingIconView> =
-                unsafe { msg_send![super(allocated), initWithFrame: rect(12.0, 1.0, 14.0, 14.0)] };
-            icon.setHidden(true);
-            content.addSubview(&icon);
-            self.ivars()
-                .status_working
-                .set(icon)
-                .expect("working badge initialized once");
             button.addSubview(&content);
             self.ivars()
                 .status_content
@@ -1097,7 +1104,28 @@ impl MenuController {
             .status
             .set(item)
             .expect("status initialized once");
-        self.update_badge(pending::list().len());
+        self.update_badge(sessions::pending_count());
+    }
+
+    fn paint_status_eyes(&self) {
+        let state = self.ivars();
+        let (levels, active) = {
+            let animation = state.status_eye_animation.borrow();
+            (animation.levels(), animation.active())
+        };
+        if let Some(icon) = state.status_icon.get()
+            && let Some(images) = state.status_base_images.get()
+        {
+            icon.setImage(Some(&images[usize::from(active)]));
+            NSView::setNeedsDisplay(icon, true);
+        }
+        if let Some(eyes) = state.status_eyes.get() {
+            for (eye, level) in eyes.iter().zip(levels) {
+                eye.setAlphaValue(level);
+                eye.setHidden(level == 0.0);
+                NSView::setNeedsDisplay(eye, true);
+            }
+        }
     }
 
     fn update_badge(&self, count: usize) {
@@ -1153,20 +1181,17 @@ impl MenuController {
             badge.setHidden(count == 0);
             badge.setFrame(rect(badge_x, badge_y, badge_width, 12.0));
         }
-        if let Some(icon) = state.status_working.get() {
-            icon.setHidden(!working);
-            icon.setFrame(rect(12.0, badge_y, 14.0, 14.0));
-            icon.ivars()
-                .angle
-                .set(if animate { self.working_angle() } else { 0.0 });
-            NSView::setNeedsDisplay(icon, true);
-        }
+        state
+            .status_eye_animation
+            .borrow_mut()
+            .update(working, animate);
+        self.paint_status_eyes();
         if animate && state.status_timer.borrow().is_none() {
             // SAFETY: The resident controller implements animateStatus: and
             // outlives the timer; common modes include native menu tracking.
             let timer = unsafe {
                 NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
-                    1.0 / 60.0,
+                    0.15,
                     self,
                     sel!(animateStatus:),
                     None,
@@ -1194,11 +1219,11 @@ impl MenuController {
             center_label(label, badge_y + 6.0);
         }
         let tooltip = if working {
-            "Codex Sessions · Working".to_owned()
+            "Agent Sessions · Working".to_owned()
         } else if count == 0 {
-            "Codex Sessions".to_owned()
+            "Agent Sessions".to_owned()
         } else {
-            format!("Codex Sessions · Pending approvals: {count}")
+            format!("Agent Sessions · Pending approvals: {count}")
         };
         button.setToolTip(Some(&NSString::from_str(&tooltip)));
     }
@@ -1252,7 +1277,7 @@ impl MenuController {
         caption.setHidden(true);
         for (symbol, action, x, tooltip) in [
             ("gearshape", sel!(settings:), 324.0, "Settings"),
-            ("power", sel!(quit:), 356.0, "Quit Codex Notify"),
+            ("power", sel!(quit:), 356.0, "Quit AI Agent Monitor"),
         ] {
             let button =
                 self.action_button(&toolbar, "", action, "", rect(x, 4.0, 24.0, 24.0), false);
@@ -1391,7 +1416,7 @@ impl MenuController {
     fn client_icon(&self, row: &NSView, client: Client, y: f64) {
         let app = match client {
             Client::VSCode => Some("/Applications/Visual Studio Code.app"),
-            Client::Desktop => Some("/Applications/ChatGPT.app"),
+            Client::Desktop { app_path, .. } => Some(app_path),
             _ => None,
         };
         let image = if let Some(path) = app.filter(|path| std::path::Path::new(path).exists()) {
@@ -1436,7 +1461,6 @@ impl MenuController {
             if activity == Activity::Working {
                 let allocated = WorkingIconView::alloc(self.mtm()).set_ivars(WorkingIconState {
                     angle: Cell::new(0.0),
-                    badge: false,
                 });
                 // SAFETY: NSImageView's initializer is valid after initializing our angle ivar.
                 let icon: Retained<WorkingIconView> =
@@ -1643,10 +1667,10 @@ impl MenuController {
             .map(|item| {
                 let frame = item.view.frame();
                 pointer::Area {
-                    x: frame.origin.x + 4.0,
-                    y: frame.origin.y + 2.0,
-                    width: 364.0,
-                    height: 44.0,
+                    x: frame.origin.x + SESSION_HOVER_LEFT,
+                    y: frame.origin.y - SESSION_HOVER_PADDING,
+                    width: SESSION_HOVER_WIDTH,
+                    height: SESSION_HEADER_HEIGHT + SESSION_HOVER_PADDING * 2.0,
                 }
             })
             .collect();
@@ -1675,7 +1699,7 @@ impl MenuController {
 
     fn begin_disclosure(&self, id: &str) {
         let state = self.ivars();
-        if !state.all.borrow().iter().any(|session| session.id == id) {
+        if !state.all.borrow().iter().any(|session| session.key() == id) {
             return;
         }
         self.advance_disclosure();
@@ -1785,6 +1809,56 @@ impl MenuController {
         self.update_hover();
     }
 
+    fn session_metadata(&self, session: &Session) -> (Retained<SessionListView>, f64) {
+        // Use the same flipped coordinate system as the expanded detail document.
+        // SAFETY: This ivar-free view uses NSView's initializer.
+        let view: Retained<SessionListView> = unsafe {
+            msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(26.0, 8.0, 318.0, 0.0)]
+        };
+        let mut rows = vec![(
+            "folder",
+            "Working directory",
+            session.working_directory().display().to_string(),
+        )];
+        if let Some(branch) = &session.git_branch {
+            rows.push(("arrow.triangle.branch", "Git branch", branch.clone()));
+        }
+        let mut y = 0.0;
+        for (symbol, description, value) in rows {
+            if y > 0.0 {
+                y += 4.0;
+            }
+            let height = 16.0;
+            let label = self.label(&view, &value, rect(20.0, y, 298.0, height), 11.0, 0.0, true);
+            label.setSelectable(true);
+            label.setToolTip(Some(&NSString::from_str(&value)));
+            // Align the symbol with the visible letter height, not the text field's
+            // frame, whose baseline and descender leave extra space below the text.
+            let text_bounds = label
+                .cell()
+                .map(|cell| cell.drawingRectForBounds(label.bounds()))
+                .unwrap_or(label.bounds());
+            let text_center = label
+                .font()
+                .map(|font| y + text_bounds.origin.y + font.ascender() - font.capHeight() / 2.0)
+                .unwrap_or(y + height / 2.0);
+            if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str(symbol),
+                Some(&NSString::from_str(description)),
+            ) {
+                image.setTemplate(true);
+                let icon = NSImageView::imageViewWithImage(&image, self.mtm());
+                icon.setFrame(rect(0.0, text_center - 6.5, 13.0, 13.0));
+                icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+                icon.setToolTip(Some(&NSString::from_str(description)));
+                view.addSubview(&icon);
+            }
+            y += height;
+        }
+        view.setFrameSize(NSSize::new(318.0, y));
+        (view, y)
+    }
+
     fn render_rows(&self, sessions: &[Session]) {
         let Some(list) = self.ivars().list.get() else {
             return;
@@ -1803,7 +1877,7 @@ impl MenuController {
         let client_order = |client| match client {
             Client::VSCode => 0,
             Client::Terminal => 1,
-            Client::Desktop => 2,
+            Client::Desktop { .. } => 2,
             Client::Unknown => 3,
         };
         ordered.sort_by(|a, b| {
@@ -1815,12 +1889,17 @@ impl MenuController {
                     {
                         NSComparisonResult::Ascending => std::cmp::Ordering::Less,
                         NSComparisonResult::Descending => std::cmp::Ordering::Greater,
-                        _ => a.id.cmp(&b.id),
+                        _ => a.key().cmp(&b.key()),
                     }
                 })
         });
         let mut group = None;
         for session in ordered {
+            let session_gap = if group == Some(session.client) {
+                SESSION_SPACING
+            } else {
+                0.0
+            };
             if group != Some(session.client) {
                 let gap = if group.is_some() { 6.0 } else { 0.0 };
                 y += gap;
@@ -1849,17 +1928,19 @@ impl MenuController {
                 y += 28.0;
                 group = Some(session.client);
             }
-            let is_expanded = expanded.contains(&session.id);
+            y += session_gap;
+            let is_expanded = expanded.contains(&session.key());
             let detail = if is_expanded
                 || reveal
-                    .get(&session.id)
+                    .get(&session.key())
                     .is_some_and(|progress| *progress > 0.0)
             {
                 let text = session
                     .approval
                     .as_ref()
                     .map(|request| request.body.as_str())
-                    .unwrap_or(&session.last_message);
+                    .unwrap_or(&session.last_message)
+                    .trim_end();
                 let text = if text.is_empty() {
                     "No messages yet"
                 } else {
@@ -1881,54 +1962,63 @@ impl MenuController {
                     .unwrap_or(60.0)
                     .max(22.0);
                 label.setFrame(rect(0.0, 0.0, 318.0, height));
-                Some((label, height))
+                let (metadata, metadata_height) = self.session_metadata(session);
+                Some((label, height, metadata, metadata_height))
             } else {
                 None
             };
             let detail_height = detail
                 .as_ref()
-                .map(|(_, height)| {
+                .map(|(_, height, _, metadata_height)| {
                     height
+                        + metadata_height
+                        + MESSAGE_TOP_GAP
                         + 16.0
                         + if session.approval.is_some() {
-                            40.0
+                            36.0
                         } else {
                             0.0
                         }
                 })
                 .unwrap_or(0.0);
-            let height = 48.0 + detail_height;
+            let height = SESSION_HEADER_HEIGHT + detail_height;
             let row = SessionRowView::create(self.mtm(), rect(12.0, y, 372.0, height));
+            if session_gap > 0.0 {
+                // Draw in the existing gap. Pinning to the row's top below keeps
+                // the divider aligned while either session expands or collapses.
+                self.separator(&row, height + session_gap / 2.0 - 0.5, 332.0);
+            }
             let text_width = 274.0;
             let title = self.label(
                 &row,
                 &session.title,
-                rect(26.0, height - 26.0, text_width, 22.0),
+                rect(
+                    26.0,
+                    height - SESSION_HEADER_HEIGHT / 2.0 - 11.0,
+                    text_width,
+                    22.0,
+                ),
                 14.0,
                 0.23,
                 false,
             );
-            center_label(&title, height - 15.0);
-            let project = session
-                .project_path()
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            self.label(
+            center_label(&title, height - SESSION_HEADER_HEIGHT / 2.0);
+            let working_icon = self.status_icon(
                 &row,
-                &project,
-                rect(26.0, height - 40.0, text_width, 16.0),
-                12.0,
-                0.0,
-                true,
+                session.activity,
+                height - SESSION_HEADER_HEIGHT / 2.0 - 8.0,
             );
-            let working_icon = self.status_icon(&row, session.activity, height - 23.0);
             let open = self.action_button(
                 &row,
                 &session.title,
                 sel!(openSession:),
-                &session.id,
-                rect(22.0, height - 48.0, text_width + 8.0, 48.0),
+                &session.key(),
+                rect(
+                    22.0,
+                    height - SESSION_HEADER_HEIGHT,
+                    text_width + 8.0,
+                    SESSION_HEADER_HEIGHT,
+                ),
                 true,
             );
             open.setToolTip(Some(&NSString::from_str(&format!(
@@ -1946,8 +2036,13 @@ impl MenuController {
                 &row,
                 "",
                 sel!(expandSession:),
-                &session.id,
-                rect(336.0, height - 27.0, 26.0, 24.0),
+                &session.key(),
+                rect(
+                    336.0,
+                    height - SESSION_HEADER_HEIGHT / 2.0 - 12.0,
+                    26.0,
+                    24.0,
+                ),
                 false,
             );
             let mut arrow_icon = None;
@@ -1981,7 +2076,7 @@ impl MenuController {
                     .setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
             }
             let mut detail_clip = None;
-            if let Some((label, text_height)) = detail {
+            if let Some((label, text_height, metadata, _)) = detail {
                 // The clip only reveals content; the main list is the sole scroller.
                 // SAFETY: NSClipView initializes this ivar-free subclass.
                 let clip: Retained<RevealClipView> = unsafe {
@@ -1992,20 +2087,29 @@ impl MenuController {
                 let document: Retained<SessionListView> = unsafe {
                     msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 372.0, detail_height)]
                 };
-                label.setFrameOrigin(NSPoint::new(26.0, 8.0));
+                let message_end = MESSAGE_TOP_GAP + text_height;
+                let footer_y = message_end
+                    + 8.0
+                    + if session.approval.is_some() {
+                        36.0
+                    } else {
+                        0.0
+                    };
+                metadata.setFrameOrigin(NSPoint::new(26.0, footer_y));
+                document.addSubview(&metadata);
+                label.setFrameOrigin(NSPoint::new(26.0, MESSAGE_TOP_GAP));
                 document.addSubview(&label);
-                if let Some(request) = &session.approval {
+                if let Some(key) = session.approval_key() {
                     let allow = self.action_button(
                         &document,
                         "Allow",
                         sel!(allowSession:),
-                        &request.response.to_string_lossy(),
-                        rect(274.0, text_height + 16.0, 70.0, 28.0),
+                        &key,
+                        rect(274.0, message_end + 8.0, 70.0, 28.0),
                         false,
                     );
                     allow.setBezelStyle(NSBezelStyle::Push);
                 }
-                self.separator(&document, detail_height - 1.0, 332.0);
                 clip.setDocumentView(Some(&document));
                 row.addSubview(&clip);
                 detail_clip = Some(clip);
@@ -2014,9 +2118,9 @@ impl MenuController {
             layout.push(LayoutRow {
                 view: row.clone().into_super(),
                 row: Some(row),
-                id: Some(session.id.clone()),
-                gap: 0.0,
-                base_height: 48.0,
+                id: Some(session.key()),
+                gap: session_gap,
+                base_height: SESSION_HEADER_HEIGHT,
                 detail_height,
                 detail: detail_clip,
                 arrow: arrow_icon,
@@ -2087,7 +2191,7 @@ impl MenuController {
         let (sender, receiver) = std::sync::mpsc::channel();
         *state.incoming.borrow_mut() = Some(receiver);
         std::thread::spawn(move || {
-            let _ = sender.send(sessions::open(&core::codex_home()));
+            let _ = sender.send(sessions::open());
         });
     }
 
@@ -2116,7 +2220,7 @@ impl MenuController {
                 self.filter();
             }
             Err(error) => {
-                eprintln!("codex-notify: cannot read sessions: {error:#}");
+                eprintln!("ai-agent-monitor: cannot read sessions: {error:#}");
                 state.all.borrow_mut().clear();
                 self.filter();
                 if let Some(caption) = state.caption.get() {
@@ -2125,7 +2229,7 @@ impl MenuController {
                 }
             }
         }
-        self.update_badge(pending::list().len());
+        self.update_badge(sessions::pending_count());
     }
 
     fn filter(&self) {
@@ -2136,10 +2240,11 @@ impl MenuController {
         let changed = state.expand_active_sessions(&visible)
             || previous.len() != visible.len()
             || previous.iter().zip(&visible).any(|(a, b)| {
-                a.id != b.id
+                a.key() != b.key()
                     || a.title != b.title
                     || a.cwd != b.cwd
                     || a.workspace != b.workspace
+                    || a.git_branch != b.git_branch
                     || a.client != b.client
                     || a.activity != b.activity
                     || a.last_message != b.last_message
@@ -2159,7 +2264,7 @@ impl MenuController {
 }
 
 pub fn start(mtm: MainThreadMarker, show: bool) -> Result<bool> {
-    let directory = core::home().join("Library/Application Support/Codex Notify");
+    let directory = core::home().join("Library/Application Support/AI Agent Monitor");
     fs::create_dir_all(&directory)?;
     let lock = OpenOptions::new()
         .read(true)
@@ -2209,7 +2314,7 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<bool> {
     std::thread::spawn(|| {
         loop {
             std::thread::sleep(Duration::from_secs(2));
-            let pending_count = pending::list().len();
+            let pending_count = sessions::pending_count();
             dispatch2::DispatchQueue::main().exec_async(move || {
                 CONTROLLER.with(|slot| {
                     if let Some(controller) = slot.borrow().as_ref() {
@@ -2237,10 +2342,12 @@ mod close_tests {
 
     fn session(id: &str, approval: Option<&str>) -> Session {
         Session {
+            agent: "codex",
             id: id.into(),
             title: id.into(),
             cwd: "/project".into(),
             workspace: None,
+            git_branch: None,
             updated_at: 0,
             client: Client::VSCode,
             activity: if approval.is_some() {
@@ -2249,10 +2356,9 @@ mod close_tests {
                 Activity::Idle
             },
             last_message: String::new(),
-            approval: approval.map(|path| pending::Request {
-                session_id: id.into(),
+            approval: approval.map(|path| sessions::Approval {
+                id: path.into(),
                 body: "Подтверждение".into(),
-                response: path.into(),
                 expires: u64::MAX,
             }),
         }
@@ -2276,27 +2382,33 @@ mod close_tests {
         assert!(state.expand_active_sessions(&sessions));
         assert_eq!(
             *state.expanded.borrow(),
-            HashSet::from(["waiting".into(), "working".into()])
+            HashSet::from(["codex:waiting".into(), "codex:working".into()])
         );
-        state.expanded.borrow_mut().remove("waiting");
-        state.expanded.borrow_mut().remove("working");
-        state.reveal.borrow_mut().insert("waiting".into(), 0.0);
-        state.reveal.borrow_mut().insert("working".into(), 0.0);
+        state.expanded.borrow_mut().remove("codex:waiting");
+        state.expanded.borrow_mut().remove("codex:working");
+        state
+            .reveal
+            .borrow_mut()
+            .insert("codex:waiting".into(), 0.0);
+        state
+            .reveal
+            .borrow_mut()
+            .insert("codex:working".into(), 0.0);
         assert!(!state.expand_active_sessions(&sessions));
-        assert!(!state.expanded.borrow().contains("waiting"));
-        assert!(!state.expanded.borrow().contains("working"));
+        assert!(!state.expanded.borrow().contains("codex:waiting"));
+        assert!(!state.expanded.borrow().contains("codex:working"));
         sessions.push(session("late", Some("/tmp/request-two/response")));
         assert!(state.expand_active_sessions(&sessions));
-        assert!(state.expanded.borrow().contains("late"));
-        assert!(!state.expanded.borrow().contains("waiting"));
+        assert!(state.expanded.borrow().contains("codex:late"));
+        assert!(!state.expanded.borrow().contains("codex:waiting"));
         state.menu_open.set(false);
         state.reset_disclosures();
         state.menu_open.set(true);
         assert!(state.expand_active_sessions(&sessions));
-        assert!(state.expanded.borrow().contains("waiting"));
-        assert!(state.expanded.borrow().contains("working"));
-        assert!(!state.expanded.borrow().contains("idle"));
-        assert!(!state.expanded.borrow().contains("unknown"));
+        assert!(state.expanded.borrow().contains("codex:waiting"));
+        assert!(state.expanded.borrow().contains("codex:working"));
+        assert!(!state.expanded.borrow().contains("codex:idle"));
+        assert!(!state.expanded.borrow().contains("codex:unknown"));
     }
 
     #[test]
@@ -2304,17 +2416,17 @@ mod close_tests {
         let state = State::default();
         state.menu_open.set(true);
         state.expand_active_sessions(&[session("chat", Some("/tmp/first/response"))]);
-        state.expanded.borrow_mut().remove("chat");
+        state.expanded.borrow_mut().remove("codex:chat");
         let now = Instant::now();
         *state.motion.borrow_mut() = Some(motion::Disclosure::new(
-            HashMap::from([("chat".into(), 1.0), ("other".into(), 0.0)]),
-            HashMap::from([("chat".into(), 0.0), ("other".into(), 1.0)]),
+            HashMap::from([("codex:chat".into(), 1.0), ("other".into(), 0.0)]),
+            HashMap::from([("codex:chat".into(), 0.0), ("other".into(), 1.0)]),
             now,
         ));
         assert!(state.expand_active_sessions(&[session("chat", Some("/tmp/second/response"))]));
         let motion = state.motion.borrow();
         let (sample, _) = motion.as_ref().unwrap().sample(now + motion::DURATION / 2);
-        assert_eq!(sample["chat"], 1.0);
+        assert_eq!(sample["codex:chat"], 1.0);
         assert!(sample["other"] > 0.0 && sample["other"] < 1.0);
     }
 

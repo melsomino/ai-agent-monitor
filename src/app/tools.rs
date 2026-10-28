@@ -1,4 +1,4 @@
-use crate::core;
+use crate::app::core;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
@@ -15,15 +15,15 @@ use std::{
 pub fn bundle() -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let contents = root.join("build").join(core::APP_NAME).join("Contents");
-    let executable = contents.join("MacOS/CodexNotify");
+    let executable = contents.join("MacOS/AIAgentMonitor");
     fs::create_dir_all(executable.parent().unwrap())?;
     fs::create_dir_all(contents.join("Resources"))?;
     let source = env::current_exe()?;
     if source == executable {
-        bail!("Run bundle from target/release/CodexNotify, not from the app being replaced");
+        bail!("Run bundle from target/release/AIAgentMonitor, not from the app being replaced");
     }
     if executable.exists() {
-        let backup = root.join("build/CodexNotify.previous");
+        let backup = root.join("build/AIAgentMonitor.previous");
         // Keep the original sender as a rollback artifact, outside the app bundle.
         if !backup.exists() {
             fs::copy(&executable, backup)?;
@@ -35,11 +35,11 @@ pub fn bundle() -> Result<()> {
     temporary.persist(&executable)?;
     fs::write(
         contents.join("Info.plist"),
-        include_bytes!("../assets/Info.plist"),
+        include_bytes!("../../assets/Info.plist"),
     )?;
     fs::write(
         contents.join("Resources/AppIcon.icns"),
-        include_bytes!("../assets/AppIcon.icns"),
+        include_bytes!("../../assets/AppIcon.icns"),
     )?;
     let result = Command::new("/usr/bin/codesign")
         .args(["--force", "--sign", "-"])
@@ -90,7 +90,7 @@ pub fn check_hooks(binary: &str) -> Result<()> {
             }
         };
         send(
-            json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"codex_notify_check","version":env!("CARGO_PKG_VERSION")}}}),
+            json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai_agent_monitor_check","version":env!("CARGO_PKG_VERSION")}}}),
         )?;
         response(1)?;
         send(json!({"method":"initialized","params":{}}))?;

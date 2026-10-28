@@ -1,5 +1,5 @@
 //! Pending hook requests shared with the resident UI. No permission is granted by discovery.
-use crate::core;
+use crate::app::core;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::{

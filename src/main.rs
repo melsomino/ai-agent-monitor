@@ -1,23 +1,12 @@
-mod cli;
-mod core;
+mod agents;
+mod app;
 #[cfg(target_os = "macos")]
-mod hotkey;
+mod macos;
+
+use agents::sessions;
+use app::{cli, core, tools};
 #[cfg(target_os = "macos")]
-mod menu;
-#[cfg(target_os = "macos")]
-mod motion;
-#[cfg(target_os = "macos")]
-mod native;
-mod pending;
-#[cfg(target_os = "macos")]
-mod pointer;
-mod sessions;
-#[cfg(target_os = "macos")]
-mod settings;
-#[cfg(test)]
-mod tests;
-mod tools;
-mod vscode;
+use macos::native;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -53,12 +42,12 @@ fn run(command: Option<Command>) -> Result<()> {
         }
         Some(Command::Bundle) => tools::bundle()?,
         Some(Command::Sessions { json: true }) => {
-            let sessions = sessions::open(&core::codex_home())?;
+            let sessions = sessions::open()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "sessions": sessions.iter().map(|session| serde_json::json!({
-                        "id":session.id,"title":session.title,"cwd":session.cwd,"workspace":session.workspace,"updatedAt":session.updated_at,
+                        "agent":session.agent,"id":session.id,"title":session.title,"cwd":session.cwd,"workspace":session.workspace,"gitBranch":session.git_branch,"updatedAt":session.updated_at,
                         "client":session.client.label(),"status":session.activity.label(),"lastMessage":session.last_message,
                         "approval":session.approval.as_ref().map(|request| serde_json::json!({"body":request.body,"expiresAt":request.expires}))
                     })).collect::<Vec<_>>()
@@ -120,7 +109,7 @@ fn main() {
     let cli = Cli::parse();
     let is_hook = matches!(cli.command, Some(Command::Hook));
     if let Err(error) = run(cli.command) {
-        eprintln!("codex-notify: {error:#}");
+        eprintln!("ai-agent-monitor: {error:#}");
         // A failed hook must return control to Codex without granting permission.
         if !is_hook {
             std::process::exit(1);

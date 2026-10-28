@@ -1,5 +1,5 @@
 //! Associate loaded Codex chats with live VS Code windows, not command working directories.
-use crate::sessions::output_with_timeout;
+use crate::app::process::output_with_timeout;
 use anyhow::Result;
 use std::{
     collections::{HashMap, HashSet},
@@ -558,19 +558,21 @@ mod tests {
         let result = resolve(&storage, &ids, &live, &mut cache);
         assert_eq!(result.get(CHAT), Some(&workspace));
         assert!(!result.contains_key(OTHER));
-        let session = crate::sessions::Session {
+        let session = crate::agents::sessions::Session {
+            agent: "codex",
             id: CHAT.into(),
             title: "Chat".into(),
             cwd: temp.path().join("deleted"),
             workspace: Some(workspace.clone()),
+            git_branch: None,
             updated_at: 0,
-            client: crate::sessions::Client::VSCode,
-            activity: crate::sessions::Activity::Idle,
+            client: crate::agents::sessions::Client::VSCode,
+            activity: crate::agents::sessions::Activity::Idle,
             last_message: String::new(),
             approval: None,
         };
         assert_eq!(
-            crate::core::vscode_path(&session.vscode_target(&storage)),
+            crate::app::core::vscode_path(&session.open_target().unwrap()),
             Some(workspace)
         );
         fs::write(

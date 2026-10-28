@@ -1,6 +1,6 @@
 //! macOS notification APIs. All Objective-C glue stays in this module.
-use crate::cli::{Message, NativeCommand};
-use crate::core::{self, Action};
+use crate::app::cli::{Message, NativeCommand};
+use crate::app::core::{self, Action};
 use anyhow::{Result, bail};
 use block2::{DynBlock, RcBlock};
 use dispatch2::DispatchQueue;
@@ -58,7 +58,7 @@ define_class!(
     // SAFETY: NSObject has no additional subclassing requirements. This class
     // has no ivars and no main-thread-bound state; callbacks dispatch UI work.
     #[unsafe(super(NSObject))]
-    #[name = "CodexNotifyRustDelegate"]
+    #[name = "AIAgentMonitorRustDelegate"]
     struct NotificationDelegate;
 
     // SAFETY: NSObjectProtocol has no extra requirements.
@@ -102,7 +102,7 @@ define_class!(
                 if should_open {
                     open_target(&target);
                 }
-                if !crate::menu::is_resident() {
+                if !crate::macos::menu::is_resident() {
                     std::process::exit(0);
                 }
             });
@@ -122,7 +122,7 @@ define_class!(
 );
 
 fn fail(message: impl std::fmt::Display) -> ! {
-    eprintln!("codex-notify: {message}");
+    eprintln!("ai-agent-monitor: {message}");
     std::process::exit(2)
 }
 
@@ -134,7 +134,7 @@ fn remove_notification(identifier: &str) {
 }
 
 pub fn dismiss_approval(response: &Path) {
-    let Some(identifier) = crate::pending::notification_id(response) else {
+    let Some(identifier) = crate::agents::codex::pending::notification_id(response) else {
         return;
     };
     remove_notification(&identifier);
@@ -146,7 +146,7 @@ pub fn dismiss_approval(response: &Path) {
         for index in 0..notifications.count() {
             let request = notifications.objectAtIndex(index).request();
             let stored = info_string(&request.content().userInfo(), ns_string!("response"));
-            if crate::pending::notification_id(Path::new(&stored)).as_deref()
+            if crate::agents::codex::pending::notification_id(Path::new(&stored)).as_deref()
                 == Some(identifier.as_str())
             {
                 remove_notification(&request.identifier().to_string());
@@ -159,7 +159,7 @@ pub fn dismiss_approval(response: &Path) {
 
 fn send(message: &Message, response: Option<&str>) {
     // The panel may answer while notification authorization/delivery is in flight.
-    if response.is_some_and(|path| crate::pending::is_resolved(Path::new(path))) {
+    if response.is_some_and(|path| crate::agents::codex::pending::is_resolved(Path::new(path))) {
         std::process::exit(0);
     }
     let content = UNMutableNotificationContent::new();
@@ -183,7 +183,7 @@ fn send(message: &Message, response: Option<&str>) {
         content.setCategoryIdentifier(ns_string!("CODEX_APPROVAL"));
     }
     let identifier = response
-        .and_then(|path| crate::pending::notification_id(Path::new(path)))
+        .and_then(|path| crate::agents::codex::pending::notification_id(Path::new(path)))
         .unwrap_or_else(|| {
             format!(
                 "{}-{}",
@@ -207,7 +207,7 @@ fn send(message: &Message, response: Option<&str>) {
         }
         if response_path
             .as_deref()
-            .is_some_and(crate::pending::is_resolved)
+            .is_some_and(crate::agents::codex::pending::is_resolved)
         {
             remove_notification(&identifier);
         }
@@ -222,7 +222,7 @@ pub fn run(command: NativeCommand) -> Result<()> {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     if matches!(command, NativeCommand::Listen | NativeCommand::Sessions)
-        && !crate::menu::start(mtm, matches!(command, NativeCommand::Sessions))?
+        && !crate::macos::menu::start(mtm, matches!(command, NativeCommand::Sessions))?
     {
         return Ok(());
     }
@@ -288,7 +288,7 @@ pub fn run(command: NativeCommand) -> Result<()> {
                     fail(error.localizedDescription());
                 }
                 if !allowed.as_bool() {
-                    fail("Notifications are disabled for Codex Notify");
+                    fail("Notifications are disabled for AI Agent Monitor");
                 }
                 send(
                     &Message {
