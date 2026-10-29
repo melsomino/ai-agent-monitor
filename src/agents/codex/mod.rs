@@ -155,6 +155,8 @@ fn open(home: &Path) -> Result<Vec<Session>> {
             enrich(session, path);
         }
     }
+    #[cfg(target_os = "macos")]
+    crate::macos::terminal::retain_live_codex(&mut sessions, &output)?;
     let vscode_ids = sessions
         .iter()
         .filter(|session| session.client == Client::VSCode)

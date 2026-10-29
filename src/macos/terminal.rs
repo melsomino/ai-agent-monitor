@@ -1,7 +1,7 @@
 //! Route terminal sessions to their existing host, never to an editor.
 use crate::{agents::sessions::Session, app::process::output_with_timeout};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -60,6 +60,7 @@ fn choose<'a>(
         .values()
         .filter(|p| {
             p.tty != "??"
+                && directories.contains_key(&p.pid)
                 && Path::new(&p.command)
                     .file_name()
                     .is_some_and(|name| name == agent)
@@ -108,10 +109,14 @@ fn host(processes: &HashMap<u32, Process>, mut pid: u32) -> Option<PathBuf> {
 fn directories(text: &str) -> HashMap<u32, PathBuf> {
     let mut result = HashMap::new();
     let mut pid = None;
+    let mut cwd = false;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix('p') {
             pid = value.parse::<u32>().ok();
-        } else if let (Some(pid), Some(path)) = (pid, line.strip_prefix('n')) {
+            cwd = false;
+        } else if let Some(fd) = line.strip_prefix('f') {
+            cwd = fd == "cwd";
+        } else if cwd && let (Some(pid), Some(path)) = (pid, line.strip_prefix('n')) {
             result.insert(pid, PathBuf::from(path));
         }
     }
@@ -140,17 +145,22 @@ pub fn open(value: &str) -> Option<bool> {
     Some(true)
 }
 
-fn focus(agent: &str, id: &str, cwd: &Path) -> anyhow::Result<()> {
+fn processes() -> anyhow::Result<HashMap<u32, Process>> {
     let timeout = Duration::from_secs(3);
-    let (_, text, _) = output_with_timeout(
+    let (status, text, _) = output_with_timeout(
         Command::new("/bin/ps").args(["-axo", "pid=,ppid=,tty=,comm="]),
         timeout,
     )?;
+    anyhow::ensure!(status == Some(0), "Could not inspect terminal clients");
     let mut processes = process_lines(&text);
-    let (_, args, _) = output_with_timeout(
+    let (status, args, _) = output_with_timeout(
         Command::new("/bin/ps").args(["-axo", "pid=,args="]),
         timeout,
     )?;
+    anyhow::ensure!(
+        status == Some(0),
+        "Could not inspect terminal client identities"
+    );
     for line in args.lines() {
         let line = line.trim_start();
         if let Some((pid, args)) = line.split_once(char::is_whitespace)
@@ -160,6 +170,93 @@ fn focus(agent: &str, id: &str, cwd: &Path) -> anyhow::Result<()> {
             process.args = args.trim_start().to_owned();
         }
     }
+    Ok(processes)
+}
+
+/// A daemon-held rollout is not sufficient: every visible terminal session
+/// needs a live foreground client. One client can account for only one session.
+pub(crate) fn retain_live_codex(sessions: &mut Vec<Session>, files: &str) -> anyhow::Result<()> {
+    if !sessions
+        .iter()
+        .any(|session| session.client == crate::agents::sessions::Client::Terminal)
+    {
+        return Ok(());
+    }
+    let processes = processes()?;
+    let directories = directories(files);
+    let candidates: Vec<_> = sessions
+        .iter()
+        .filter(|session| session.client == crate::agents::sessions::Client::Terminal)
+        .map(|session| {
+            (
+                session.id.clone(),
+                crate::agents::codex::initial_directory(&session.id)
+                    .unwrap_or_else(|| session.cwd.clone()),
+                session.updated_at,
+            )
+        })
+        .collect();
+    let live = live_ids(&processes, &directories, &candidates);
+    sessions.retain(|session| {
+        session.client != crate::agents::sessions::Client::Terminal || live.contains(&session.id)
+    });
+    Ok(())
+}
+
+fn live_ids(
+    processes: &HashMap<u32, Process>,
+    directories: &HashMap<u32, PathBuf>,
+    sessions: &[(String, PathBuf, i64)],
+) -> HashSet<String> {
+    let mut clients: Vec<_> = processes
+        .values()
+        .filter(|process| {
+            process.tty != "??"
+                && directories.contains_key(&process.pid)
+                && Path::new(&process.command)
+                    .file_name()
+                    .is_some_and(|name| name == "codex")
+        })
+        .collect();
+    clients.sort_by_key(|process| process.pid);
+    let mut live = HashSet::new();
+    // Explicit resume identities win even when sessions share a directory.
+    clients.retain(|process| {
+        if let Some((id, _, _)) = sessions
+            .iter()
+            .find(|(id, _, _)| process.args.split_whitespace().any(|arg| arg == id))
+        {
+            live.insert(id.clone());
+            return false;
+        }
+        // An explicitly resumed thread outside this snapshot cannot keep a
+        // different transcript in the same directory visible.
+        !process
+            .args
+            .split_whitespace()
+            .any(|arg| arg.len() == 36 && arg.bytes().filter(|byte| *byte == b'-').count() == 4)
+    });
+    let mut remaining: Vec<_> = sessions
+        .iter()
+        .filter(|(id, _, _)| !live.contains(id))
+        .collect();
+    remaining.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    for (id, cwd, _) in remaining {
+        if !cwd.as_os_str().is_empty()
+            && let Some(index) = clients
+                .iter()
+                .position(|process| directories.get(&process.pid) == Some(cwd))
+        {
+            clients.remove(index);
+            live.insert(id.clone());
+        }
+    }
+    live
+}
+
+fn focus(agent: &str, id: &str, cwd: &Path) -> anyhow::Result<()> {
+    let timeout = Duration::from_secs(3);
+    let processes = processes()?;
     // lsof limits cwd discovery to the agent's processes and the current user.
     // SAFETY: geteuid has no preconditions; discovery stays scoped to this user.
     let uid = unsafe { libc::geteuid() }.to_string();
@@ -303,9 +400,46 @@ mod tests {
         );
     }
     #[test]
+    fn daemon_rollouts_do_not_keep_closed_terminal_sessions_alive() {
+        let mut processes =
+            process_lines("10 2 ttys001 codex\n20 1 ?? /bin/codex\n30 3 ttys002 codex");
+        let dirs = HashMap::from([
+            (10, PathBuf::from("/project")),
+            (20, PathBuf::from("/closed")),
+            (30, PathBuf::from("/resumed")),
+        ]);
+        let resumed = "01a10d25-27a3-73a3-838d-9dfb24104803";
+        processes.get_mut(&30).unwrap().args = format!("codex resume {resumed}");
+        let sessions = vec![
+            ("old".into(), PathBuf::from("/project"), 1),
+            ("current".into(), PathBuf::from("/project"), 2),
+            ("closed".into(), PathBuf::from("/closed"), 3),
+            (resumed.into(), PathBuf::from("/resumed"), 1),
+            (
+                "closed-in-resumed-directory".into(),
+                PathBuf::from("/resumed"),
+                9,
+            ),
+        ];
+        assert_eq!(
+            live_ids(&processes, &dirs, &sessions),
+            HashSet::from(["current".into(), resumed.into()])
+        );
+        processes.remove(&10);
+        assert_eq!(
+            live_ids(&processes, &dirs, &sessions),
+            HashSet::from([resumed.into()])
+        );
+        processes.remove(&30);
+        assert!(live_ids(&processes, &dirs, &sessions).is_empty());
+    }
+
+    #[test]
     fn cwd_records_are_bound_to_their_process() {
         assert_eq!(
-            directories("p10\nfcwd\nn/work/one\np20\nfcwd\nn/work/two with spaces\n"),
+            directories(
+                "p10\nfcwd\nn/work/one\nf5\nau\nn/not/the/directory\np20\nfcwd\nn/work/two with spaces\n"
+            ),
             HashMap::from([
                 (10, PathBuf::from("/work/one")),
                 (20, PathBuf::from("/work/two with spaces"))

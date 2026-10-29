@@ -28,6 +28,8 @@ The provider finds rollout files open for writing by the current user's Codex pr
 
 Transcript tails are limited to the latest 4 MiB for message reading. If lifecycle events lie outside the tail, the provider scans backward to resolve the status. File identity and boundary checks invalidate cached data after rewrites or rotation. A session can be open without currently running a turn.
 
+Terminal sessions also require a live Codex client with a controlling TTY. A shared app-server daemon can retain rollouts after the terminal closes, so daemon file handles alone do not keep them visible. Explicit resume IDs take priority; otherwise clients are matched one-to-one by their original launch directory, considering the most recently updated sessions first. Directory matching is a fallback when the CLI does not expose its current thread ID.
+
 ### VS Code windows and workspace identity
 
 A shared Codex process may retain a loaded transcript after a VS Code window closes. Open transcript handles alone therefore do not establish that a window is still open.
