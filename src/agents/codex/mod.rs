@@ -1,5 +1,6 @@
 //! Codex backend and its hook/VS Code integrations.
 pub(crate) mod runtime;
+pub(crate) mod usage;
 pub(crate) mod vscode;
 
 use crate::{

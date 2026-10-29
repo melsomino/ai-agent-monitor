@@ -1,8 +1,11 @@
 //! Resident menu bar item and native sessions menu.
 use crate::{
-    agents::sessions::{self, Activity, Client, Session},
+    agents::{
+        codex::usage,
+        sessions::{self, Activity, Client, Session},
+    },
     app::core,
-    macos::{hotkey, motion, native, pointer, settings},
+    macos::{hotkey, motion, native, pointer, search, settings},
 };
 use anyhow::{Context, Result};
 use objc2::{
@@ -71,6 +74,11 @@ pub fn is_resident() -> bool {
     RESIDENT.load(Ordering::Relaxed)
 }
 
+struct Discovery {
+    sessions: Result<Vec<Session>>,
+    usage: Option<usage::Usage>,
+}
+
 #[derive(Default)]
 struct State {
     status: OnceCell<Retained<NSStatusItem>>,
@@ -97,11 +105,13 @@ struct State {
     menu_item: OnceCell<Retained<NSMenuItem>>,
     menu_close_shortcut: OnceCell<Retained<NSMenuItem>>,
     menu_open: Cell<bool>,
-    incoming: RefCell<Option<std::sync::mpsc::Receiver<Result<Vec<Session>>>>>,
+    incoming: RefCell<Option<std::sync::mpsc::Receiver<Discovery>>>,
     last_refresh: Cell<Option<Instant>>,
     list: OnceCell<Retained<SessionListView>>,
     root: OnceCell<Retained<PanelView>>,
     toolbar: OnceCell<Retained<NSView>>,
+    footer: OnceCell<Retained<NSView>>,
+    footer_height: Cell<f64>,
     scroll: OnceCell<Retained<SessionScrollView>>,
     content_height: Cell<f64>,
     expanded: RefCell<HashSet<String>>,
@@ -116,6 +126,9 @@ struct State {
     session_notifications: RefCell<HashSet<String>>,
     all: RefCell<Vec<Session>>,
     visible: RefCell<Vec<Session>>,
+    filter_query: RefCell<String>,
+    filter_dirty: Cell<bool>,
+    usage: RefCell<Option<usage::Usage>>,
     lock: OnceCell<File>,
     refreshing: Cell<bool>,
     routing_scroll: Cell<bool>,
@@ -129,6 +142,16 @@ struct State {
 }
 
 impl State {
+    fn filtered_sessions(&self) -> Vec<Session> {
+        let query = self.filter_query.borrow();
+        self.all
+            .borrow()
+            .iter()
+            .filter(|session| search::matches(&session.title, &query))
+            .cloned()
+            .collect()
+    }
+
     fn reset_disclosures(&self) {
         self.animation_epoch
             .set(self.animation_epoch.get().wrapping_add(1));
@@ -199,9 +222,7 @@ define_class!(
             // tracking ends, reopening the menu instead of closing it.
             self.ivars().shortcut_registration.borrow_mut().take();
             self.receive_sessions();
-            if self.ivars().expand_active_sessions(&self.ivars().all.borrow()) {
-                self.render_rows(&self.ivars().all.borrow());
-            }
+            self.filter();
             self.refresh();
             self.start_pointer_tracking();
         }
@@ -471,6 +492,7 @@ struct HoverState {
     background: OnceCell<Retained<NSBox>>,
     active: Cell<bool>,
     focused: Cell<bool>,
+    matches: OnceCell<Vec<std::ops::Range<usize>>>,
     title: OnceCell<Retained<NSTextField>>,
     arrow: OnceCell<Retained<NSImageView>>,
 }
@@ -523,14 +545,7 @@ impl SessionRowView {
             background.setFillColor(&color);
             paint_hover(background, if active || focused { 1.0 } else { 0.0 });
         }
-        if let Some(title) = self.ivars().title.get() {
-            let color = if focused {
-                NSColor::selectedMenuItemTextColor()
-            } else {
-                NSColor::labelColor()
-            };
-            title.setTextColor(Some(&color));
-        }
+        self.paint_title(focused);
         if let Some(arrow) = self.ivars().arrow.get() {
             let color = if focused {
                 NSColor::selectedMenuItemTextColor()
@@ -539,6 +554,42 @@ impl SessionRowView {
             };
             arrow.setContentTintColor(Some(&color));
         }
+    }
+    fn paint_title(&self, focused: bool) {
+        let Some(title) = self.ivars().title.get() else {
+            return;
+        };
+        let text = title.stringValue();
+        let attributed =
+            NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &text);
+        let full = NSRange::new(0, text.length());
+        let color = if focused {
+            NSColor::selectedMenuItemTextColor()
+        } else {
+            NSColor::labelColor()
+        };
+        // SAFETY: Attribute values have AppKit's documented NSColor/NSFont types;
+        // all ranges refer to UTF-16 positions in this exact displayed title.
+        unsafe {
+            attributed.addAttribute_value_range(NSForegroundColorAttributeName, &color, full);
+            if let Some(font) = title.font() {
+                attributed.addAttribute_value_range(NSFontAttributeName, &font, full);
+            }
+            for range in self.ivars().matches.get().into_iter().flatten() {
+                let range = NSRange::new(range.start, range.end - range.start);
+                attributed.addAttribute_value_range(
+                    NSBackgroundColorAttributeName,
+                    &NSColor::findHighlightColor(),
+                    range,
+                );
+                attributed.addAttribute_value_range(
+                    NSForegroundColorAttributeName,
+                    &NSColor::blackColor(),
+                    range,
+                );
+            }
+        }
+        title.setAttributedStringValue(&attributed);
     }
 }
 fn hover_background(mtm: MainThreadMarker, frame: NSRect, radius: f64) -> Retained<NSBox> {
@@ -1389,6 +1440,12 @@ impl MenuController {
         scroll.setHasHorizontalScroller(false);
         scroll.setDocumentView(Some(&list));
         view.addSubview(&scroll);
+        let footer = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 392.0, 36.0));
+        view.addSubview(&footer);
+        self.ivars()
+            .footer
+            .set(footer)
+            .expect("footer initialized once");
         view.addSubview(&toolbar);
         view.setPostsFrameChangedNotifications(true);
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Codex"));
@@ -1449,6 +1506,7 @@ impl MenuController {
             .caption
             .set(caption)
             .expect("caption initialized once");
+        self.render_footer();
         self.render_rows(&[]);
         self.refresh();
     }
@@ -1584,10 +1642,13 @@ impl MenuController {
     fn close_panel(&self) {
         self.stop_keyboard_tracking();
         self.ivars().keyboard_focus.borrow_mut().take();
+        self.ivars().filter_query.borrow_mut().clear();
+        self.ivars().filter_dirty.set(true);
         self.stop_pointer_tracking();
         let state = self.ivars();
         state.reset_disclosures();
-        self.render_rows(&state.all.borrow());
+        self.filter();
+        self.render_footer();
         if let Some(scroll) = state.scroll.get() {
             scroll.contentView().scrollToPoint(NSPoint::new(0.0, 0.0));
         }
@@ -1623,8 +1684,28 @@ impl MenuController {
             return false;
         }
         let key = event.keyCode();
-        if !matches!(key, 125 | 126 | 36 | 76 | 49) {
-            return false;
+        if key == 51 {
+            let text = state.filter_query.borrow().clone();
+            let text = NSString::from_str(&text);
+            if text.length() > 0 {
+                let range = text.rangeOfComposedCharacterSequenceAtIndex(text.length() - 1);
+                *state.filter_query.borrow_mut() =
+                    text.substringToIndex(range.location).to_string();
+                self.filter_edited();
+            }
+            return true;
+        }
+        if !matches!(key, 123 | 124 | 125 | 126 | 36 | 76) {
+            let text = event
+                .characters()
+                .map(|text| text.to_string())
+                .unwrap_or_default();
+            if !search::printable(&text) {
+                return false;
+            }
+            state.filter_query.borrow_mut().push_str(&text);
+            self.filter_edited();
+            return true;
         }
         if matches!(key, 125 | 126) {
             let ids: Vec<_> = state
@@ -1648,8 +1729,9 @@ impl MenuController {
         let Some(id) = state.keyboard_focus.borrow().clone() else {
             return true;
         };
-        if key == 49 {
-            if !event.isARepeat() {
+        if matches!(key, 123 | 124) {
+            let expanded = state.expanded.borrow().contains(&id);
+            if !event.isARepeat() && expanded != (key == 124) {
                 self.begin_disclosure(&id);
             }
         } else if !event.isARepeat() {
@@ -1665,6 +1747,13 @@ impl MenuController {
             }
         }
         true
+    }
+
+    fn filter_edited(&self) {
+        self.ivars().filter_dirty.set(true);
+        self.filter();
+        self.render_footer();
+        self.reveal_keyboard_focus();
     }
 
     fn reveal_keyboard_focus(&self) {
@@ -1913,7 +2002,7 @@ impl MenuController {
         state
             .animation_epoch
             .set(state.animation_epoch.get().wrapping_add(1));
-        self.render_rows(&state.all.borrow());
+        self.render_rows(&state.filtered_sessions());
         // pollPointer: advances the same timeline in common run-loop modes,
         // including NSMenu's tracking loop and nested NSButton tracking.
     }
@@ -2195,9 +2284,17 @@ impl MenuController {
             );
             center_label(&title, height - SESSION_HEADER_HEIGHT / 2.0);
             row.ivars()
+                .matches
+                .set(search::highlights(
+                    &title.stringValue().to_string(),
+                    &self.ivars().filter_query.borrow(),
+                ))
+                .expect("matches initialized once");
+            row.ivars()
                 .title
                 .set(title)
                 .expect("title initialized once");
+            row.paint_title(false);
             let working_icon = self.status_icon(
                 &row,
                 session.activity,
@@ -2348,9 +2445,136 @@ impl MenuController {
         {
             self.ivars().keyboard_focus.borrow_mut().take();
         }
+        if !self.ivars().filter_query.borrow().is_empty()
+            && self.ivars().keyboard_focus.borrow().is_none()
+        {
+            *self.ivars().keyboard_focus.borrow_mut() =
+                layout.iter().find_map(|row| row.id.clone());
+        }
         *self.ivars().layout.borrow_mut() = layout;
         self.layout_rows();
         self.advance_working_icons();
+    }
+
+    fn render_footer(&self) {
+        let state = self.ivars();
+        let usage = state.usage.borrow();
+        let usage = usage.as_ref();
+        let query = state.filter_query.borrow().clone();
+        let filter_rows = usize::from(!query.is_empty());
+        let Some(footer) = state.footer.get() else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let rows = usage.map(|usage| usage.windows.len()).unwrap_or(1);
+        let height = (rows + filter_rows) as f64 * 24.0 + 12.0;
+        let changed = state.footer_height.replace(height) != height;
+        let children = footer.subviews();
+        for index in 0..children.count() {
+            children.objectAtIndex(index).removeFromSuperview();
+        }
+        footer.setFrame(rect(0.0, 0.0, 392.0, height));
+        self.separator(footer, height - 1.0, 352.0);
+        if filter_rows > 0 {
+            let label = self.label(
+                footer,
+                "",
+                rect(20.0, height - 32.0, 352.0, 20.0),
+                12.0,
+                0.0,
+                false,
+            );
+            label.setStringValue(&NSString::from_str(&format!("Filter: {query}")));
+            label.setToolTip(Some(&NSString::from_str(&query)));
+        }
+        if let Some(usage) = usage {
+            for (index, window) in usage.windows.iter().enumerate() {
+                let y = height - 8.0 - 24.0 * (index + 1 + filter_rows) as f64;
+                let name = self.label(
+                    footer,
+                    &window.label(),
+                    rect(20.0, y, 178.0, 20.0),
+                    12.0,
+                    0.0,
+                    true,
+                );
+                let remaining = window
+                    .remaining(now)
+                    .map(|value| format!("{value}%"))
+                    .unwrap_or_else(|| "—".into());
+                let percent = self.label(
+                    footer,
+                    &remaining,
+                    rect(202.0, y, 66.0, 20.0),
+                    12.0,
+                    0.0,
+                    true,
+                );
+                percent.setAlignment(NSTextAlignment::Right);
+                let reset = window
+                    .resets_at
+                    .map(|reset| {
+                        let formatter = NSDateFormatter::new();
+                        formatter.setDateFormat(Some(if window.minutes >= 1440 {
+                            ns_string!("MMM d")
+                        } else {
+                            ns_string!("HH:mm")
+                        }));
+                        formatter
+                            .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(reset as f64))
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "—".into());
+                let date = self.label(footer, &reset, rect(280.0, y, 92.0, 20.0), 12.0, 0.0, true);
+                date.setAlignment(NSTextAlignment::Right);
+                let tooltip = NSString::from_str(&format!(
+                    "Codex · {} quota remaining\nReset: {}\nLast reported: {}{}",
+                    window.label(),
+                    window
+                        .resets_at
+                        .map(|reset| {
+                            let formatter = NSDateFormatter::new();
+                            formatter.setDateFormat(Some(ns_string!("yyyy-MM-dd HH:mm")));
+                            formatter
+                                .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(
+                                    reset as f64,
+                                ))
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "Unknown".into()),
+                    usage.observed_at,
+                    if window.remaining(now).is_none() {
+                        "\nWaiting for Codex to report the new balance."
+                    } else {
+                        ""
+                    },
+                ));
+                for label in [name, percent, date] {
+                    center_label(&label, y + 10.0);
+                    label.setToolTip(Some(&tooltip));
+                }
+            }
+        } else {
+            let label = self.label(
+                footer,
+                "Codex usage",
+                rect(20.0, 6.0, 220.0, 20.0),
+                12.0,
+                0.0,
+                true,
+            );
+            label.setToolTip(Some(ns_string!(
+                "Usage will appear after Codex reports its account limits."
+            )));
+            let value = self.label(footer, "—", rect(280.0, 6.0, 92.0, 20.0), 12.0, 0.0, true);
+            value.setAlignment(NSTextAlignment::Right);
+        }
+        if changed {
+            self.layout_rows();
+        }
     }
 
     fn resize_content(&self, content_height: f64) -> f64 {
@@ -2370,8 +2594,11 @@ impl MenuController {
             })
             .unwrap_or(640.0)
             .max(100.0);
-        let height = (content_height + 8.0).max(64.0).min(maximum);
-        let viewport = height - 8.0;
+        let footer_height = state.footer_height.get();
+        let height = (content_height + footer_height + 8.0)
+            .max(64.0 + footer_height)
+            .min(maximum);
+        let viewport = height - footer_height - 8.0;
         NSAnimationContext::beginGrouping();
         let context = NSAnimationContext::currentContext();
         context.setDuration(0.0);
@@ -2385,7 +2612,7 @@ impl MenuController {
             }
         }
         if let Some(scroll) = state.scroll.get() {
-            scroll.setFrame(rect(4.0, 4.0, 384.0, viewport));
+            scroll.setFrame(rect(4.0, footer_height + 4.0, 384.0, viewport));
         }
         if let Some(toolbar) = state.toolbar.get() {
             toolbar.setFrame(rect(0.0, height - 34.0, 392.0, 32.0));
@@ -2409,7 +2636,11 @@ impl MenuController {
         let (sender, receiver) = std::sync::mpsc::channel();
         *state.incoming.borrow_mut() = Some(receiver);
         std::thread::spawn(move || {
-            let _ = sender.send(sessions::open());
+            let usage = usage::latest(&core::codex_home());
+            let _ = sender.send(Discovery {
+                sessions: sessions::open(),
+                usage,
+            });
         });
     }
 
@@ -2423,16 +2654,19 @@ impl MenuController {
                 .and_then(|receiver| match receiver.try_recv() {
                     Ok(result) => Some(result),
                     Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        Some(Err(anyhow::anyhow!("session worker disconnected")))
-                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Discovery {
+                        sessions: Err(anyhow::anyhow!("session worker disconnected")),
+                        usage: None,
+                    }),
                 });
         let Some(result) = result else {
             return;
         };
         state.incoming.borrow_mut().take();
         state.refreshing.set(false);
-        match result {
+        *state.usage.borrow_mut() = result.usage;
+        self.render_footer();
+        match result.sessions {
             Ok(sessions) => {
                 let requests: HashSet<_> = sessions
                     .iter()
@@ -2475,10 +2709,12 @@ impl MenuController {
 
     fn filter(&self) {
         let state = self.ivars();
-        let visible = state.all.borrow().clone();
+        let visible = state.filtered_sessions();
         let count = visible.len();
         let previous = state.visible.borrow();
-        let changed = state.expand_active_sessions(&visible)
+        let expanded = state.expand_active_sessions(&visible);
+        let changed = state.filter_dirty.replace(false)
+            || expanded
             || previous.len() != visible.len()
             || previous.iter().zip(&visible).any(|(a, b)| {
                 a.key() != b.key()
@@ -2497,7 +2733,21 @@ impl MenuController {
             *state.visible.borrow_mut() = visible;
         }
         if let Some(caption) = state.caption.get() {
-            let text = if count == 0 { "No open sessions" } else { "" };
+            let text = if count == 0 {
+                if state
+                    .filter_query
+                    .borrow()
+                    .split_whitespace()
+                    .next()
+                    .is_some()
+                {
+                    "No matching sessions"
+                } else {
+                    "No open sessions"
+                }
+            } else {
+                ""
+            };
             caption.setStringValue(&NSString::from_str(text));
             caption.setHidden(text.is_empty());
         }
