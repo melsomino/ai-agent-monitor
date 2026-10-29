@@ -362,7 +362,11 @@ pub fn handle(request: Request) -> Result<Value> {
         }
         Request::Sessions => {
             let sessions = agents::sessions::open()?;
-            json!({"monitor":{"pid":std::process::id(),"version":core::VERSION}, "sessions":sessions.iter().map(|session| json!({
+            #[cfg(target_os = "macos")]
+            let telegram = crate::macos::telegram::diagnostics();
+            #[cfg(not(target_os = "macos"))]
+            let telegram = Value::Null;
+            json!({"monitor":{"pid":std::process::id(),"version":core::VERSION}, "telegram":telegram,"sessions":sessions.iter().map(|session| json!({
                 "agent":session.agent,"id":session.id,"title":session.title,"cwd":session.cwd,"workspace":session.workspace,"gitBranch":session.git_branch,"updatedAt":session.updated_at,
                 "client":session.client.label(),"status":session.activity.label(),"lastMessage":session.last_message,
                 "approval":session.approval.as_ref().map(|request| json!({"id":request.id,"body":request.body,"expiresAt":request.expires,"canAllow":request.can_allow}))

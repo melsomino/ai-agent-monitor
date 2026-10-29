@@ -28,6 +28,10 @@ pub struct Status {
     pub paired: bool,
     pub text: String,
     pub link: Option<String>,
+    pub queued: usize,
+    pub delivered: usize,
+    pub snapshot_pending: usize,
+    pub suppressed: usize,
 }
 fn state() -> &'static Mutex<Status> {
     STATUS.get_or_init(|| {
@@ -40,6 +44,10 @@ fn state() -> &'static Mutex<Status> {
 pub fn status() -> Status {
     state().lock().unwrap().clone()
 }
+pub fn diagnostics() -> Value {
+    let status = status();
+    json!({"connected":status.connected,"enabled":status.enabled,"paired":status.paired,"status":status.text,"queued":status.queued,"delivered":status.delivered,"snapshotPending":status.snapshot_pending,"suppressed":status.suppressed})
+}
 enum Event {
     Connect(String),
     Disconnect,
@@ -48,6 +56,7 @@ enum Event {
     Observe(Box<Session>),
     Resolve(String),
     Test,
+    Updates(u64, Result<Value>),
 }
 fn send(event: Event) {
     if let Some(tx) = COMMANDS.get() {
@@ -89,46 +98,15 @@ pub fn start() {
     std::thread::spawn(move || {
         let mut worker = Worker::load();
         loop {
-            while let Ok(event) = rx.try_recv() {
+            if let Ok(event) = rx.recv_timeout(Duration::from_millis(100)) {
+                worker.event(event);
+            }
+            for event in rx.try_iter().take(64) {
                 worker.event(event);
             }
             worker.flush();
-            if worker.token.is_empty()
-                || (!worker.config.enabled && worker.pair.is_none())
-                || Instant::now() < worker.retry
-            {
-                if let Ok(event) = rx.recv_timeout(Duration::from_millis(250)) {
-                    worker.event(event);
-                }
-                continue;
-            }
-            let generation = worker.generation;
-            let updates = worker.api("getUpdates", json!({"offset":worker.config.offset,"timeout":5,"allowed_updates":["message","callback_query"]}));
-            // Apply disconnect/disable before handling any updates returned by the poll.
-            while let Ok(event) = rx.try_recv() {
-                worker.event(event);
-            }
-            if generation != worker.generation {
-                continue;
-            }
-            match updates {
-                Ok(updates) => {
-                    let previous_offset = worker.config.offset;
-                    for update in updates.as_array().into_iter().flatten() {
-                        if let Some(id) = update["update_id"].as_i64() {
-                            worker.config.offset = worker.config.offset.max(id + 1);
-                            worker.update(update);
-                        }
-                    }
-                    if previous_offset != worker.config.offset {
-                        worker.save();
-                    }
-                }
-                Err(error) => {
-                    worker.note(&error.to_string());
-                    worker.retry = Instant::now() + Duration::from_secs(15);
-                }
-            }
+            worker.update_counts();
+            worker.poll();
         }
     });
 }
@@ -371,6 +349,8 @@ struct Worker {
     retry: Instant,
     generation: u64,
     closed: HashSet<String>,
+    polling: bool,
+    poll_retry: Instant,
 }
 impl Worker {
     fn load() -> Self {
@@ -391,6 +371,8 @@ impl Worker {
             retry: Instant::now(),
             generation: 0,
             closed: HashSet::new(),
+            polling: false,
+            poll_retry: Instant::now(),
         };
         worker.publish();
         if let Err(error) = credential {
@@ -427,11 +409,62 @@ impl Worker {
             } else {
                 "Reconnect to pair your Telegram account.".into()
             },
+            snapshot_pending: 0,
+            suppressed: 0,
+            queued: self
+                .pending
+                .values()
+                .filter(|p| p.message.is_none())
+                .count(),
+            delivered: self
+                .pending
+                .values()
+                .filter(|p| p.message.is_some())
+                .count(),
             link: self
                 .pair
                 .as_ref()
                 .map(|(code, _)| format!("https://t.me/{}?start={code}", self.config.username)),
         };
+    }
+    fn poll(&mut self) {
+        if self.polling
+            || self.token.is_empty()
+            || (!self.config.enabled && self.pair.is_none())
+            || Instant::now() < self.poll_retry
+        {
+            return;
+        }
+        let Some(tx) = COMMANDS.get().cloned() else {
+            return;
+        };
+        let token = self.token.clone();
+        let offset = self.config.offset;
+        let generation = self.generation;
+        self.polling = true;
+        // Only one inbound poll is in flight. Outgoing delivery and local
+        // resolutions keep running while Telegram waits for incoming updates.
+        std::thread::spawn(move || {
+            let updates = api(
+                &token,
+                "getUpdates",
+                json!({"offset":offset,"timeout":5,"allowed_updates":["message","callback_query"]}),
+            );
+            let _ = tx.send(Event::Updates(generation, updates));
+        });
+    }
+    fn update_counts(&self) {
+        let mut status = state().lock().unwrap();
+        status.queued = self
+            .pending
+            .values()
+            .filter(|p| p.message.is_none())
+            .count();
+        status.delivered = self
+            .pending
+            .values()
+            .filter(|p| p.message.is_some())
+            .count();
     }
     fn note(&self, text: &str) {
         state().lock().unwrap().text = text.to_owned();
@@ -451,6 +484,9 @@ impl Worker {
             self.closed.clear();
         }
         self.closed.insert(key.to_owned());
+        self.forget(key, text);
+    }
+    fn forget(&mut self, key: &str, text: &str) {
         if let Some(pending) = self.pending.remove(key)
             && let Some(message) = pending.message
         {
@@ -470,6 +506,33 @@ impl Worker {
     }
     fn event(&mut self, event: Event) {
         match event {
+            Event::Updates(generation, updates) => {
+                self.polling = false;
+                if generation != self.generation {
+                    return;
+                }
+                match updates {
+                    Ok(updates) => {
+                        let previous = self.config.offset;
+                        for update in updates.as_array().into_iter().flatten() {
+                            if let Some(id) = update["update_id"].as_i64()
+                                && id >= self.config.offset
+                            {
+                                self.config.offset = id + 1;
+                                self.update(update);
+                            }
+                        }
+                        if previous != self.config.offset {
+                            self.save();
+                        }
+                    }
+                    Err(error) => {
+                        self.note(&error.to_string());
+                        self.poll_retry = Instant::now() + Duration::from_secs(15);
+                    }
+                }
+            }
+
             Event::Connect(token) => {
                 self.note("Connecting…");
                 let result = self.connect(token.trim());
@@ -514,13 +577,24 @@ impl Worker {
                     && !self.pending.contains_key(&key)
                     && !self.closed.contains(&key)
                     && self.pending.len() < 128
-                    && let Ok(pending) = Pending::new(*session)
                 {
-                    self.pending.insert(key, pending);
+                    match Pending::new(*session) {
+                        Ok(pending) => {
+                            self.pending.insert(key, pending);
+                        }
+                        Err(_) => self.note(
+                            "Could not prepare the question for Telegram. Retrying on refresh.",
+                        ),
+                    }
                 }
             }
             Event::Sync(sessions) => {
                 let live: HashSet<_> = sessions.iter().filter_map(Session::approval_key).collect();
+                {
+                    let mut status = state().lock().unwrap();
+                    status.snapshot_pending = live.len();
+                    status.suppressed = live.intersection(&self.closed).count();
+                }
                 let stale: Vec<_> = self
                     .pending
                     .keys()
@@ -528,7 +602,11 @@ impl Worker {
                     .cloned()
                     .collect();
                 for key in stale {
-                    self.retire(&key, "Resolved or no longer pending.");
+                    // A discovery gap is not an authoritative resolution.
+                    self.forget(
+                        &key,
+                        "No longer pending. If it returns, use the latest request message.",
+                    );
                 }
                 for session in sessions {
                     if session.approval.is_some() {
@@ -574,6 +652,7 @@ impl Worker {
         };
         self.pair = Some((code, Instant::now() + Duration::from_secs(600)));
         self.retry = Instant::now();
+        self.poll_retry = Instant::now();
         self.save();
         self.publish();
         Ok(())
@@ -714,7 +793,7 @@ impl Worker {
             .into_iter()
             .find(|s| s.key() == pending.session.key() && s.approval == pending.session.approval);
         let Some(current) = current else {
-            self.retire(key, "Resolved or no longer pending.");
+            self.forget(key, "Resolved or no longer pending.");
             bail!("This request is no longer pending.");
         };
         anyhow::ensure!(
@@ -795,6 +874,8 @@ mod tests {
             retry: Instant::now(),
             generation: 0,
             closed: HashSet::new(),
+            polling: false,
+            poll_retry: Instant::now(),
         }
     }
     fn question(id: &str, freeform: bool) -> Question {
@@ -978,5 +1059,34 @@ mod tests {
         worker.event(Event::Resolve(key.clone()));
         worker.event(Event::Observe(Box::new(session)));
         assert!(!worker.pending.contains_key(&key));
+    }
+    #[test]
+    fn temporary_discovery_gaps_do_not_permanently_suppress_a_question() {
+        let mut worker = worker();
+        let session = session();
+        let key = session.approval_key().unwrap();
+        worker.event(Event::Sync(vec![session.clone()]));
+        assert!(worker.pending.contains_key(&key));
+        worker.event(Event::Sync(vec![]));
+        assert!(!worker.pending.contains_key(&key));
+        assert!(!worker.closed.contains(&key));
+        worker.event(Event::Sync(vec![session]));
+        assert!(worker.pending.contains_key(&key));
+    }
+    #[test]
+    fn pending_delivery_can_be_queued_while_a_long_poll_is_in_flight() {
+        let mut worker = worker();
+        worker.polling = true;
+        let session = session();
+        let key = session.approval_key().unwrap();
+        worker.event(Event::Observe(Box::new(session)));
+        assert!(worker.pending.contains_key(&key));
+        worker.event(Event::Resolve(key.clone()));
+        assert!(!worker.pending.contains_key(&key));
+        assert!(worker.polling);
+        // Results of a poll from an old pairing/enable generation have no authority.
+        worker.event(Event::Updates(99, Ok(json!([{"update_id":1000}]))));
+        assert_eq!(worker.config.offset, 0);
+        assert!(!worker.polling);
     }
 }
