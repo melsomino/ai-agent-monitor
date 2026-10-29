@@ -53,6 +53,20 @@ pub fn toggle_from_hotkey() {
     });
 }
 
+/// Shared by the native menu dispatcher and AppKit's event-fetching loop.
+/// Return false for everything outside our open sessions menu.
+pub fn handle_menu_key(event: &NSEvent) -> bool {
+    CONTROLLER.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|slot| {
+                slot.as_ref()
+                    .map(|controller| controller.handle_session_key(event))
+            })
+            .unwrap_or(false)
+    })
+}
+
 pub fn is_resident() -> bool {
     RESIDENT.load(Ordering::Relaxed)
 }
@@ -108,6 +122,8 @@ struct State {
     buttons: RefCell<Vec<ButtonHover>>,
     toolbar_buttons: RefCell<Vec<ButtonHover>>,
     hovered: Cell<Option<pointer::Target>>,
+    keyboard_focus: RefCell<Option<String>>,
+    keyboard_handler: RefCell<Option<hotkey::MenuKeyboard>>,
     pointer_timer: RefCell<Option<Retained<NSTimer>>>,
     last_pointer: Cell<Option<NSPoint>>,
 }
@@ -215,6 +231,7 @@ define_class!(
 
         #[unsafe(method(pollPointer:))]
         fn poll_pointer(&self, _timer: &NSTimer) {
+            self.start_keyboard_tracking();
             self.receive_sessions();
             self.advance_disclosure();
             self.advance_working_icons();
@@ -453,6 +470,9 @@ define_class!(
 struct HoverState {
     background: OnceCell<Retained<NSBox>>,
     active: Cell<bool>,
+    focused: Cell<bool>,
+    title: OnceCell<Retained<NSTextField>>,
+    arrow: OnceCell<Retained<NSImageView>>,
 }
 define_class!(
     // SAFETY: This NSView only stores its hover decoration on the main thread.
@@ -488,11 +508,36 @@ impl SessionRowView {
             .expect("background initialized once");
         row
     }
-    fn set_hovered(&self, active: bool) {
-        if self.ivars().active.replace(active) != active
-            && let Some(background) = self.ivars().background.get()
-        {
-            paint_hover(background, if active { 1.0 } else { 0.0 });
+    fn set_highlight(&self, active: bool, focused: bool) {
+        let changed = self.ivars().active.replace(active) != active;
+        let changed = (self.ivars().focused.replace(focused) != focused) || changed;
+        if !changed {
+            return;
+        }
+        if let Some(background) = self.ivars().background.get() {
+            let color = if focused {
+                NSColor::selectedContentBackgroundColor()
+            } else {
+                NSColor::labelColor().colorWithAlphaComponent(0.12)
+            };
+            background.setFillColor(&color);
+            paint_hover(background, if active || focused { 1.0 } else { 0.0 });
+        }
+        if let Some(title) = self.ivars().title.get() {
+            let color = if focused {
+                NSColor::selectedMenuItemTextColor()
+            } else {
+                NSColor::labelColor()
+            };
+            title.setTextColor(Some(&color));
+        }
+        if let Some(arrow) = self.ivars().arrow.get() {
+            let color = if focused {
+                NSColor::selectedMenuItemTextColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            arrow.setContentTintColor(Some(&color));
         }
     }
 }
@@ -551,6 +596,28 @@ struct LayoutRow {
     detail: Option<Retained<RevealClipView>>,
     arrow: Option<Retained<NSImageView>>,
     working_icon: Option<Retained<WorkingIconView>>,
+}
+
+fn adjacent_session(current: Option<usize>, count: usize, forward: bool) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    Some(match current.filter(|index| *index < count) {
+        None => {
+            if forward {
+                0
+            } else {
+                count - 1
+            }
+        }
+        Some(index) => {
+            if forward {
+                (index + 1).min(count - 1)
+            } else {
+                index.saturating_sub(1)
+            }
+        }
+    })
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
@@ -1515,12 +1582,113 @@ impl MenuController {
     }
 
     fn close_panel(&self) {
+        self.stop_keyboard_tracking();
+        self.ivars().keyboard_focus.borrow_mut().take();
         self.stop_pointer_tracking();
         let state = self.ivars();
         state.reset_disclosures();
         self.render_rows(&state.all.borrow());
         if let Some(scroll) = state.scroll.get() {
             scroll.contentView().scrollToPoint(NSPoint::new(0.0, 0.0));
+        }
+    }
+
+    fn start_keyboard_tracking(&self) {
+        let state = self.ivars();
+        // Install after NSMenu has attached the view and entered its tracking loop.
+        if state.menu_open.get()
+            && state.keyboard_handler.borrow().is_none()
+            && state.root.get().and_then(|root| root.window()).is_some()
+        {
+            match hotkey::MenuKeyboard::new(self.mtm()) {
+                Ok(handler) => *state.keyboard_handler.borrow_mut() = Some(handler),
+                Err(error) => eprintln!("ai-agent-monitor: {error:#}"),
+            }
+        }
+    }
+
+    fn stop_keyboard_tracking(&self) {
+        self.ivars().keyboard_handler.borrow_mut().take();
+    }
+
+    fn handle_session_key(&self, event: &NSEvent) -> bool {
+        let state = self.ivars();
+        if !state.menu_open.get()
+            || event.modifierFlags().intersects(
+                NSEventModifierFlags::Command
+                    | NSEventModifierFlags::Control
+                    | NSEventModifierFlags::Option,
+            )
+        {
+            return false;
+        }
+        let key = event.keyCode();
+        if !matches!(key, 125 | 126 | 36 | 76 | 49) {
+            return false;
+        }
+        if matches!(key, 125 | 126) {
+            let ids: Vec<_> = state
+                .layout
+                .borrow()
+                .iter()
+                .filter_map(|row| row.id.clone())
+                .collect();
+            let current = state
+                .keyboard_focus
+                .borrow()
+                .as_ref()
+                .and_then(|id| ids.iter().position(|key| key == id));
+            if let Some(index) = adjacent_session(current, ids.len(), key == 125) {
+                *state.keyboard_focus.borrow_mut() = Some(ids[index].clone());
+                self.reveal_keyboard_focus();
+                self.apply_hover(state.hovered.get());
+            }
+            return true;
+        }
+        let Some(id) = state.keyboard_focus.borrow().clone() else {
+            return true;
+        };
+        if key == 49 {
+            if !event.isARepeat() {
+                self.begin_disclosure(&id);
+            }
+        } else if !event.isARepeat() {
+            let target = state
+                .all
+                .borrow()
+                .iter()
+                .find(|session| session.key() == id)
+                .and_then(Session::open_target);
+            if let Some(target) = target {
+                self.dismiss_menu();
+                native::open_target(&target);
+            }
+        }
+        true
+    }
+
+    fn reveal_keyboard_focus(&self) {
+        let state = self.ivars();
+        let focus = state.keyboard_focus.borrow().clone();
+        let header = state
+            .layout
+            .borrow()
+            .iter()
+            .find(|row| row.id.is_some() && row.id == focus)
+            .map(|row| {
+                let frame = row.view.frame();
+                rect(
+                    frame.origin.x,
+                    frame.origin.y - SESSION_HOVER_PADDING,
+                    frame.size.width,
+                    SESSION_HEADER_HEIGHT + 2.0 * SESSION_HOVER_PADDING,
+                )
+            });
+        // Release layout borrows: scrolling synchronously updates hover hit testing.
+        if let Some(header) = header
+            && let Some(list) = state.list.get()
+        {
+            list.scrollRectToVisible(header);
         }
     }
 
@@ -1575,9 +1743,8 @@ impl MenuController {
 
     fn apply_hover(&self, target: Option<pointer::Target>) {
         let state = self.ivars();
-        if state.hovered.replace(target) == target {
-            return;
-        }
+        state.hovered.set(target);
+        let focus = state.keyboard_focus.borrow();
         for (index, item) in state
             .layout
             .borrow()
@@ -1586,7 +1753,12 @@ impl MenuController {
             .enumerate()
         {
             if let Some(row) = &item.row {
-                row.set_hovered(target == Some(pointer::Target::Row(index)));
+                row.set_highlight(
+                    target == Some(pointer::Target::Row(index)),
+                    item.id
+                        .as_ref()
+                        .is_some_and(|id| Some(id) == focus.as_ref()),
+                );
             }
         }
         for (index, item) in state
@@ -1605,6 +1777,7 @@ impl MenuController {
                 },
             );
         }
+        drop(focus);
         // Flush the changed decorations even when no control redraw or click
         // occurs: pointer sampling can run while NSApplication waits for events.
         if let Some(root) = state.root.get() {
@@ -2021,6 +2194,10 @@ impl MenuController {
                 false,
             );
             center_label(&title, height - SESSION_HEADER_HEIGHT / 2.0);
+            row.ivars()
+                .title
+                .set(title)
+                .expect("title initialized once");
             let working_icon = self.status_icon(
                 &row,
                 session.activity,
@@ -2079,6 +2256,10 @@ impl MenuController {
                 icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
                 decoration.addSubview(&icon);
                 arrow.addSubview(&decoration);
+                row.ivars()
+                    .arrow
+                    .set(icon.clone())
+                    .expect("arrow initialized once");
                 arrow_icon = Some(icon);
             }
             arrow.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
@@ -2158,6 +2339,15 @@ impl MenuController {
         }
         drop(reveal);
         drop(expanded);
+        if self
+            .ivars()
+            .keyboard_focus
+            .borrow()
+            .as_ref()
+            .is_some_and(|id| !layout.iter().any(|row| row.id.as_ref() == Some(id)))
+        {
+            self.ivars().keyboard_focus.borrow_mut().take();
+        }
         *self.ivars().layout.borrow_mut() = layout;
         self.layout_rows();
         self.advance_working_icons();
@@ -2390,6 +2580,17 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<bool> {
 #[cfg(test)]
 mod close_tests {
     use super::*;
+
+    #[test]
+    fn keyboard_navigation_starts_at_an_edge_and_stays_within_the_sessions() {
+        assert_eq!(adjacent_session(None, 0, true), None);
+        assert_eq!(adjacent_session(None, 3, true), Some(0));
+        assert_eq!(adjacent_session(None, 3, false), Some(2));
+        assert_eq!(adjacent_session(Some(0), 3, false), Some(0));
+        assert_eq!(adjacent_session(Some(1), 3, true), Some(2));
+        assert_eq!(adjacent_session(Some(2), 3, true), Some(2));
+        assert_eq!(adjacent_session(Some(1), 3, false), Some(0));
+    }
 
     fn session(id: &str, approval: Option<&str>) -> Session {
         Session {

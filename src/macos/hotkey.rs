@@ -193,6 +193,7 @@ type Handler = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i3
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     fn GetEventDispatcherTarget() -> *mut c_void;
+    fn CallNextEventHandler(handler: *mut c_void, event: *mut c_void) -> i32;
     fn InstallEventHandler(
         target: *mut c_void,
         handler: Handler,
@@ -315,6 +316,73 @@ impl Drop for Registration {
             }
         }
     }
+}
+
+/// Raw key events are dispatched directly by NSMenu, bypassing NSEvent monitors.
+/// Registered only while our menu is tracking, without a global keyboard tap.
+pub struct MenuKeyboard {
+    handler: *mut c_void,
+    _main_thread: PhantomData<Rc<()>>,
+}
+impl MenuKeyboard {
+    pub fn new(_mtm: MainThreadMarker) -> Result<Self> {
+        let mut registration = Self {
+            handler: ptr::null_mut(),
+            _main_thread: PhantomData,
+        };
+        let types = [
+            EventType {
+                class: u32::from_be_bytes(*b"keyb"),
+                kind: 1,
+            },
+            EventType {
+                class: u32::from_be_bytes(*b"keyb"),
+                kind: 2,
+            },
+        ];
+        // SAFETY: SDK event kinds are raw key-down and repeat; no borrowed user data.
+        let status = unsafe {
+            InstallEventHandler(
+                GetEventDispatcherTarget(),
+                menu_key_pressed,
+                types.len(),
+                types.as_ptr(),
+                ptr::null_mut(),
+                &mut registration.handler,
+            )
+        };
+        anyhow::ensure!(
+            status == 0,
+            "Could not install menu keyboard handler ({status})"
+        );
+        Ok(registration)
+    }
+}
+impl Drop for MenuKeyboard {
+    fn drop(&mut self) {
+        if !self.handler.is_null() {
+            // SAFETY: Owned registration, removed on its main thread.
+            unsafe {
+                RemoveEventHandler(self.handler);
+            }
+        }
+    }
+}
+unsafe extern "C" fn menu_key_pressed(
+    handler: *mut c_void,
+    event: *mut c_void,
+    _: *mut c_void,
+) -> i32 {
+    if MainThreadMarker::new().is_some()
+        && let Some(event_ref) = std::ptr::NonNull::new(event)
+        // SAFETY: Carbon supplies a live event for the duration of this callback.
+        && let Some(event) = (unsafe { objc2_app_kit::NSEvent::eventWithEventRef(event_ref) })
+        && crate::macos::menu::handle_menu_key(&event)
+    {
+        return 0;
+    }
+    // SAFETY: Forward unhandled events, including Escape and menu key equivalents.
+    unsafe { CallNextEventHandler(handler, event) }
 }
 
 #[cfg(test)]

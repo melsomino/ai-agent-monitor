@@ -5,19 +5,47 @@ use anyhow::{Result, bail};
 use block2::{DynBlock, RcBlock};
 use dispatch2::DispatchQueue;
 use objc2::{
-    ClassType, MainThreadMarker, define_class, msg_send,
+    ClassType, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
     runtime::{Bool, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
-    NSRunningApplication, NSWorkspace,
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSEvent,
+    NSEventMask, NSEventType, NSRunningApplication, NSWorkspace,
 };
 use objc2_foundation::{
-    NSArray, NSDictionary, NSError, NSObject, NSObjectProtocol, NSSet, NSString, NSURL, ns_string,
+    NSArray, NSDate, NSDictionary, NSError, NSObject, NSObjectProtocol, NSRunLoopMode, NSSet,
+    NSString, NSURL, ns_string,
 };
 use objc2_user_notifications::*;
 use std::{path::Path, ptr::NonNull};
+
+define_class!(
+    // SAFETY: NSApplication permits event-loop subclassing. All AppKit events
+    // and the sessions controller are confined to the main thread.
+    #[unsafe(super(NSApplication))]
+    #[thread_kind = MainThreadOnly]
+    struct MonitorApplication;
+    unsafe impl NSObjectProtocol for MonitorApplication {}
+    impl MonitorApplication {
+        #[unsafe(method_id(nextEventMatchingMask:untilDate:inMode:dequeue:))]
+        fn next_event(&self, mask: NSEventMask, expiration: Option<&NSDate>, mode: &NSRunLoopMode, dequeue: bool) -> Option<Retained<NSEvent>> {
+            loop {
+                // SAFETY: Preserve AppKit's requested mask, deadline, mode and queue semantics.
+                let event: Option<Retained<NSEvent>> = unsafe {
+                    msg_send![super(self), nextEventMatchingMask: mask, untilDate: expiration, inMode: mode, dequeue: dequeue]
+                };
+                let Some(event) = event else { break None; };
+                if dequeue && event.r#type() == NSEventType::KeyDown
+                    && crate::macos::menu::handle_menu_key(&event)
+                {
+                    continue;
+                }
+                break Some(event);
+            }
+        }
+    }
+);
 
 pub fn open_target(value: &str) -> bool {
     let Some(path) = core::vscode_path(value) else {
@@ -291,7 +319,10 @@ fn send(message: &Message, response: Option<&str>) {
 
 pub fn run(command: NativeCommand) -> Result<()> {
     let mtm = MainThreadMarker::new().expect("native UI must start on main thread");
-    let app = NSApplication::sharedApplication(mtm);
+    // SAFETY: Create the application singleton as our public NSApplication subclass
+    // before any other code requests it. No change to key-window or activation behavior.
+    let app: Retained<NSApplication> =
+        unsafe { msg_send![MonitorApplication::class(), sharedApplication] };
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     if matches!(command, NativeCommand::Listen | NativeCommand::Sessions)
         && !crate::macos::menu::start(mtm, matches!(command, NativeCommand::Sessions))?
