@@ -2495,7 +2495,7 @@ impl MenuController {
                 let y = height - 8.0 - 24.0 * (index + 1 + filter_rows) as f64;
                 let name = self.label(
                     footer,
-                    &window.label(),
+                    &format!("Codex {}", window.label()),
                     rect(20.0, y, 178.0, 20.0),
                     12.0,
                     0.0,
