@@ -2,6 +2,7 @@
 pub(crate) mod claude;
 pub(crate) mod cline;
 pub(crate) mod codex;
+pub(crate) mod interaction;
 pub(crate) mod pending;
 pub(crate) mod sessions;
 pub(crate) mod tracking;

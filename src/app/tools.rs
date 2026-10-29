@@ -35,7 +35,9 @@ pub fn bundle() -> Result<()> {
     temporary.persist(&executable)?;
     fs::write(
         contents.join("Info.plist"),
-        include_bytes!("../../assets/Info.plist"),
+        include_str!("../../assets/Info.plist")
+            .replace("@BUILD_NUMBER@", env!("AI_AGENT_MONITOR_BUILD"))
+            .replace("@VERSION@", env!("CARGO_PKG_VERSION")),
     )?;
     fs::write(
         contents.join("Resources/AppIcon.icns"),

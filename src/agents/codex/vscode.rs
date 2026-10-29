@@ -224,9 +224,10 @@ fn live_logs(paths: &[PathBuf]) -> Result<HashMap<PathBuf, HashSet<u32>>> {
     let (status, output, _) = output_with_timeout(&mut command, Duration::from_secs(2))?;
     // lsof may report unmatched historical paths while still returning live
     // matches. Only the returned PID/file pairs are used below.
-    if !matches!(status, Some(0 | 1)) {
-        return Ok(HashMap::new());
-    }
+    anyhow::ensure!(
+        matches!(status, Some(0 | 1)),
+        "Could not discover VS Code extension hosts"
+    );
     let allowed: HashSet<_> = paths.iter().collect();
     let mut result: HashMap<PathBuf, HashSet<u32>> = HashMap::new();
     let mut pid = None;
@@ -277,17 +278,39 @@ struct Match {
     owner: bool,
 }
 
+#[derive(Default)]
+pub struct LiveSessions {
+    pub active: HashSet<String>,
+    pub workspaces: HashMap<String, PathBuf>,
+    complete: bool,
+}
+
+#[cfg(test)]
 fn resolve(
     storage: &Path,
     ids: &HashSet<String>,
     live: &HashMap<PathBuf, HashSet<u32>>,
     cache: &mut HashMap<PathBuf, CachedLog>,
 ) -> HashMap<String, PathBuf> {
+    resolve_live(storage, ids, live, cache).workspaces
+}
+
+fn resolve_live(
+    storage: &Path,
+    ids: &HashSet<String>,
+    live: &HashMap<PathBuf, HashSet<u32>>,
+    cache: &mut HashMap<PathBuf, CachedLog>,
+) -> LiveSessions {
+    let mut result = LiveSessions {
+        complete: true,
+        ..LiveSessions::default()
+    };
     let mut matches: HashMap<String, Match> = HashMap::new();
     let mut ambiguous = HashSet::new();
     let mut read_paths = HashSet::new();
     for (host_log, pids) in live {
         let Ok(host) = read_log(cache, host_log, storage) else {
+            result.complete = false;
             continue;
         };
         read_paths.insert(host_log.clone());
@@ -297,17 +320,12 @@ fn resolve(
         if !pids.contains(pid) {
             continue;
         }
-        let Some((_, id)) = host
+        let workspace = host
             .workspaces
             .iter()
             .filter(|(time, _)| time >= start)
             .max_by_key(|(time, _)| time)
-        else {
-            continue;
-        };
-        let Some(workspace) = workspace_path(storage, id) else {
-            continue;
-        };
+            .and_then(|(_, id)| workspace_path(storage, id));
         let Some(directory) = host_log.parent() else {
             continue;
         };
@@ -324,6 +342,7 @@ fn resolve(
             }
             let path = entry.path();
             let Ok(data) = read_log(cache, &path, storage) else {
+                result.complete = false;
                 continue;
             };
             read_paths.insert(path);
@@ -342,6 +361,10 @@ fn resolve(
             if !matches!(role.name.as_str(), "owner" | "follower") {
                 continue;
             }
+            result.active.insert(id.clone());
+            let Some(workspace) = workspace.as_ref() else {
+                continue;
+            };
             let candidate = Match {
                 path: workspace.clone(),
                 timestamp: role.timestamp,
@@ -365,25 +388,40 @@ fn resolve(
         }
     }
     cache.retain(|path, _| read_paths.contains(path));
-    matches
+    result.workspaces = matches
         .into_iter()
         .filter(|(id, _)| !ambiguous.contains(id))
         .map(|(id, value)| (id, value.path))
-        .collect()
+        .collect();
+    result
 }
 
 pub fn workspaces(ids: &HashSet<String>, storage: &Path) -> HashMap<String, PathBuf> {
+    live_sessions(ids, storage)
+        .map(|live| live.workspaces)
+        .unwrap_or_default()
+}
+
+/// None means discovery is unavailable; an empty verified set means no IDE
+/// windows currently have these chats loaded. Directory existence is unrelated.
+pub fn live_sessions(ids: &HashSet<String>, storage: &Path) -> Option<LiveSessions> {
     if ids.is_empty() {
-        return HashMap::new();
+        return Some(LiveSessions {
+            complete: true,
+            ..LiveSessions::default()
+        });
     }
-    let Ok(live) = live_logs(&candidate_logs(storage)) else {
-        return HashMap::new();
-    };
+    let paths = candidate_logs(storage);
+    if paths.is_empty() {
+        return None;
+    }
+    let live = live_logs(&paths).ok()?;
     let mut cache = LOG_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    resolve(storage, ids, &live, &mut cache)
+    let resolved = resolve_live(storage, ids, &live, &mut cache);
+    resolved.complete.then_some(resolved)
 }
 
 #[cfg(test)]
@@ -475,6 +513,42 @@ mod tests {
         assert!(!resolved.contains_key(CHAT));
         assert_eq!(resolved.get(OTHER), Some(&project));
         assert!(resolve(&storage, &ids, &HashMap::new(), &mut cache).is_empty());
+    }
+
+    #[test]
+    fn closed_windows_disappear_even_while_a_shared_codex_process_retains_the_rollout() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("Code/User/workspaceStorage");
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let (host, log) = window(&storage, 4, 123, &project);
+        fs::write(&log, role(2, CHAT, "follower")).unwrap();
+        let ids = HashSet::from([CHAT.to_owned()]);
+        let mut cache = HashMap::new();
+        let live = HashMap::from([(host.clone(), HashSet::from([123]))]);
+        assert!(
+            resolve_live(&storage, &ids, &live, &mut cache)
+                .active
+                .contains(CHAT)
+        );
+        // Missing/deleted worktrees do not imply that a live window is closed.
+        fs::remove_dir(&project).unwrap();
+        let resolved = resolve_live(&storage, &ids, &live, &mut cache);
+        assert!(resolved.active.contains(CHAT));
+        assert!(resolved.workspaces.is_empty());
+        // Closing the extension host must remove membership, including cached roles.
+        let resolved = resolve_live(&storage, &ids, &HashMap::new(), &mut cache);
+        assert!(resolved.complete);
+        assert!(resolved.active.is_empty());
+        // Reopening the window and loading the same chat restores membership.
+        append(&host, &line(3, "Extension host with pid 456 started"));
+        append(&log, &role(4, CHAT, "follower"));
+        let reopened = HashMap::from([(host, HashSet::from([456]))]);
+        assert!(
+            resolve_live(&storage, &ids, &reopened, &mut cache)
+                .active
+                .contains(CHAT)
+        );
     }
 
     #[test]

@@ -1,4 +1,7 @@
-//! Observe the existing owner's live IPC stream. Never resume a thread or run a model.
+//! Observe the existing owner without resuming threads. Explicit replies are forwarded
+//! to that owner; async question replies use its normal user-message admission.
+use super::{async_questions, requests};
+use crate::agents::interaction::{Interaction, Response};
 use crate::agents::sessions::{Activity, Approval};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -105,6 +108,8 @@ pub fn views(ids: &HashSet<String>) -> HashMap<String, View> {
                 && s.state["requests"]
                     .as_array()
                     .is_some_and(|requests| requests.contains(&t.request))
+                || (s.owner == t.owner
+                    && async_questions::pending(&s.state).as_ref() == Some(&t.request))
         })
     });
     let mut result = HashMap::new();
@@ -115,20 +120,25 @@ pub fn views(ids: &HashSet<String>) -> HashMap<String, View> {
         let Some(activity) = activity(&live.state["threadRuntimeStatus"]) else {
             continue;
         };
-        let request = live.state["requests"].as_array().and_then(|requests| {
-            requests.iter().find(|r| {
-                matches!(
-                    r["method"].as_str(),
-                    Some(
-                        "item/commandExecution/requestApproval"
-                            | "item/fileChange/requestApproval"
-                            | "item/permissions/requestApproval"
-                            | "item/tool/requestUserInput"
-                            | "item/tool/requestOptionPicker"
+        let async_request = async_questions::pending(&live.state);
+        let request = live.state["requests"]
+            .as_array()
+            .and_then(|requests| {
+                requests.iter().find(|r| {
+                    matches!(
+                        r["method"].as_str(),
+                        Some(
+                            "item/commandExecution/requestApproval"
+                                | "item/fileChange/requestApproval"
+                                | "item/permissions/requestApproval"
+                                | "item/tool/requestUserInput"
+                                | "item/tool/requestOptionPicker"
+                                | "mcpServer/elicitation/request"
+                        )
                     )
-                )
+                })
             })
-        });
+            .or(async_request.as_ref());
         let approval = if let Some(request) = request {
             let token = state
                 .tickets
@@ -157,7 +167,10 @@ pub fn views(ids: &HashSet<String>) -> HashMap<String, View> {
                 id: token,
                 body: body(request),
                 expires: u64::MAX,
-                can_allow: approval_method(request).is_some(),
+                can_allow: requests::interaction(request)
+                    .actions
+                    .iter()
+                    .any(|action| action.id == "allow"),
             })
         } else if activity == Activity::Confirmation {
             Some(Approval {
@@ -195,7 +208,8 @@ pub fn pending_count(exclude: &HashSet<String>) -> usize {
         .iter()
         .filter(|(id, s)| {
             !exclude.contains(*id)
-                && activity(&s.state["threadRuntimeStatus"]) == Some(Activity::Confirmation)
+                && (activity(&s.state["threadRuntimeStatus"]) == Some(Activity::Confirmation)
+                    || async_questions::pending(&s.state).is_some())
         })
         .count()
 }
@@ -219,13 +233,46 @@ fn activity(status: &Value) -> Option<Activity> {
 }
 fn body(request: &Value) -> String {
     let p = &request["params"];
-    for key in ["reason", "justification", "message"] {
-        if let Some(text) = p[key].as_str().filter(|s| !s.trim().is_empty()) {
-            return crate::app::core::shorten(text, 2000);
+    if request["method"] == "item/tool/requestUserInput"
+        || request["method"] == async_questions::METHOD
+    {
+        let questions = requests::interaction(request).questions;
+        if !questions.is_empty() {
+            return questions
+                .iter()
+                .map(|question| question.title.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
         }
     }
-    if let Some(question) = p["questions"][0]["question"].as_str() {
-        return crate::app::core::shorten(question, 2000);
+    if request["method"] == "item/tool/requestOptionPicker" {
+        let mut text = p["question"]
+            .as_str()
+            .unwrap_or("Choose an option in Codex.")
+            .to_owned();
+        for option in p["options"].as_array().into_iter().flatten() {
+            if let Some(label) = option["label"].as_str() {
+                text.push_str(&format!("\n• {label}"));
+                if let Some(description) = option["description"].as_str().filter(|s| !s.is_empty())
+                {
+                    text.push_str(&format!(" — {description}"));
+                }
+            }
+        }
+        return text;
+    }
+    let reason = ["reason", "justification", "message"]
+        .iter()
+        .find_map(|key| p[key].as_str().filter(|s| !s.trim().is_empty()));
+    if request["method"] == "item/permissions/requestApproval" {
+        return format!(
+            "{}\n\n{}",
+            reason.unwrap_or("Allow the requested permissions?"),
+            serde_json::to_string_pretty(&p["permissions"]).unwrap_or_default()
+        );
+    }
+    if let Some(text) = reason {
+        return crate::app::core::shorten(text, 2000);
     }
     match request["method"].as_str() {
         Some("item/commandExecution/requestApproval") => "Allow this command?".into(),
@@ -233,6 +280,7 @@ fn body(request: &Value) -> String {
         _ => "Codex is waiting for your confirmation or input.".into(),
     }
 }
+#[cfg(test)]
 fn approval_method(request: &Value) -> Option<&'static str> {
     if !request["id"].is_string() && !request["id"].is_number() {
         return None;
@@ -247,14 +295,15 @@ fn approval_method(request: &Value) -> Option<&'static str> {
 }
 fn exact_request(state: &Value, ticket: &Ticket) -> bool {
     state["id"] == ticket.session
-        && state["requests"]
+        && (state["requests"]
             .as_array()
             .is_some_and(|requests| requests.contains(&ticket.request))
+            || async_questions::pending(state).as_ref() == Some(&ticket.request))
         && ticket.request["params"]["threadId"] == ticket.session
 }
 /// Only called by an explicit Allow click. Re-read from the same owner first.
 pub fn allow(token: &str) -> bool {
-    allow_inner(token).unwrap_or(false)
+    respond_inner(token, &Response::Action("allow".into())).unwrap_or(false)
 }
 pub fn allow_for(session: &crate::agents::sessions::Session) -> bool {
     let Some(approval) = &session.approval else {
@@ -276,16 +325,58 @@ pub fn allow_for(session: &crate::agents::sessions::Session) -> bool {
         });
     valid && allow(&approval.id)
 }
-fn allow_inner(token: &str) -> Result<bool> {
+pub fn interaction_for(session: &crate::agents::sessions::Session) -> Interaction {
+    let Some(approval) = &session.approval else {
+        return Interaction::default();
+    };
+    let Some(observer) = OBSERVER.get() else {
+        return Interaction::default();
+    };
+    observer
+        .state
+        .lock()
+        .unwrap()
+        .tickets
+        .get(&approval.id)
+        .filter(|ticket| ticket.session == session.id && body(&ticket.request) == approval.body)
+        .map(|ticket| requests::interaction(&ticket.request))
+        .unwrap_or_default()
+}
+pub fn respond_for(session: &crate::agents::sessions::Session, response: &Response) -> bool {
+    let Some(approval) = &session.approval else {
+        return false;
+    };
+    let Some(observer) = OBSERVER.get() else {
+        return false;
+    };
+    let valid = observer
+        .state
+        .lock()
+        .unwrap()
+        .tickets
+        .get(&approval.id)
+        .is_some_and(|ticket| {
+            ticket.session == session.id && body(&ticket.request) == approval.body
+        });
+    valid && respond_inner(&approval.id, response).unwrap_or(false)
+}
+fn respond_inner(token: &str, response: &Response) -> Result<bool> {
     let Some(observer) = OBSERVER.get() else {
         return Ok(false);
     };
     let Some(ticket) = observer.state.lock().unwrap().tickets.get(token).cloned() else {
         return Ok(false);
     };
-    let Some(method) = approval_method(&ticket.request) else {
-        return Ok(false);
+    let asynchronous = ticket.request["method"] == async_questions::METHOD;
+    let wire = requests::wire_response(&ticket.request, response);
+    let async_text = if asynchronous {
+        async_questions::reply_text(&ticket.request, response)
+    } else {
+        None
     };
+    if wire.is_none() && async_text.is_none() {
+        return Ok(false);
+    }
     let mut connection = Connection::connect()?;
     let owner = connection.owner(&ticket.session)?;
     if owner != ticket.owner {
@@ -312,17 +403,42 @@ fn allow_inner(token: &str) -> Result<bool> {
         if !exact_request(&change["conversationState"], &ticket) {
             return Ok(false);
         }
+        if let Some(text) = async_text {
+            let mut random = [0u8; 16];
+            fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+            random[6] = (random[6] & 0x0f) | 0x40;
+            random[8] = (random[8] & 0x3f) | 0x80;
+            let hex = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let client_id = format!(
+                "{}-{}-{}-{}-{}",
+                &hex[..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..]
+            );
+            let Some((method, version, params)) =
+                async_questions::reply_envelope(&change["conversationState"], &text, &client_id)
+            else {
+                return Ok(false);
+            };
+            let result = connection.request(method, params, version, Some(&owner))?;
+            return Ok(result["resultType"] == "success");
+        }
+        let Some((method, field, value)) = wire else {
+            return Ok(false);
+        };
         let id = &ticket.request["id"];
         let request_id = id
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| id.to_string());
-        let result = connection.request(
-            method,
-            json!({"conversationId":ticket.session,"requestId":request_id,"decision":"accept"}),
-            1,
-            Some(&owner),
-        )?;
+        let mut params = json!({"conversationId":ticket.session,"requestId":request_id});
+        params[field] = value;
+        let result = connection.request(method, params, 1, Some(&owner))?;
         return Ok(result["resultType"] == "success" && result["result"]["ok"] == true);
     }
     Ok(false)
@@ -435,12 +551,20 @@ impl Connection {
     ) -> Result<Value> {
         self.next_id += 1;
         let id = format!("aim-{}", self.next_id);
-        let mut message = json!({"type":"request","requestId":id,"sourceClientId":self.client,"method":method,"version":version,"params":params,"timeoutMs":1000});
+        let timeout = if matches!(
+            method,
+            "thread-follower-start-turn" | "thread-follower-steer-turn"
+        ) {
+            8000
+        } else {
+            1000
+        };
+        let mut message = json!({"type":"request","requestId":id,"sourceClientId":self.client,"method":method,"version":version,"params":params,"timeoutMs":timeout});
         if let Some(target) = target {
             message["targetClientId"] = target.into();
         }
         self.send(message)?;
-        let deadline = Instant::now() + Duration::from_millis(1500);
+        let deadline = Instant::now() + Duration::from_millis(timeout + 500);
         while Instant::now() < deadline {
             let Some(message) = self.read()? else {
                 continue;
@@ -607,7 +731,7 @@ fn apply_change(
             Live {
                 owner: owner.into(),
                 revision,
-                state: json!({"id":session,"requests":state["requests"],"threadRuntimeStatus":state["threadRuntimeStatus"]}),
+                state: async_questions::project(state),
             },
         );
         return true;
@@ -631,17 +755,21 @@ fn apply_change(
             live.remove(session);
             return false;
         };
-        if !matches!(
+        let value = if matches!(
             path.first().and_then(Value::as_str),
             Some("requests" | "threadRuntimeStatus")
         ) {
+            patch["value"].clone()
+        } else if let Some(value) = async_questions::project_patch(path, &patch["value"]) {
+            value
+        } else {
             continue;
-        }
+        };
         if !apply_patch(
             &mut current.state,
             path,
             patch["op"].as_str().unwrap_or(""),
-            &patch["value"],
+            &value,
         ) {
             live.remove(session);
             return false;
@@ -723,7 +851,12 @@ mod tests {
             Some(Activity::Confirmation)
         );
         assert_eq!(body(&state["requests"][0]), "Allow file update?");
-        assert!(state.get("turnHistory").is_none());
+        assert!(
+            state["turnHistory"]["history"]["entitiesByKey"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
         assert!(apply_change(
             &mut live,
             "chat",
@@ -750,6 +883,39 @@ mod tests {
             activity(&live["chat"].state["threadRuntimeStatus"]),
             Some(Activity::Idle)
         );
+    }
+    #[test]
+    fn async_questions_follow_history_patches_and_old_tickets_fail_after_a_reply() {
+        let raw = json!({"id":"chat","requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":{"history":{"entitiesByKey":{"turn:one":{"turnId":"one","turnStartedAtMs":1,"items":[{"type":"userMessage","id":"u"},{"type":"agentMessage","id":"call","questions":null}]}}}}});
+        let mut live = HashMap::new();
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &json!({"type":"snapshot","revision":1,"conversationState":raw})
+        ));
+        assert!(async_questions::pending(&live["chat"].state).is_none());
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &json!({"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"replace","path":["turnHistory","history","entitiesByKey","turn:one","items",1,"questions"],"value":[{"title":"Pick?","options":["A","B"]}]}]})
+        ));
+        let request = async_questions::pending(&live["chat"].state).unwrap();
+        let ticket = Ticket {
+            session: "chat".into(),
+            owner: "owner".into(),
+            request,
+        };
+        assert!(exact_request(&live["chat"].state, &ticket));
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &json!({"type":"patches","baseRevision":2,"revision":3,"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:two"],"value":{"turnId":"two","turnStartedAtMs":2,"items":[{"type":"userMessage","id":"reply","content":[{"type":"text","text":"New input"}]}]}}]})
+        ));
+        assert!(!exact_request(&live["chat"].state, &ticket));
+        assert!(async_questions::pending(&live["chat"].state).is_none());
     }
     #[test]
     fn stale_revisions_are_discarded_instead_of_reusing_old_approvals() {

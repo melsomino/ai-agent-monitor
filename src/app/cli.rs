@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 /// Native macOS session monitor and approval notifications for coding agents.
 #[derive(Debug, Parser)]
-#[command(name = "AIAgentMonitor", version)]
+#[command(name = "AIAgentMonitor", version = env!("AI_AGENT_MONITOR_VERSION"))]
 pub struct Cli {
     // No command is intentional: macOS relaunches the app this way on a click.
     #[command(subcommand)]

@@ -15,6 +15,7 @@ use url::Url;
 
 pub const WAIT: Duration = Duration::from_secs(60);
 pub const APP_NAME: &str = "AI Agent Monitor.app";
+pub const VERSION: &str = env!("AI_AGENT_MONITOR_VERSION");
 
 pub fn home() -> PathBuf {
     env::var_os("HOME")

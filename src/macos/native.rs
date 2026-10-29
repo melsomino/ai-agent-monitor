@@ -14,8 +14,8 @@ use objc2_app_kit::{
     NSEventMask, NSEventType, NSRunningApplication, NSWorkspace,
 };
 use objc2_foundation::{
-    NSArray, NSDate, NSDictionary, NSError, NSObject, NSObjectProtocol, NSRunLoopMode, NSSet,
-    NSString, NSURL, ns_string,
+    NSArray, NSDate, NSDictionary, NSError, NSObject, NSObjectProtocol, NSRunLoopMode, NSString,
+    NSURL, ns_string,
 };
 use objc2_user_notifications::*;
 use std::{path::Path, ptr::NonNull};
@@ -114,6 +114,91 @@ define_class!(
                     action == UNNotificationDismissActionIdentifier.to_string(),
                 )
             };
+            if let Some(index) = action
+                .strip_prefix("AGENT_REPLY_")
+                .and_then(|index| index.parse::<usize>().ok())
+            {
+                let key = info_string(&info, ns_string!("requestKey"));
+                let category = response
+                    .notification()
+                    .request()
+                    .content()
+                    .categoryIdentifier()
+                    .to_string();
+                let binding = crate::macos::notification_actions::lookup(&key, &category);
+                let text = response
+                    .downcast_ref::<UNTextInputNotificationResponse>()
+                    .map(|response| response.userText().to_string());
+                let identifier = response.notification().request().identifier().to_string();
+                completion.call(());
+                if let Some(binding) = binding {
+                    use crate::macos::notification_actions::Kind;
+                    let button = binding.plan.buttons.get(index).cloned();
+                    let reply = binding.plan.response(index, text.as_deref());
+                    if let Some(reply) = reply {
+                        std::thread::spawn(move || {
+                            let sent = binding.session.respond(&reply);
+                            DispatchQueue::main().exec_async(move || {
+                                if sent {
+                                    remove_session_notification(&key);
+                                } else {
+                                    let draft = match reply {
+                                        crate::agents::interaction::Response::Answers(answers) => {
+                                            Some(answers)
+                                        }
+                                        _ => None,
+                                    };
+                                    let form = !binding.session.interaction().questions.is_empty();
+                                    crate::macos::menu::show_notification_request(
+                                        binding.session,
+                                        form,
+                                        draft,
+                                    );
+                                }
+                                crate::macos::menu::refresh_after_response();
+                                if !crate::macos::menu::is_resident() {
+                                    std::process::exit(0);
+                                }
+                            });
+                        });
+                    } else {
+                        DispatchQueue::main().exec_async(move || {
+                            match button.map(|button| button.kind) {
+                                Some(Kind::Form) => crate::macos::menu::show_notification_request(
+                                    binding.session,
+                                    true,
+                                    None,
+                                ),
+                                Some(Kind::More) => {
+                                    let form = !binding.session.interaction().questions.is_empty();
+                                    crate::macos::menu::show_notification_request(
+                                        binding.session,
+                                        form,
+                                        None,
+                                    );
+                                }
+                                Some(Kind::Text) => crate::macos::menu::show_notification_request(
+                                    binding.session,
+                                    true,
+                                    None,
+                                ),
+                                _ => {
+                                    open_target(&target);
+                                }
+                            }
+                        });
+                    }
+                } else {
+                    DispatchQueue::main().exec_async(move || {
+                        remove_notification(&identifier);
+                        open_target(&target);
+                        if !crate::macos::menu::is_resident() {
+                            std::process::exit(0);
+                        }
+                    });
+                }
+                return;
+            }
             if action == "ALLOW_ONCE" && response_path.starts_with("ipc:") {
                 let identifier = response.notification().request().identifier().to_string();
                 completion.call(());
@@ -203,7 +288,7 @@ pub fn dismiss_approval(response: &Path) {
         .getDeliveredNotificationsWithCompletionHandler(&callback);
 }
 
-/// Live requests without a file-backed hook: only addressed Codex requests get Allow.
+/// Live requests get a request-specific action set, registered before delivery.
 pub fn notify_session(session: &crate::agents::sessions::Session) {
     let Some(approval) = session
         .approval
@@ -215,49 +300,51 @@ pub fn notify_session(session: &crate::agents::sessions::Session) {
     let Some(key) = session.approval_key() else {
         return;
     };
-    let content = UNMutableNotificationContent::new();
-    content.setTitle(&NSString::from_str(&session.title));
-    content.setSubtitle(&NSString::from_str(session.agent_label()));
-    content.setBody(&NSString::from_str(&approval.body));
-    content.setSound(Some(&UNNotificationSound::defaultSound()));
-    let target = NSString::from_str(&session.open_target().unwrap_or_default());
-    let response_token =
-        NSString::from_str(if approval.id.starts_with("ipc:") && approval.can_allow {
-            &approval.id
-        } else {
-            ""
-        });
-    let info = NSDictionary::<NSString, NSString>::from_slices(
-        &[ns_string!("target"), ns_string!("response")],
-        &[&target, &response_token],
-    );
-    if approval.id.starts_with("ipc:") && approval.can_allow {
-        content.setCategoryIdentifier(ns_string!("CODEX_APPROVAL"));
-    }
-    // SAFETY: The property-list dictionary contains only retained NSString values.
-    unsafe {
-        let _: () = msg_send![&*content, setUserInfo: &*info];
-    }
-    let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
-        &NSString::from_str(&format!("session-{key}")),
-        &content,
-        None,
-    );
-    let callback = RcBlock::new(|error: *mut NSError| {
-        // SAFETY: The framework supplies a live NSError or null.
-        if let Some(error) = unsafe { error.as_ref() } {
-            eprintln!("ai-agent-monitor: {}", error.localizedDescription());
+    let Some(plan) = crate::macos::notification_actions::bind(session) else {
+        return;
+    };
+    let mut body = approval.body.clone();
+    let mut shown = std::collections::HashSet::new();
+    for action in session.interaction().actions {
+        if !action.detail.is_empty()
+            && !body.contains(&action.detail)
+            && shown.insert(action.detail.clone())
+        {
+            body.push_str(&format!("\n\n{}\n{}", action.label, action.detail));
         }
-    });
-    UNUserNotificationCenter::currentNotificationCenter()
-        .addNotificationRequest_withCompletionHandler(&request, Some(&callback));
+    }
+    crate::macos::notification_categories::deliver(
+        plan,
+        crate::macos::notification_categories::Notice {
+            key,
+            title: session.title.clone(),
+            subtitle: session.agent_label().into(),
+            body,
+            target: session.open_target().unwrap_or_default(),
+            token: approval.id.clone(),
+        },
+    );
 }
 
 pub fn remove_session_notification(key: &str) {
+    let bound = crate::macos::notification_actions::remove(key);
     remove_notification(&format!("session-{key}"));
+    if bound && crate::macos::menu::is_resident() {
+        crate::macos::notification_categories::prune();
+    }
 }
 
 fn send(message: &Message, response: Option<&str>) {
+    let message = message.clone();
+    let response = response.map(str::to_owned);
+    crate::macos::notification_categories::legacy_then(move || {
+        let message = message.clone();
+        let response = response.clone();
+        DispatchQueue::main().exec_async(move || send_registered(&message, response.as_deref()));
+    });
+}
+
+fn send_registered(message: &Message, response: Option<&str>) {
     // The panel may answer while notification authorization/delivery is in flight.
     if response.is_some_and(|path| crate::agents::pending::is_resolved(Path::new(path))) {
         std::process::exit(0);
@@ -334,18 +421,9 @@ pub fn run(command: NativeCommand) -> Result<()> {
     let delegate: Retained<NotificationDelegate> =
         unsafe { msg_send![NotificationDelegate::class(), new] };
     center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    let action = UNNotificationAction::actionWithIdentifier_title_options(
-        ns_string!("ALLOW_ONCE"),
-        ns_string!("Allow"),
-        UNNotificationActionOptions::AuthenticationRequired,
-    );
-    let category = UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
-        ns_string!("CODEX_APPROVAL"),
-        &NSArray::from_slice(&[&*action]),
-        &NSArray::new(),
-        UNNotificationCategoryOptions::CustomDismissAction,
-    );
-    center.setNotificationCategories(&NSSet::from_slice(&[&*category]));
+    if crate::macos::menu::is_resident() {
+        crate::macos::notification_categories::legacy();
+    }
     match command {
         NativeCommand::NotificationSettings => {
             let callback = RcBlock::new(|settings: NonNull<UNNotificationSettings>| {
@@ -368,19 +446,34 @@ pub fn run(command: NativeCommand) -> Result<()> {
                     UNAlertStyle::Alert => "alert",
                     _ => "none",
                 };
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "authorization": authorization,
-                        "alertStyle": style,
-                        "alerts": enabled(settings.alertSetting()),
-                        "notificationCenter": enabled(settings.notificationCenterSetting()),
-                        "sound": enabled(settings.soundSetting()),
-                        "timeSensitive": enabled(settings.timeSensitiveSetting()),
-                        "scheduledDelivery": enabled(settings.scheduledDeliverySetting()),
-                    })
+                let summary = serde_json::json!({
+                    "authorization": authorization,
+                    "alertStyle": style,
+                    "alerts": enabled(settings.alertSetting()),
+                    "notificationCenter": enabled(settings.notificationCenterSetting()),
+                    "sound": enabled(settings.soundSetting()),
+                    "timeSensitive": enabled(settings.timeSensitiveSetting()),
+                    "scheduledDelivery": enabled(settings.scheduledDeliverySetting()),
+                });
+                let categories = RcBlock::new(
+                    move |categories: NonNull<objc2_foundation::NSSet<UNNotificationCategory>>| {
+                        // SAFETY: UserNotifications supplies a live set for this callback.
+                        let categories = unsafe { categories.as_ref() }.allObjects();
+                        let mut summary = summary.clone();
+                        summary["categories"] = serde_json::json!((0..categories.count()).map(|index| {
+                        let category = categories.objectAtIndex(index);
+                        let actions = category.actions();
+                        serde_json::json!({"id":category.identifier().to_string(),"actions":(0..actions.count()).map(|index| {
+                            let action = actions.objectAtIndex(index);
+                            serde_json::json!({"id":action.identifier().to_string(),"title":action.title().to_string(),"textInput":action.downcast_ref::<UNTextInputNotificationAction>().is_some()})
+                        }).collect::<Vec<_>>()})
+                    }).collect::<Vec<_>>());
+                        println!("{summary}");
+                        std::process::exit(0);
+                    },
                 );
-                std::process::exit(0);
+                UNUserNotificationCenter::currentNotificationCenter()
+                    .getNotificationCategoriesWithCompletionHandler(&categories);
             });
             center.getNotificationSettingsWithCompletionHandler(&callback);
         }

@@ -1,4 +1,6 @@
 //! Codex backend and its hook/VS Code integrations.
+pub(crate) mod async_questions;
+pub(crate) mod requests;
 pub(crate) mod runtime;
 pub(crate) mod usage;
 pub(crate) mod vscode;
@@ -62,6 +64,41 @@ impl SessionProvider for Codex {
         }
     }
 
+    fn interaction(&self, session: &Session) -> crate::agents::interaction::Interaction {
+        if session
+            .approval
+            .as_ref()
+            .is_some_and(|request| request.id.starts_with("ipc:"))
+        {
+            runtime::interaction_for(session)
+        } else if session
+            .approval
+            .as_ref()
+            .is_some_and(|request| request.can_allow)
+        {
+            crate::agents::interaction::Interaction::allow()
+        } else {
+            crate::agents::interaction::Interaction::default()
+        }
+    }
+    fn respond(&self, session: &Session, response: &crate::agents::interaction::Response) -> bool {
+        let responded = if session
+            .approval
+            .as_ref()
+            .is_some_and(|request| request.id.starts_with("ipc:"))
+        {
+            runtime::respond_for(session, response)
+        } else {
+            response == &crate::agents::interaction::Response::Action("allow".into())
+                && self.allow(session)
+        };
+        #[cfg(target_os = "macos")]
+        if responded && let Some(key) = session.approval_key() {
+            crate::macos::native::remove_session_notification(&key);
+        }
+        responded
+    }
+
     fn allow(&self, session: &Session) -> bool {
         let Some(snapshot) = session.approval.as_ref() else {
             return false;
@@ -105,12 +142,32 @@ fn open(home: &Path) -> Result<Vec<Session>> {
     let files = open_files(&output, home);
     let ids = files.keys().cloned().collect();
     let mut sessions = read_open(home, &ids)?;
-    let pending = crate::agents::pending::list_for("codex");
-    let mut runtime = runtime::views(&ids);
     for session in &mut sessions {
         if let Some(path) = files.get(&session.id) {
             enrich(session, path);
         }
+    }
+    let vscode_ids = sessions
+        .iter()
+        .filter(|session| session.client == Client::VSCode)
+        .map(|session| session.id.clone())
+        .collect();
+    let storage =
+        crate::app::core::home().join("Library/Application Support/Code/User/workspaceStorage");
+    if let Some(mut live) = vscode::live_sessions(&vscode_ids, &storage) {
+        // A shared backend can keep writing a rollout after its IDE window closed.
+        // Only a live extension host's current stream membership proves it is open.
+        sessions.retain(|session| {
+            session.client != Client::VSCode || live.active.contains(&session.id)
+        });
+        for session in &mut sessions {
+            session.workspace = live.workspaces.remove(&session.id);
+        }
+    }
+    let visible_ids = sessions.iter().map(|session| session.id.clone()).collect();
+    let pending = crate::agents::pending::list_for("codex");
+    let mut runtime = runtime::views(&visible_ids);
+    for session in &mut sessions {
         if let Some(live) = runtime.remove(&session.id) {
             session.activity = live.activity;
             session.approval = live.approval;
@@ -126,17 +183,6 @@ fn open(home: &Path) -> Result<Vec<Session>> {
         if session.approval.is_some() {
             session.activity = Activity::Confirmation;
         }
-    }
-    let vscode_ids = sessions
-        .iter()
-        .filter(|session| session.client == Client::VSCode)
-        .map(|session| session.id.clone())
-        .collect();
-    let storage =
-        crate::app::core::home().join("Library/Application Support/Code/User/workspaceStorage");
-    let mut workspaces = crate::agents::codex::vscode::workspaces(&vscode_ids, &storage);
-    for session in &mut sessions {
-        session.workspace = workspaces.remove(&session.id);
     }
     Ok(sessions)
 }

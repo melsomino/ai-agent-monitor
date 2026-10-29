@@ -1,9 +1,10 @@
 //! Agent-independent session snapshots and backend dispatch.
+use crate::agents::interaction::{Interaction, Response};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// A provider-owned opaque token plus the information needed by the UI.
-/// The provider must revalidate this snapshot before granting permission.
+/// The provider must revalidate this snapshot before sending any response.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Approval {
     pub id: String,
@@ -19,6 +20,25 @@ pub trait SessionProvider: Sync {
     fn pending_count(&self) -> usize;
     fn open_target(&self, session: &Session) -> String;
     fn allow(&self, session: &Session) -> bool;
+    fn interaction(&self, session: &Session) -> Interaction {
+        if session
+            .approval
+            .as_ref()
+            .is_some_and(|request| request.can_allow)
+        {
+            Interaction::allow()
+        } else {
+            Interaction::default()
+        }
+    }
+    fn respond(&self, session: &Session, response: &Response) -> bool {
+        response == &Response::Action("allow".into())
+            && session
+                .approval
+                .as_ref()
+                .is_some_and(|request| request.can_allow)
+            && self.allow(session)
+    }
 }
 
 /// Registry also serves as the dispatch boundary for session actions.
@@ -97,6 +117,15 @@ pub enum Client {
     Unknown,
 }
 impl Client {
+    /// Stable settings identity independent of the displayed group name.
+    pub fn application_id(self) -> String {
+        match self {
+            Self::VSCode => "com.microsoft.VSCode".into(),
+            Self::Terminal => "terminal".into(),
+            Self::Desktop { app_path, .. } => format!("desktop:{app_path}"),
+            Self::Unknown => "other".into(),
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Terminal => "Terminal",
@@ -119,7 +148,7 @@ impl Activity {
         match self {
             Self::Working => "Working",
             Self::Idle => "Idle",
-            Self::Confirmation => "Needs approval",
+            Self::Confirmation => "Needs response",
             Self::Unknown => "Unknown status",
         }
     }
@@ -182,6 +211,23 @@ impl Session {
 
     pub fn open_target(&self) -> Option<String> {
         registry().open_target(self)
+    }
+
+    pub fn interaction(&self) -> Interaction {
+        registry()
+            .provider(self.agent)
+            .map(|provider| provider.interaction(self))
+            .unwrap_or_default()
+    }
+
+    pub fn respond(&self, response: &Response) -> bool {
+        if response == &Response::Action("allow".into()) {
+            return self.allow();
+        }
+        self.approval.is_some()
+            && registry()
+                .provider(self.agent)
+                .is_some_and(|provider| provider.respond(self, response))
     }
 
     pub fn allow(&self) -> bool {

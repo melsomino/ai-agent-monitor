@@ -1,4 +1,5 @@
 //! Persistent preferences and macOS login-item registration.
+use crate::agents::sessions::Client;
 use anyhow::{Context, Result, bail};
 use objc2::{
     msg_send,
@@ -6,6 +7,105 @@ use objc2::{
     runtime::{AnyClass, AnyObject, Bool},
 };
 use objc2_foundation::{NSError, NSUserDefaults, ns_string};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnownApplication {
+    pub id: String,
+    pub name: String,
+    pub icon_path: Option<String>,
+    pub enabled: bool,
+}
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub struct Applications {
+    apps: BTreeMap<String, KnownApplication>,
+}
+impl Applications {
+    /// Keep previously seen applications, including disabled and currently closed ones.
+    pub fn observe(&mut self, clients: impl IntoIterator<Item = Client>) -> bool {
+        let mut changed = false;
+        for client in clients {
+            let id = client.application_id();
+            let name = if client == Client::Unknown {
+                "Other apps"
+            } else {
+                client.label()
+            }
+            .to_owned();
+            let icon_path = match client {
+                Client::VSCode => Some("/Applications/Visual Studio Code.app"),
+                Client::Terminal => Some("/System/Applications/Utilities/Terminal.app"),
+                Client::Desktop { app_path, .. } => Some(app_path),
+                Client::Unknown => None,
+            }
+            .map(str::to_owned);
+            if let Some(app) = self.apps.get_mut(&id) {
+                if app.name != name || app.icon_path != icon_path {
+                    app.name = name;
+                    app.icon_path = icon_path;
+                    changed = true;
+                }
+            } else {
+                self.apps.insert(
+                    id.clone(),
+                    KnownApplication {
+                        id,
+                        name,
+                        icon_path,
+                        enabled: true,
+                    },
+                );
+                changed = true;
+            }
+        }
+        changed
+    }
+    pub fn enabled(&self, client: Client) -> bool {
+        self.apps
+            .get(&client.application_id())
+            .is_none_or(|app| app.enabled)
+    }
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> bool {
+        let Some(app) = self.apps.get_mut(id) else {
+            return false;
+        };
+        if app.enabled == enabled {
+            return false;
+        }
+        app.enabled = enabled;
+        true
+    }
+    pub fn list(&self) -> Vec<&KnownApplication> {
+        let mut apps: Vec<_> = self.apps.values().collect();
+        apps.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        apps
+    }
+    fn decode(value: &str) -> Self {
+        serde_json::from_str(value).unwrap_or_default()
+    }
+}
+pub fn applications() -> Applications {
+    NSUserDefaults::standardUserDefaults()
+        .stringForKey(ns_string!("KnownApplications"))
+        .map(|value| Applications::decode(&value.to_string()))
+        .unwrap_or_default()
+}
+pub fn save_applications(applications: &Applications) {
+    let value = objc2_foundation::NSString::from_str(
+        &serde_json::to_string(applications).expect("serializable application preferences"),
+    );
+    // SAFETY: A copied NSString is a valid NSUserDefaults property-list value.
+    unsafe {
+        NSUserDefaults::standardUserDefaults()
+            .setObject_forKey(Some(&value), ns_string!("KnownApplications"));
+    }
+}
 
 #[link(name = "ServiceManagement", kind = "framework")]
 unsafe extern "C" {}
@@ -108,6 +208,42 @@ pub fn set_menu_shortcut(shortcut: Option<&crate::macos::hotkey::Shortcut>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn learns_only_observed_apps_and_keeps_hidden_apps_after_their_sessions_close() {
+        let mut apps = Applications::default();
+        assert!(apps.list().is_empty());
+        assert!(apps.enabled(Client::VSCode));
+        assert!(apps.observe([Client::VSCode, Client::Terminal, Client::VSCode]));
+        assert_eq!(apps.list().len(), 2);
+        assert!(apps.set_enabled(&Client::VSCode.application_id(), false));
+        assert!(!apps.observe([Client::Terminal]));
+        assert!(!apps.observe([Client::VSCode]));
+        assert!(!apps.enabled(Client::VSCode));
+        assert!(apps.enabled(Client::Terminal));
+        assert_eq!(apps.list().len(), 2);
+        let restored = Applications::decode(&serde_json::to_string(&apps).unwrap());
+        assert!(!restored.enabled(Client::VSCode));
+        assert!(restored.enabled(Client::Terminal));
+        assert!(Applications::decode("invalid").list().is_empty());
+    }
+
+    #[test]
+    fn applications_with_equal_names_do_not_share_checkbox_preferences() {
+        let first = Client::Desktop {
+            name: "Editor",
+            app_path: "/Applications/First.app",
+        };
+        let second = Client::Desktop {
+            name: "Editor",
+            app_path: "/Applications/Second.app",
+        };
+        let mut apps = Applications::default();
+        apps.observe([first, second]);
+        apps.set_enabled(&first.application_id(), false);
+        assert!(!apps.enabled(first));
+        assert!(apps.enabled(second));
+    }
 
     #[test]
     fn system_login_service_is_linked_and_readable_without_registering() {
