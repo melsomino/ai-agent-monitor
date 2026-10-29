@@ -41,6 +41,19 @@ One Rust executable, native AppKit controls, and macOS notifications. No Python 
 
 The monitor runs on the Mac that hosts the agents. SSH, containers, and remote development environments need a separate delivery mechanism. Linux is not supported yet.
 
+## Telegram notifications
+
+Use your own Telegram bot to receive agent questions and answer them away from the Mac. No hosted relay is needed; the resident monitor connects directly to Telegram using long polling.
+
+1. Open [@BotFather](https://t.me/BotFather) in Telegram, send `/newbot`, and create a dedicated bot.
+2. In **Settings → Telegram**, paste the bot token and click **Connect**. The token is stored in macOS Keychain.
+3. Click **Open pairing link**, then press **Start** in your bot. The one-time pairing link expires after 10 minutes.
+4. Click **Send test** to verify delivery. **Send questions to Telegram** pauses or resumes the integration; **Disconnect** removes the saved token and pairing.
+
+Approval messages use the agent's offered answer buttons. For a question that accepts a custom answer, reply to its bot message. Multiple questions are presented one at a time and submitted together. Questions marked as secret must be answered in the agent app.
+
+Only the paired private Telegram account can reply. The monitor rechecks the live request before forwarding an answer, and removes answer buttons when a request is resolved elsewhere. Your Mac must be awake and the monitor running to deliver notifications or process replies. Session titles and question text are sent through Telegram; this integration is opt-in. Use a separate bot for each monitor instance: Telegram polling cannot be shared with another bot client or an active webhook.
+
 ## Installation
 
 ### Download the app — no terminal required

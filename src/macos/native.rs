@@ -262,6 +262,7 @@ pub fn notify_session(session: &crate::agents::sessions::Session) {
     if !crate::app::monitor::hook_pending(session) {
         return;
     }
+    super::telegram::observe(session);
     let Some(approval) = session.approval.as_ref() else {
         return;
     };
@@ -297,6 +298,7 @@ pub fn notify_session(session: &crate::agents::sessions::Session) {
 }
 
 pub fn remove_session_notification(key: &str) {
+    super::telegram::resolved(key);
     let bound = crate::macos::notification_actions::remove(key);
     remove_notification(&format!("session-{key}"));
     if bound && crate::macos::menu::is_resident() {

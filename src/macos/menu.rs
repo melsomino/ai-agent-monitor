@@ -248,6 +248,12 @@ struct State {
     integrations_button: OnceCell<Retained<NSButton>>,
     integrations_note: OnceCell<Retained<NSTextField>>,
     integrations_snapshot: RefCell<Option<Vec<crate::macos::onboarding::Row>>>,
+    telegram_token: OnceCell<Retained<NSSecureTextField>>,
+    telegram_enabled: OnceCell<Retained<NSButton>>,
+    telegram_status: OnceCell<Retained<NSTextField>>,
+    telegram_pair: OnceCell<Retained<NSButton>>,
+    telegram_test: OnceCell<Retained<NSButton>>,
+    telegram_disconnect: OnceCell<Retained<NSButton>>,
     login_switch: OnceCell<Retained<NSButton>>,
     animation_switch: OnceCell<Retained<NSButton>>,
     login_note: OnceCell<Retained<NSTextField>>,
@@ -543,6 +549,35 @@ define_class!(
         fn setup_integrations(&self, _sender: Option<&AnyObject>) {
             crate::macos::onboarding::begin(self.mtm(), true);
             self.refresh_integration_settings();
+        }
+
+        #[unsafe(method(connectTelegram:))]
+        fn connect_telegram(&self, _sender: Option<&AnyObject>) {
+            if let Some(field) = self.ivars().telegram_token.get() {
+                let token = field.stringValue().to_string();
+                field.setStringValue(ns_string!(""));
+                crate::macos::telegram::connect(token);
+                self.refresh_telegram_settings();
+            }
+        }
+        #[unsafe(method(disconnectTelegram:))]
+        fn disconnect_telegram(&self, _sender: Option<&AnyObject>) {
+            crate::macos::telegram::disconnect();
+        }
+        #[unsafe(method(toggleTelegram:))]
+        fn toggle_telegram(&self, sender: &NSButton) {
+            crate::macos::telegram::enable(sender.state() == NSControlStateValueOn);
+        }
+        #[unsafe(method(pairTelegram:))]
+        fn pair_telegram(&self, _sender: Option<&AnyObject>) {
+            if let Some(link) = crate::macos::telegram::status().link
+                && let Some(url) = NSURL::URLWithString(&NSString::from_str(&link)) {
+                NSWorkspace::sharedWorkspace().openURL(&url);
+            }
+        }
+        #[unsafe(method(testTelegram:))]
+        fn test_telegram(&self, _sender: Option<&AnyObject>) {
+            crate::macos::telegram::test();
         }
 
         #[unsafe(method(toggleLogin:))]
@@ -1382,6 +1417,44 @@ impl MenuController {
             integrations_view.addSubview(&setup);
             state.integrations_button.set(setup).expect("integration setup button initialized once");
 
+            let telegram_view = NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 304.0));
+            let instructions = self.label(&telegram_view,
+                "Create your own bot with @BotFather using /newbot.\nPaste its token, connect, then open the pairing link and press Start.\nQuestions are sent directly from this Mac while the monitor is running.",
+                rect(24.0, 234.0, 412.0, 54.0), 11.0, 0.0, true);
+            instructions.setUsesSingleLineMode(false);
+            instructions.setMaximumNumberOfLines(3);
+            self.label(&telegram_view, "Bot token · stored in macOS Keychain", rect(24.0, 207.0, 412.0, 20.0), 12.0, 0.0, false);
+            let token = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(self.mtm()), rect(24.0, 176.0, 300.0, 26.0));
+            token.setPlaceholderString(Some(ns_string!("Token from @BotFather")));
+            token.setEditable(true);
+            token.setSelectable(true);
+            telegram_view.addSubview(&token);
+            state.telegram_token.set(token).expect("Telegram token initialized once");
+            // SAFETY: Selectors are implemented by this retained controller.
+            let connect = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Connect"), Some(self), Some(sel!(connectTelegram:)), self.mtm()) };
+            connect.setFrame(rect(332.0, 175.0, 104.0, 28.0));
+            telegram_view.addSubview(&connect);
+            // SAFETY: Selector and retained target are valid for the settings lifetime.
+            let enabled = unsafe { NSButton::checkboxWithTitle_target_action(ns_string!("Send questions to Telegram"), Some(self), Some(sel!(toggleTelegram:)), self.mtm()) };
+            enabled.setFrame(rect(24.0, 136.0, 412.0, 24.0));
+            telegram_view.addSubview(&enabled);
+            state.telegram_enabled.set(enabled).expect("Telegram toggle initialized once");
+            let status = self.label(&telegram_view, "Not connected", rect(24.0, 70.0, 412.0, 54.0), 11.0, 0.0, true);
+            status.setUsesSingleLineMode(false);
+            status.setMaximumNumberOfLines(3);
+            state.telegram_status.set(status).expect("Telegram status initialized once");
+            for (title, action, x, width, storage) in [
+                ("Open pairing link", sel!(pairTelegram:), 24.0, 132.0, &state.telegram_pair),
+                ("Send test", sel!(testTelegram:), 164.0, 116.0, &state.telegram_test),
+                ("Disconnect", sel!(disconnectTelegram:), 312.0, 124.0, &state.telegram_disconnect),
+            ] {
+                // SAFETY: Every selector is implemented by this retained controller.
+                let button = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(title), Some(self), Some(action), self.mtm()) };
+                button.setFrame(rect(x, 24.0, width, 28.0));
+                telegram_view.addSubview(&button);
+                storage.set(button).expect("Telegram control initialized once");
+            }
+
             // AppKit owns the preferences toolbar, selection, and tab transitions.
             let tabs = NSTabViewController::new(self.mtm());
             tabs.setTabStyle(NSTabViewControllerTabStyle::Toolbar);
@@ -1390,6 +1463,7 @@ impl MenuController {
                 ("General", "gearshape", &view),
                 ("Applications", "square.stack.3d.up", &applications_view),
                 ("Integrations", "puzzlepiece.extension", &integrations_view),
+                ("Telegram", "paperplane", &telegram_view),
             ] {
                 let controller = NSViewController::new(self.mtm());
                 controller.setTitle(Some(&NSString::from_str(title)));
@@ -1416,6 +1490,7 @@ impl MenuController {
         self.refresh_settings();
         self.refresh_application_settings();
         self.refresh_integration_settings();
+        self.refresh_telegram_settings();
         let app = NSApplication::sharedApplication(self.mtm());
         if app.respondsToSelector(sel!(activate)) {
             app.activate();
@@ -1425,6 +1500,31 @@ impl MenuController {
             app.activateIgnoringOtherApps(true);
         }
         window.makeKeyAndOrderFront(None);
+    }
+
+    fn refresh_telegram_settings(&self) {
+        let status = crate::macos::telegram::status();
+        let state = self.ivars();
+        if let Some(label) = state.telegram_status.get() {
+            label.setStringValue(&NSString::from_str(&status.text));
+        }
+        if let Some(button) = state.telegram_enabled.get() {
+            button.setState(if status.enabled {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+            button.setEnabled(status.connected && status.paired);
+        }
+        if let Some(button) = state.telegram_pair.get() {
+            button.setEnabled(status.link.is_some());
+        }
+        if let Some(button) = state.telegram_test.get() {
+            button.setEnabled(status.enabled && status.paired);
+        }
+        if let Some(button) = state.telegram_disconnect.get() {
+            button.setEnabled(status.connected);
+        }
     }
 
     fn refresh_integration_settings(&self) {
@@ -3661,6 +3761,7 @@ impl MenuController {
         self.render_footer();
         match result.sessions {
             Ok(sessions) => {
+                crate::macos::telegram::sync(&sessions);
                 let learned = {
                     let mut applications = state.applications.borrow_mut();
                     let changed =
@@ -3822,6 +3923,7 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<bool> {
                             .is_some_and(|window| window.isVisible())
                         {
                             controller.refresh_integration_settings();
+                            controller.refresh_telegram_settings();
                         }
                         if controller
                             .ivars()

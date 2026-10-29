@@ -113,3 +113,13 @@ Implement `SessionProvider` and register it in `src/agents/mod.rs`. Common types
 A provider supplies open sessions, activity, navigation targets, and supported interactions. UI keys include the provider identity, so identical session IDs from different agents do not collide. `Approval.id` is an opaque token to the UI, not a response-file path.
 
 Discovery must never authorize actions. A response implementation must verify that the request still belongs to the intended session and remains current before sending an explicit user decision.
+
+## Personal Telegram bots
+
+The resident starts a single background worker for the user-owned bot. Settings holds a secure token input and an expiring pairing link. Tokens are stored through Security.framework in Keychain, never in JSON preferences or subprocess arguments. Nonsecret bot identity, private chat/user IDs, update offset and delivered message IDs are saved atomically with mode 0600 in `telegram.json` under Application Support.
+
+The worker uses the official [Telegram Bot API](https://core.telegram.org/bots/api), via HTTPS POSTs and `getUpdates` long polling. It checks bot identity and refuses bots configured with a webhook. No relay or inbound listener is needed. A random 128-bit `/start` payload binds a single private account for replies. Callback payloads contain random request handles and option indices, rather than commands or native agent IDs.
+
+Requests come from the same resident snapshots and hook events as macOS notifications. Button captions and action IDs come from the agent interaction abstraction. Callback processing validates the paired sender, chat, message ID and current random handle. It rereads live sessions and the exact approval/interaction before calling `monitor::respond`, which remains the sole response boundary. Freeform replies must reference the pending bot message; structured questions collect all answers before submitting. Secret questions expose no answer controls or private text.
+
+Resolved, expired and superseded requests lose their remote response authority and their messages are edited to remove buttons. Old buttons do not regain authority after restart. Delivery and message edits use bounded network timeouts and retry failures without logging credentials. Initial network/pairing verification requires a real user-owned bot; protocol and authorization tests run without Telegram credentials.

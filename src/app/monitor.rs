@@ -33,6 +33,8 @@ fn store() -> &'static HookStore {
 }
 pub fn set_host() {
     HOST.store(true, Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    crate::macos::telegram::start();
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -244,6 +246,8 @@ pub fn respond(session: &Session, response: &Response) -> bool {
         session.respond_agent(response)
     };
     if sent {
+        #[cfg(target_os = "macos")]
+        crate::macos::telegram::resolved(&key);
         #[cfg(target_os = "macos")]
         dispatch2::DispatchQueue::main().exec_async(move || {
             crate::macos::native::remove_session_notification(&key);
