@@ -82,8 +82,6 @@ impl SessionProvider for Claude {
         if !pending::allow(&request) {
             return false;
         }
-        #[cfg(target_os = "macos")]
-        crate::macos::native::dismiss_approval(&request.response);
         true
     }
 }

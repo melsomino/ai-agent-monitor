@@ -48,13 +48,13 @@ The monitor runs on the Mac that hosts the agents. SSH, containers, and remote d
 1. Download the [latest DMG for Apple Silicon](https://github.com/melsomino/ai-agent-monitor/releases/latest/download/AI-Agent-Monitor-apple-silicon.dmg) from [GitHub Releases](https://github.com/melsomino/ai-agent-monitor/releases/latest).
 2. Open the DMG and drag **AI Agent Monitor** to **Applications**.
 3. Open the app from Applications. It connects detected agents automatically and requests notification permission.
-4. Follow the setup summary: restart the connected agents, review Codex's hook in `/hooks`, or enable Cline hooks if needed.
+4. Open **Settings → Integrations** to check status and next steps: restart the connected agents, review Codex's hook in `/hooks`, or enable Cline hooks if needed.
 
 Requires **macOS 13+** and **Apple Silicon** for the prebuilt DMG. Agents are installed separately. Rust, Xcode, and terminal commands are not needed to run the downloaded app.
 
 The current release is ad-hoc signed and **not notarized by Apple**. If macOS blocks the first launch, follow [Apple's instructions for opening an unnotarized app](https://support.apple.com/en-us/102445): after attempting to open it, use **System Settings → Privacy & Security → Open Anyway** if you trust this release. No system-wide security settings need to be disabled.
 
-The robot icon appears in the menu bar. To start automatically next time, enable **Settings → General → Launch at login**. Setup can be rerun from **Settings → General → Set up integrations…**, including after installing another agent. Existing unrelated hooks are preserved.
+The robot icon appears in the menu bar. To start automatically next time, enable **Settings → General → Launch at login**. Setup can be rerun from **Settings → Integrations → Check & set up**, including after installing another agent. Existing unrelated hooks are preserved.
 
 ### Build from source
 
@@ -157,7 +157,7 @@ Click the robot icon, or use your configured shortcut, to open the menu. Idle se
 - **Click outside**, press **Escape**, or use the shortcut again to close the menu.
 - Use **gear** in the footer to open settings, or **power** to quit the resident monitor.
 
-Closing the menu clears the filter and collapses the sessions. On the next opening, working sessions and requests needing a response expand again. Quitting the resident monitor does not remove installed hooks.
+Closing the menu clears the filter and collapses the sessions. On the next opening, working sessions and requests needing a response expand again. Quitting the resident monitor does not remove installed hooks. A later hook starts the installed monitor in the background when needed.
 
 Project navigation opens the workspace in VS Code; it does not select a particular chat. If the project folder no longer exists, the monitor switches to VS Code without trying to open the missing path. If the same project is open in several windows, VS Code chooses the window.
 
@@ -185,7 +185,7 @@ The monitor rechecks that the request is still current before sending a response
 
 macOS notifications use actions specific to the request. Depending on the notification layout, these may appear in an actions menu. Larger sets of answers use **More answers** or open the full form. macOS controls how many actions and text lines are visible.
 
-**Hook-based approvals:** Codex CLI and Claude Code permission hooks wait up to 60 seconds for a one-time **Allow**. Clicking the notification body, dismissing it, or reaching the timeout returns control to the agent's own permission dialog. A stale notification cannot approve a later request. Errors never grant permission automatically.
+**Hook-based approvals:** hooks forward their events to the resident monitor and wait up to 60 seconds for a one-time **Allow**. The monitor owns the request, notification, and response to the agent. The same response handler serves notification buttons and the session menu. Dismissing a notification leaves the request in the monitor; expiry, disconnection, or restarting the monitor returns control without approval. A stale notification cannot approve a later request. Errors never grant permission automatically.
 
 ### Codex quota
 
@@ -195,15 +195,17 @@ This is a cached report from Codex sessions, checked every ten seconds, rather t
 
 ## Settings
 
-Settings use a native preferences toolbar with two sections.
+Settings use a native preferences toolbar with three sections: **General**, **Applications**, and **Integrations**.
 
 | Section | Setting | Behavior |
 | --- | --- | --- |
 | **General** | Launch at login | Registers a macOS Login Item; disabled by default |
 | **General** | Menu bar animation | Animates green robot eyes while agents work; when disabled, working eyes stay green |
-| **General** | Set up integrations… | Reconnect detected agents or retry setup after an error |
+| **Integrations** | Check & set up | Inspect detected agents, hook status and errors, or retry setup |
 | **General** | Keyboard shortcut | Records a global shortcut using ⌘, ⌥, or ⌃; **Escape** cancels recording and **×** clears it |
 | **Applications** | Application switches | Show or hide that application's sessions in the menu |
+
+The Integrations section shows detected agents with **Needs setup**, **Setting up…**, **Hooks installed**, or **Needs attention**. Status is checked against the current hook configuration; **Hooks installed** does not mean that Codex trust or Cline’s Enable Hooks setting has been confirmed. Required next steps appear beneath each agent. Setup runs in the background without a separate results window.
 
 The application list fills automatically as sessions are discovered. Entries and your choices are retained after applications close and across monitor restarts. Hiding an application affects the session list; notifications and the menu bar indicator still account for its sessions.
 

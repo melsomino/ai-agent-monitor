@@ -3,7 +3,6 @@ mod app;
 #[cfg(target_os = "macos")]
 mod macos;
 
-use agents::sessions;
 use app::{cli, core, tools};
 #[cfg(target_os = "macos")]
 use macos::native;
@@ -11,9 +10,8 @@ use macos::native;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{AgentKind, Cli, Command, NativeCommand};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
-    env,
     io::{self, Read},
     path::Path,
 };
@@ -21,10 +19,16 @@ use std::{
 fn run(command: Option<Command>) -> Result<()> {
     match command {
         Some(Command::Hook) => {
-            let event: Value =
-                serde_json::from_reader(io::stdin()).context("invalid hook event")?;
-            let action = core::deliver(&event, true)?;
-            if let Some(result) = core::decision(action, false) {
+            let event: Value = serde_json::from_reader(io::stdin().take(2 * 1024 * 1024))
+                .context("invalid hook event")?;
+            if event["hook_event_name"] != "PermissionRequest" {
+                return Ok(());
+            }
+            let result = app::ipc::request(&app::ipc::Request::Hook {
+                event,
+                owner: agents::tracking::owner("codex").ok(),
+            })?;
+            if !result.is_null() {
                 println!("{result}");
             }
         }
@@ -32,17 +36,14 @@ fn run(command: Option<Command>) -> Result<()> {
             let input: Value = serde_json::from_reader(io::stdin().take(2 * 1024 * 1024))
                 .context("invalid agent hook event")?;
             let owner = agents::tracking::owner(agent.id())?;
-            let root = agents::tracking::root();
-            match agent {
-                AgentKind::Claude => {
-                    if let Some(result) = agents::claude::hook(&input, &root, owner, true)? {
-                        println!("{result}");
-                    }
-                }
-                AgentKind::Cline => println!(
-                    "{}",
-                    agents::cline::hook(&input, event.as_deref(), &root, owner)?
-                ),
+            let result = app::ipc::request(&app::ipc::Request::AgentHook {
+                agent: agent.id().into(),
+                event,
+                input,
+                owner,
+            })?;
+            if !result.is_null() {
+                println!("{result}");
             }
         }
         Some(Command::InstallAgent { agent, home }) => {
@@ -78,32 +79,24 @@ fn run(command: Option<Command>) -> Result<()> {
             approval,
             session_id,
         }) => {
-            let mut event = json!({"hook_event_name": "PermissionRequest", "cwd": env::current_dir()?,
-                "tool_name": "Bash", "tool_input": {"description": "Test notification sent from Rust. Allow does not run any commands."}});
-            if let Some(id) = session_id {
-                event["session_id"] = id.into();
-            }
-            let action = core::deliver(&event, approval)?;
-            if let Some(core::Action::Allow) = action {
-                eprintln!("Test: Allow clicked; no Codex permission granted.");
-            } else {
-                eprintln!("Test completed: {action:?}");
-            }
+            let result = app::ipc::request(&app::ipc::Request::Test {
+                approval,
+                session_id,
+            })?;
+            eprintln!(
+                "Test completed: {}; no agent permissions granted.",
+                if result["allowed"] == true {
+                    "Allow received"
+                } else {
+                    "no approval"
+                }
+            );
         }
         Some(Command::Bundle) => tools::bundle()?,
         Some(Command::Dmg) => tools::dmg()?,
         Some(Command::Sessions { json: true }) => {
-            let sessions = sessions::open()?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "sessions": sessions.iter().map(|session| serde_json::json!({
-                        "agent":session.agent,"id":session.id,"title":session.title,"cwd":session.cwd,"workspace":session.workspace,"gitBranch":session.git_branch,"updatedAt":session.updated_at,
-                        "client":session.client.label(),"status":session.activity.label(),"lastMessage":session.last_message,
-                        "approval":session.approval.as_ref().map(|request| serde_json::json!({"body":request.body,"expiresAt":request.expires,"canAllow":request.can_allow}))
-                    })).collect::<Vec<_>>()
-                }))?
-            );
+            let result = app::ipc::request(&app::ipc::Request::Sessions)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Some(Command::Sessions { json: false }) => run_native(NativeCommand::Sessions)?,
         Some(Command::Install { codex_home }) => {
@@ -128,17 +121,31 @@ fn run(command: Option<Command>) -> Result<()> {
             }
         }
         Some(Command::CheckHooks { binary }) => tools::check_hooks(&binary)?,
-        Some(Command::Setup) => run_native(NativeCommand::Setup)?,
-        Some(Command::NotificationSettings) => run_native(NativeCommand::NotificationSettings)?,
+        Some(Command::Setup) => {
+            let result = app::ipc::request(&app::ipc::Request::Setup)?;
+            anyhow::ensure!(
+                result["allowed"] == true,
+                "Notifications are disabled for AI Agent Monitor"
+            );
+            println!("Notifications are ready");
+        }
+        Some(Command::NotificationSettings) => {
+            println!(
+                "{}",
+                app::ipc::request(&app::ipc::Request::NotificationSettings)?
+            );
+        }
         Some(Command::OpenTarget { target }) => run_native(NativeCommand::OpenTarget(target))?,
-        Some(Command::Send(message)) => run_native(NativeCommand::Send {
-            message,
-            response: None,
-        })?,
-        Some(Command::SendApproval { message, response }) => run_native(NativeCommand::Send {
-            message,
-            response: Some(response),
-        })?,
+        Some(Command::Send(message)) => {
+            app::ipc::request(&app::ipc::Request::Notice {
+                title: message.title,
+                body: message.body,
+                target: message.target,
+            })?;
+        }
+        Some(Command::SendApproval { .. }) => {
+            bail!("Legacy approval senders are no longer supported; use the hook client")
+        }
         None => run_native(NativeCommand::Listen)?,
     }
     Ok(())

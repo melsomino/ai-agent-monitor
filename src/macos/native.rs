@@ -1,7 +1,7 @@
 //! macOS notification APIs. All Objective-C glue stays in this module.
-use crate::app::cli::{Message, NativeCommand};
-use crate::app::core::{self, Action};
-use anyhow::{Result, bail};
+use crate::app::cli::NativeCommand;
+use crate::app::core;
+use anyhow::{Context, Result, bail};
 use block2::{DynBlock, RcBlock};
 use dispatch2::DispatchQueue;
 use objc2::{
@@ -18,7 +18,7 @@ use objc2_foundation::{
     NSURL, ns_string,
 };
 use objc2_user_notifications::*;
-use std::{path::Path, ptr::NonNull};
+use std::ptr::NonNull;
 
 define_class!(
     // SAFETY: NSApplication permits event-loop subclassing. All AppKit events
@@ -105,15 +105,8 @@ define_class!(
             let action = response.actionIdentifier().to_string();
             let info = response.notification().request().content().userInfo();
             let target = info_string(&info, ns_string!("target"));
-            let response_path = info_string(&info, ns_string!("response"));
-            let path = Path::new(&response_path);
             // SAFETY: These immutable framework constants are valid NSStrings.
-            let (is_default, is_dismiss) = unsafe {
-                (
-                    action == UNNotificationDefaultActionIdentifier.to_string(),
-                    action == UNNotificationDismissActionIdentifier.to_string(),
-                )
-            };
+            let is_default = unsafe { action == UNNotificationDefaultActionIdentifier.to_string() };
             if let Some(index) = action
                 .strip_prefix("AGENT_REPLY_")
                 .and_then(|index| index.parse::<usize>().ok())
@@ -199,38 +192,15 @@ define_class!(
                 }
                 return;
             }
-            if action == "ALLOW_ONCE" && response_path.starts_with("ipc:") {
-                let identifier = response.notification().request().identifier().to_string();
-                completion.call(());
-                std::thread::spawn(move || {
-                    let allowed = crate::agents::codex::runtime::allow(&response_path);
-                    DispatchQueue::main().exec_async(move || {
-                        if allowed {
-                            remove_notification(&identifier);
-                        } else {
-                            open_target(&target);
-                        }
-                        if !crate::macos::menu::is_resident() {
-                            std::process::exit(0);
-                        }
-                    });
-                });
-                return;
-            }
-            let should_open = if action == "ALLOW_ONCE" {
-                !core::respond(path, Action::Allow)
-            } else if is_default {
-                core::respond(path, Action::Open);
-                true
-            } else {
-                if is_dismiss {
-                    core::respond(path, Action::Open);
-                }
-                false
-            };
+            // Old notifications may outlive an upgrade. They cannot bypass the
+            // monitor's current request store; take the user to the agent instead.
+            let hook_key = info_string(&info, ns_string!("requestKey"));
             completion.call(());
             DispatchQueue::main().exec_async(move || {
-                if should_open {
+                if is_default {
+                    crate::app::monitor::defer_hook(&hook_key);
+                }
+                if is_default || action == "ALLOW_ONCE" {
                     open_target(&target);
                 }
                 if !crate::macos::menu::is_resident() {
@@ -252,11 +222,6 @@ define_class!(
     }
 );
 
-fn fail(message: impl std::fmt::Display) -> ! {
-    eprintln!("ai-agent-monitor: {message}");
-    std::process::exit(2)
-}
-
 fn remove_notification(identifier: &str) {
     let identifiers = NSArray::from_slice(&[&*NSString::from_str(identifier)]);
     let center = UNUserNotificationCenter::currentNotificationCenter();
@@ -264,21 +229,19 @@ fn remove_notification(identifier: &str) {
     center.removeDeliveredNotificationsWithIdentifiers(&identifiers);
 }
 
-pub fn dismiss_approval(response: &Path) {
-    let Some(identifier) = crate::agents::pending::notification_id(response) else {
-        return;
-    };
-    remove_notification(&identifier);
-    // Match pre-update notifications too: those used random identifiers but
-    // already included the exact response path in their property-list userInfo.
-    let callback = RcBlock::new(move |notifications: NonNull<NSArray<UNNotification>>| {
-        // SAFETY: The notification center supplies a live array for this callback.
+/// A restarted monitor cannot reuse the old process's opaque request bindings.
+fn remove_stale_notifications() {
+    let callback = RcBlock::new(|notifications: NonNull<NSArray<UNNotification>>| {
+        // SAFETY: The framework supplies a live array for this callback.
         let notifications = unsafe { notifications.as_ref() };
         for index in 0..notifications.count() {
             let request = notifications.objectAtIndex(index).request();
-            let stored = info_string(&request.content().userInfo(), ns_string!("response"));
-            if crate::agents::pending::notification_id(Path::new(&stored)).as_deref()
-                == Some(identifier.as_str())
+            let content = request.content();
+            let category = content.categoryIdentifier().to_string();
+            let key = info_string(&content.userInfo(), ns_string!("requestKey"));
+            if category == "CODEX_APPROVAL"
+                || (category.starts_with("AGENT_DYNAMIC_")
+                    && crate::macos::notification_actions::lookup(&key, &category).is_none())
             {
                 remove_notification(&request.identifier().to_string());
             }
@@ -290,16 +253,21 @@ pub fn dismiss_approval(response: &Path) {
 
 /// Live requests get a request-specific action set, registered before delivery.
 pub fn notify_session(session: &crate::agents::sessions::Session) {
-    let Some(approval) = session
-        .approval
-        .as_ref()
-        .filter(|request| !request.can_allow || request.id.starts_with("ipc:"))
-    else {
+    if !crate::macos::menu::is_resident() {
+        return;
+    }
+    if !crate::app::monitor::hook_pending(session) {
+        return;
+    }
+    let Some(approval) = session.approval.as_ref() else {
         return;
     };
     let Some(key) = session.approval_key() else {
         return;
     };
+    if crate::macos::notification_actions::active(&key) {
+        return;
+    }
     let Some(plan) = crate::macos::notification_actions::bind(session) else {
         return;
     };
@@ -334,71 +302,38 @@ pub fn remove_session_notification(key: &str) {
     }
 }
 
-fn send(message: &Message, response: Option<&str>) {
-    let message = message.clone();
-    let response = response.map(str::to_owned);
-    crate::macos::notification_categories::legacy_then(move || {
-        let message = message.clone();
-        let response = response.clone();
-        DispatchQueue::main().exec_async(move || send_registered(&message, response.as_deref()));
-    });
-}
-
-fn send_registered(message: &Message, response: Option<&str>) {
-    // The panel may answer while notification authorization/delivery is in flight.
-    if response.is_some_and(|path| crate::agents::pending::is_resolved(Path::new(path))) {
-        std::process::exit(0);
+/// Only the resident calls this; passive messages have no approval side channel.
+pub fn notify_passive(message: &core::Notification) {
+    if !crate::macos::menu::is_resident() {
+        return;
     }
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(&message.title));
-    content.setSubtitle(&NSString::from_str(&message.subtitle));
     content.setBody(&NSString::from_str(&message.body));
     content.setSound(Some(&UNNotificationSound::defaultSound()));
-    let target = NSString::from_str(&message.target);
-    let response_value = NSString::from_str(response.unwrap_or(""));
     let info = NSDictionary::<NSString, NSString>::from_slices(
-        &[ns_string!("target"), ns_string!("response")],
-        &[&target, &response_value],
+        &[ns_string!("target")],
+        &[&NSString::from_str(&message.target)],
     );
-    // SAFETY: setUserInfo accepts an NSDictionary of property-list values. This
-    // dictionary contains only NSString keys and NSString values, retained/copied
-    // by UNMutableNotificationContent.
+    // SAFETY: Strings are copied into the property-list notification userInfo.
     unsafe {
         let _: () = msg_send![&*content, setUserInfo: &*info];
     }
-    if response.is_some() {
-        content.setCategoryIdentifier(ns_string!("CODEX_APPROVAL"));
-    }
-    let identifier = response
-        .and_then(|path| crate::agents::pending::notification_id(Path::new(path)))
-        .unwrap_or_else(|| {
-            format!(
-                "{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            )
-        });
+    let identifier = format!(
+        "notice-{}-{}",
+        std::process::id(),
+        crate::agents::tracking::now()
+    );
     let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
         &NSString::from_str(&identifier),
         &content,
         None,
     );
-    let response_path = response.map(std::path::PathBuf::from);
-    let callback = RcBlock::new(move |error: *mut NSError| {
-        // SAFETY: Apple guarantees a valid NSError pointer (or null) for this callback.
+    let callback = RcBlock::new(|error: *mut NSError| {
+        // SAFETY: Valid NSError or null for the lifetime of this callback.
         if let Some(error) = unsafe { error.as_ref() } {
-            fail(error.localizedDescription());
+            eprintln!("ai-agent-monitor: {}", error.localizedDescription());
         }
-        if response_path
-            .as_deref()
-            .is_some_and(crate::agents::pending::is_resolved)
-        {
-            remove_notification(&identifier);
-        }
-        std::process::exit(0);
     });
     UNUserNotificationCenter::currentNotificationCenter()
         .addNotificationRequest_withCompletionHandler(&request, Some(&callback));
@@ -411,6 +346,12 @@ pub fn run(command: NativeCommand) -> Result<()> {
     let app: Retained<NSApplication> =
         unsafe { msg_send![MonitorApplication::class(), sharedApplication] };
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    if let NativeCommand::OpenTarget(target) = &command {
+        if !open_target(target) {
+            bail!("VS Code could not open this target");
+        }
+        return Ok(());
+    }
     if matches!(command, NativeCommand::Listen | NativeCommand::Sessions)
         && !crate::macos::onboarding::installed_location(mtm)
     {
@@ -428,44 +369,54 @@ pub fn run(command: NativeCommand) -> Result<()> {
     center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     if crate::macos::menu::is_resident() {
         crate::macos::notification_categories::legacy();
+        remove_stale_notifications();
     }
-    match command {
-        NativeCommand::NotificationSettings => {
-            let callback = RcBlock::new(|settings: NonNull<UNNotificationSettings>| {
-                // SAFETY: The framework supplies a valid settings object for this callback.
-                let settings = unsafe { settings.as_ref() };
-                let enabled = |value: UNNotificationSetting| match value {
-                    UNNotificationSetting::Enabled => "enabled",
-                    UNNotificationSetting::Disabled => "disabled",
-                    _ => "unsupported",
-                };
-                let authorization = match settings.authorizationStatus() {
-                    UNAuthorizationStatus::Authorized => "authorized",
-                    UNAuthorizationStatus::Provisional => "provisional",
-                    UNAuthorizationStatus::Denied => "denied",
-                    UNAuthorizationStatus::NotDetermined => "notDetermined",
-                    _ => "unknown",
-                };
-                let style = match settings.alertStyle() {
-                    UNAlertStyle::Banner => "banner",
-                    UNAlertStyle::Alert => "alert",
-                    _ => "none",
-                };
-                let summary = serde_json::json!({
-                    "authorization": authorization,
-                    "alertStyle": style,
-                    "alerts": enabled(settings.alertSetting()),
-                    "notificationCenter": enabled(settings.notificationCenterSetting()),
-                    "sound": enabled(settings.soundSetting()),
-                    "timeSensitive": enabled(settings.timeSensitiveSetting()),
-                    "scheduledDelivery": enabled(settings.scheduledDeliverySetting()),
-                });
-                let categories = RcBlock::new(
-                    move |categories: NonNull<objc2_foundation::NSSet<UNNotificationCategory>>| {
-                        // SAFETY: UserNotifications supplies a live set for this callback.
-                        let categories = unsafe { categories.as_ref() }.allObjects();
-                        let mut summary = summary.clone();
-                        summary["categories"] = serde_json::json!((0..categories.count()).map(|index| {
+    crate::macos::onboarding::begin(mtm, false);
+    app.run();
+    // Keep the weak delegate alive for the entire run loop.
+    drop(delegate);
+    Ok(())
+}
+/// Queried inside the resident so diagnostics cannot register a competing notification client.
+pub fn notification_settings() -> Result<serde_json::Value> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let center = UNUserNotificationCenter::currentNotificationCenter();
+    let callback = RcBlock::new(move |settings: NonNull<UNNotificationSettings>| {
+        // SAFETY: The framework supplies a valid settings object for this callback.
+        let settings = unsafe { settings.as_ref() };
+        let enabled = |value: UNNotificationSetting| match value {
+            UNNotificationSetting::Enabled => "enabled",
+            UNNotificationSetting::Disabled => "disabled",
+            _ => "unsupported",
+        };
+        let authorization = match settings.authorizationStatus() {
+            UNAuthorizationStatus::Authorized => "authorized",
+            UNAuthorizationStatus::Provisional => "provisional",
+            UNAuthorizationStatus::Denied => "denied",
+            UNAuthorizationStatus::NotDetermined => "notDetermined",
+            _ => "unknown",
+        };
+        let style = match settings.alertStyle() {
+            UNAlertStyle::Banner => "banner",
+            UNAlertStyle::Alert => "alert",
+            _ => "none",
+        };
+        let summary = serde_json::json!({
+            "authorization": authorization,
+            "alertStyle": style,
+            "alerts": enabled(settings.alertSetting()),
+            "notificationCenter": enabled(settings.notificationCenterSetting()),
+            "sound": enabled(settings.soundSetting()),
+            "timeSensitive": enabled(settings.timeSensitiveSetting()),
+            "scheduledDelivery": enabled(settings.scheduledDeliverySetting()),
+        });
+        let sender = sender.clone();
+        let categories = RcBlock::new(
+            move |categories: NonNull<objc2_foundation::NSSet<UNNotificationCategory>>| {
+                // SAFETY: UserNotifications supplies a live set for this callback.
+                let categories = unsafe { categories.as_ref() }.allObjects();
+                let mut summary = summary.clone();
+                summary["categories"] = serde_json::json!((0..categories.count()).map(|index| {
                         let category = categories.objectAtIndex(index);
                         let actions = category.actions();
                         serde_json::json!({"id":category.identifier().to_string(),"actions":(0..actions.count()).map(|index| {
@@ -473,70 +424,52 @@ pub fn run(command: NativeCommand) -> Result<()> {
                             serde_json::json!({"id":action.identifier().to_string(),"title":action.title().to_string(),"textInput":action.downcast_ref::<UNTextInputNotificationAction>().is_some()})
                         }).collect::<Vec<_>>()})
                     }).collect::<Vec<_>>());
-                        println!("{summary}");
-                        std::process::exit(0);
+                let sender = sender.clone();
+                let delivered = RcBlock::new(
+                    move |notifications: NonNull<NSArray<UNNotification>>| {
+                        // SAFETY: The center supplies a live array during this callback.
+                        let notifications = unsafe { notifications.as_ref() };
+                        let mut summary = summary.clone();
+                        summary["delivered"] = serde_json::json!((0..notifications.count()).map(|index| {
+                                let request = notifications.objectAtIndex(index).request();
+                                let content = request.content();
+                                let info = content.userInfo();
+                                serde_json::json!({"id": request.identifier().to_string(), "category": content.categoryIdentifier().to_string(), "requestKey": info_string(&info, ns_string!("requestKey")), "response": info_string(&info, ns_string!("response"))})
+                            }).collect::<Vec<_>>());
+                        let _ = sender.send(summary);
                     },
                 );
                 UNUserNotificationCenter::currentNotificationCenter()
-                    .getNotificationCategoriesWithCompletionHandler(&categories);
-            });
-            center.getNotificationSettingsWithCompletionHandler(&callback);
-        }
-        NativeCommand::Setup => {
-            let callback = RcBlock::new(|allowed: Bool, error: *mut NSError| {
-                // SAFETY: The pointer is valid (or null) for the lifetime of the callback.
-                if let Some(error) = unsafe { error.as_ref() } {
-                    fail(error.localizedDescription());
-                }
-                if !allowed.as_bool() {
-                    fail("Notifications are disabled for AI Agent Monitor");
-                }
-                send(
-                    &Message {
-                        title: "Notifications are ready".into(),
-                        subtitle: String::new(),
-                        body: "You will be notified when an agent needs approval.".into(),
-                        target: String::new(),
-                    },
-                    None,
-                );
-            });
-            center.requestAuthorizationWithOptions_completionHandler(
-                UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
-                &callback,
-            );
-        }
-        NativeCommand::Send { message, response } => authorize_and_send(&center, message, response),
-        NativeCommand::OpenTarget(target) => {
-            if !open_target(&target) {
-                bail!("VS Code could not open this target");
-            }
-            return Ok(());
-        }
-        NativeCommand::Listen | NativeCommand::Sessions => {
-            crate::macos::onboarding::begin(mtm, false)
-        }
-    }
-    app.run();
-    // Keep the weak delegate alive for the entire run loop.
-    drop(delegate);
-    Ok(())
-}
-
-fn authorize_and_send(
-    center: &UNUserNotificationCenter,
-    message: Message,
-    response: Option<String>,
-) {
-    let callback = RcBlock::new(move |settings: NonNull<UNNotificationSettings>| {
-        // SAFETY: The framework passes a valid non-null settings object.
-        let status = unsafe { settings.as_ref() }.authorizationStatus();
-        if status != UNAuthorizationStatus::Authorized
-            && status != UNAuthorizationStatus::Provisional
-        {
-            fail("Run --setup to allow notifications");
-        }
-        send(&message, response.as_deref());
+                    .getDeliveredNotificationsWithCompletionHandler(&delivered);
+            },
+        );
+        UNUserNotificationCenter::currentNotificationCenter()
+            .getNotificationCategoriesWithCompletionHandler(&categories);
     });
     center.getNotificationSettingsWithCompletionHandler(&callback);
+
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .context("Notification settings timed out")
+}
+
+pub fn setup_notifications() -> Result<bool> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let callback = RcBlock::new(move |allowed: Bool, error: *mut NSError| {
+        // SAFETY: NSError is valid or null for the duration of this callback.
+        let result = match unsafe { error.as_ref() } {
+            Some(error) => Err(error.localizedDescription().to_string()),
+            None => Ok(allowed.as_bool()),
+        };
+        let _ = sender.send(result);
+    });
+    UNUserNotificationCenter::currentNotificationCenter()
+        .requestAuthorizationWithOptions_completionHandler(
+            UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+            &callback,
+        );
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .context("Notification permission timed out")?
+        .map_err(anyhow::Error::msg)
 }

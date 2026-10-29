@@ -32,9 +32,6 @@ pub fn deliver(plan: Plan, notice: Notice) {
 pub fn prune() {
     update(None, None, None);
 }
-pub fn legacy_then(completion: impl Fn() + Send + Sync + 'static) {
-    update(None, None, Some(Arc::new(completion)));
-}
 
 fn category(plan: Option<&Plan>) -> Retained<UNNotificationCategory> {
     let mut actions: Vec<Retained<UNNotificationAction>> = Vec::new();

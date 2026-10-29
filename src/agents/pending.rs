@@ -1,9 +1,13 @@
 //! Pending hook requests shared with the resident UI. No permission is granted by discovery.
 use crate::app::core;
-use serde_json::{Value, json};
-use std::io::{Read, Write};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
+use std::io::Read;
+#[cfg(test)]
+use std::io::{self, Write};
 use std::{
-    fs, io,
+    fs,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -24,6 +28,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
+#[cfg(test)]
 pub fn publish(directory: &Path, event: &Value, body: &str, lifetime: u64) -> io::Result<()> {
     let Some(id) = event["session_id"].as_str().filter(|id| !id.is_empty()) else {
         return Ok(());
@@ -110,6 +115,7 @@ pub fn allow(request: &Request) -> bool {
 }
 
 /// Stable across sender/UI processes and /tmp's macOS path aliases.
+#[cfg(test)]
 pub fn notification_id(response: &Path) -> Option<String> {
     if response.file_name()? != "response" {
         return None;
@@ -125,6 +131,7 @@ pub fn notification_id(response: &Path) -> Option<String> {
     Some(format!("approval-{name}"))
 }
 
+#[cfg(test)]
 pub fn is_resolved(response: &Path) -> bool {
     notification_id(response).is_some()
         && (response.exists()

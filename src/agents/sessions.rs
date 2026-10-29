@@ -63,6 +63,17 @@ impl Registry<'_> {
             );
             sessions.extend(discovered);
         }
+        for pending in crate::app::monitor::hook_sessions() {
+            if let Some(session) = sessions
+                .iter_mut()
+                .find(|session| session.key() == pending.key())
+            {
+                session.activity = Activity::Confirmation;
+                session.approval = pending.approval;
+            } else {
+                sessions.push(pending);
+            }
+        }
         let mut branches = std::collections::HashMap::new();
         for session in &mut sessions {
             session.git_branch = branches
@@ -74,7 +85,11 @@ impl Registry<'_> {
     }
 
     fn pending_count(&self) -> usize {
-        self.0.iter().map(|provider| provider.pending_count()).sum()
+        self.0
+            .iter()
+            .map(|provider| provider.pending_count())
+            .sum::<usize>()
+            + crate::app::monitor::hook_sessions().len()
     }
 
     fn open_target(&self, session: &Session) -> Option<String> {
@@ -210,7 +225,7 @@ impl Session {
     }
 
     pub fn open_target(&self) -> Option<String> {
-        registry().open_target(self)
+        crate::app::monitor::hook_target(self).or_else(|| registry().open_target(self))
     }
 
     pub fn interaction(&self) -> Interaction {
@@ -221,8 +236,12 @@ impl Session {
     }
 
     pub fn respond(&self, response: &Response) -> bool {
+        crate::app::monitor::respond(self, response)
+    }
+
+    pub(crate) fn respond_agent(&self, response: &Response) -> bool {
         if response == &Response::Action("allow".into()) {
-            return self.allow();
+            return registry().allow(self);
         }
         self.approval.is_some()
             && registry()
@@ -230,8 +249,9 @@ impl Session {
                 .is_some_and(|provider| provider.respond(self, response))
     }
 
+    #[cfg(test)]
     pub fn allow(&self) -> bool {
-        registry().allow(self)
+        self.respond(&Response::Action("allow".into()))
     }
 }
 

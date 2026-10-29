@@ -50,7 +50,8 @@ impl SessionProvider for Codex {
 
     fn pending_count(&self) -> usize {
         let requests = crate::agents::pending::list_for("codex");
-        let sessions = requests.iter().map(|r| r.session_id.clone()).collect();
+        let mut sessions = crate::app::monitor::hook_ids("codex");
+        sessions.extend(requests.iter().map(|r| r.session_id.clone()));
         requests.len() + runtime::pending_count(&sessions)
     }
 
@@ -82,7 +83,7 @@ impl SessionProvider for Codex {
         }
     }
     fn respond(&self, session: &Session, response: &crate::agents::interaction::Response) -> bool {
-        let responded = if session
+        if session
             .approval
             .as_ref()
             .is_some_and(|request| request.id.starts_with("ipc:"))
@@ -91,12 +92,7 @@ impl SessionProvider for Codex {
         } else {
             response == &crate::agents::interaction::Response::Action("allow".into())
                 && self.allow(session)
-        };
-        #[cfg(target_os = "macos")]
-        if responded && let Some(key) = session.approval_key() {
-            crate::macos::native::remove_session_notification(&key);
         }
-        responded
     }
 
     fn allow(&self, session: &Session) -> bool {
@@ -104,12 +100,7 @@ impl SessionProvider for Codex {
             return false;
         };
         if snapshot.id.starts_with("ipc:") {
-            let allowed = runtime::allow_for(session);
-            #[cfg(target_os = "macos")]
-            if allowed && let Some(key) = session.approval_key() {
-                crate::macos::native::remove_session_notification(&key);
-            }
-            return allowed;
+            return runtime::allow_for(session);
         }
         // Resolve the opaque token and compare the complete current snapshot.
         // pending::allow revalidates once more at the write boundary.
@@ -122,8 +113,6 @@ impl SessionProvider for Codex {
         if !crate::agents::pending::allow(&request) {
             return false;
         }
-        #[cfg(target_os = "macos")]
-        crate::macos::native::dismiss_approval(&request.response);
         true
     }
 }

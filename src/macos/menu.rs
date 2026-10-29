@@ -34,6 +34,7 @@ const SESSION_HOVER_PADDING: f64 = 4.0;
 const SESSION_HOVER_LEFT: f64 = -6.0;
 const SESSION_HOVER_WIDTH: f64 = 374.0;
 const MESSAGE_TOP_GAP: f64 = 4.0;
+const BUTTON_HOVER_PADDING: f64 = 3.0;
 
 static RESIDENT: AtomicBool = AtomicBool::new(false);
 thread_local! { static CONTROLLER: RefCell<Option<Retained<MenuController>>> = const { RefCell::new(None) }; }
@@ -122,6 +123,14 @@ pub fn show_notification_request(
             }
         });
     }
+}
+
+pub fn refresh_integrations() {
+    CONTROLLER.with(|slot| {
+        if let Some(controller) = slot.borrow().as_ref() {
+            controller.refresh_integration_settings();
+        }
+    });
 }
 
 pub fn refresh_after_response() {
@@ -223,6 +232,10 @@ struct State {
     settings_window: OnceCell<Retained<NSWindow>>,
     applications: RefCell<settings::Applications>,
     applications_list: OnceCell<Retained<SessionListView>>,
+    integrations_list: OnceCell<Retained<SessionListView>>,
+    integrations_button: OnceCell<Retained<NSButton>>,
+    integrations_note: OnceCell<Retained<NSTextField>>,
+    integrations_snapshot: RefCell<Option<Vec<crate::macos::onboarding::Row>>>,
     login_switch: OnceCell<Retained<NSButton>>,
     animation_switch: OnceCell<Retained<NSButton>>,
     login_note: OnceCell<Retained<NSTextField>>,
@@ -473,6 +486,7 @@ define_class!(
         #[unsafe(method(setupIntegrations:))]
         fn setup_integrations(&self, _sender: Option<&AnyObject>) {
             crate::macos::onboarding::begin(self.mtm(), true);
+            self.refresh_integration_settings();
         }
 
         #[unsafe(method(toggleLogin:))]
@@ -1268,10 +1282,6 @@ impl MenuController {
             unsafe { let _: () = msg_send![&*clear, setAccessibilityLabel: ns_string!("Clear keyboard shortcut")]; }
             view.addSubview(&clear);
             state.shortcut_clear.set(clear).expect("shortcut clear button initialized once");
-            // SAFETY: Implemented selector and target retained for the window lifetime.
-            let setup = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Set up integrations…"), Some(self), Some(sel!(setupIntegrations:)), self.mtm()) };
-            setup.setFrame(rect(264.0, 16.0, 172.0, 28.0));
-            view.addSubview(&setup);
             let applications_view = NSView::initWithFrame(
                 NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 304.0),
             );
@@ -1287,6 +1297,28 @@ impl MenuController {
             applications_view.addSubview(&scroll);
             state.applications_list.set(list).expect("application settings initialized once");
 
+            let integrations_view = NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 304.0));
+            self.label(&integrations_view, "Detected agents and hook setup", rect(24.0, 264.0, 412.0, 22.0), 13.0, 0.0, false);
+            // SAFETY: Flipped, ivar-free document view on the UI thread.
+            let integrations: Retained<SessionListView> = unsafe { msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 412.0, 184.0)] };
+            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(self.mtm()), rect(24.0, 64.0, 412.0, 184.0));
+            scroll.setDrawsBackground(false);
+            scroll.setHasVerticalScroller(true);
+            scroll.setAutohidesScrollers(true);
+            scroll.setHasHorizontalScroller(false);
+            scroll.setDocumentView(Some(&integrations));
+            integrations_view.addSubview(&scroll);
+            state.integrations_list.set(integrations).expect("integrations initialized once");
+            let note = self.label(&integrations_view, "", rect(24.0, 12.0, 228.0, 40.0), 10.0, 0.0, true);
+            note.setUsesSingleLineMode(false);
+            note.setMaximumNumberOfLines(2);
+            state.integrations_note.set(note).expect("integration note initialized once");
+            // SAFETY: Implemented selector and retained target.
+            let setup = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Check & set up"), Some(self), Some(sel!(setupIntegrations:)), self.mtm()) };
+            setup.setFrame(rect(264.0, 16.0, 172.0, 28.0));
+            integrations_view.addSubview(&setup);
+            state.integrations_button.set(setup).expect("integration setup button initialized once");
+
             // AppKit owns the preferences toolbar, selection, and tab transitions.
             let tabs = NSTabViewController::new(self.mtm());
             tabs.setTabStyle(NSTabViewControllerTabStyle::Toolbar);
@@ -1294,6 +1326,7 @@ impl MenuController {
             for (title, symbol, content) in [
                 ("General", "gearshape", &view),
                 ("Applications", "square.stack.3d.up", &applications_view),
+                ("Integrations", "puzzlepiece.extension", &integrations_view),
             ] {
                 let controller = NSViewController::new(self.mtm());
                 controller.setTitle(Some(&NSString::from_str(title)));
@@ -1319,6 +1352,7 @@ impl MenuController {
         });
         self.refresh_settings();
         self.refresh_application_settings();
+        self.refresh_integration_settings();
         let app = NSApplication::sharedApplication(self.mtm());
         if app.respondsToSelector(sel!(activate)) {
             app.activate();
@@ -1328,6 +1362,117 @@ impl MenuController {
             app.activateIgnoringOtherApps(true);
         }
         window.makeKeyAndOrderFront(None);
+    }
+
+    fn refresh_integration_settings(&self) {
+        use crate::macos::onboarding::{self, Phase};
+        let state = self.ivars();
+        let Some(list) = state.integrations_list.get() else {
+            return;
+        };
+        if let Some(button) = state.integrations_button.get() {
+            button.setEnabled(!onboarding::busy());
+            button.setTitle(if onboarding::busy() {
+                ns_string!("Setting up…")
+            } else {
+                ns_string!("Check & set up")
+            });
+        }
+        if let Some(note) = state.integrations_note.get() {
+            let text = onboarding::notification_note();
+            note.setStringValue(&NSString::from_str(&text));
+            note.setToolTip(
+                (!text.is_empty())
+                    .then(|| NSString::from_str(&text))
+                    .as_deref(),
+            );
+        }
+        let rows = onboarding::rows();
+        if state.integrations_snapshot.borrow().as_ref() == Some(&rows) {
+            return;
+        }
+        let old = list.subviews();
+        for index in 0..old.count() {
+            old.objectAtIndex(index).removeFromSuperview();
+        }
+        if rows.is_empty() {
+            let text = NSTextField::wrappingLabelWithString(
+                ns_string!(
+                    "No supported agents found. Install Codex, Claude Code, or Cline, then click Check & set up."
+                ),
+                self.mtm(),
+            );
+            text.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+            text.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            text.setFrame(rect(0.0, 8.0, 396.0, 64.0));
+            list.addSubview(&text);
+        }
+        let mut y = 0.0;
+        for row in &rows {
+            self.label(
+                list,
+                row.agent.name(),
+                rect(0.0, y + 4.0, 166.0, 22.0),
+                13.0,
+                0.23,
+                false,
+            );
+            let (symbol, color) = match row.phase {
+                Phase::Installed => ("checkmark.circle.fill", NSColor::systemGreenColor()),
+                Phase::Failed => (
+                    "exclamationmark.triangle.fill",
+                    NSColor::systemOrangeColor(),
+                ),
+                Phase::Installing => (
+                    "arrow.triangle.2.circlepath",
+                    NSColor::secondaryLabelColor(),
+                ),
+                Phase::Detected => ("circle", NSColor::secondaryLabelColor()),
+            };
+            let status = self.label(
+                list,
+                row.status(),
+                rect(170.0, y + 6.0, 202.0, 18.0),
+                11.0,
+                0.0,
+                false,
+            );
+            status.setAlignment(NSTextAlignment::Right);
+            status.setTextColor(Some(&color));
+            if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str(symbol),
+                None,
+            ) {
+                image.setTemplate(true);
+                let icon = NSImageView::imageViewWithImage(&image, self.mtm());
+                icon.setFrame(rect(380.0, y + 7.0, 14.0, 14.0));
+                icon.setContentTintColor(Some(&color));
+                list.addSubview(&icon);
+            }
+            let detail =
+                NSTextField::wrappingLabelWithString(&NSString::from_str(&row.detail), self.mtm());
+            detail.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            detail.setMaximumNumberOfLines(0);
+            detail.setToolTip(Some(&NSString::from_str(&format!(
+                "{}\n{}",
+                row.detail, row.directory
+            ))));
+            let height = detail
+                .cell()
+                .map(|cell| {
+                    cell.cellSizeForBounds(rect(0.0, 0.0, 396.0, 100000.0))
+                        .height
+                        .ceil()
+                })
+                .unwrap_or(32.0)
+                .max(16.0);
+            detail.setFrame(rect(0.0, y + 30.0, 396.0, height));
+            list.addSubview(&detail);
+            y += height + 46.0;
+        }
+        list.setFrameSize(NSSize::new(412.0, y.max(184.0)));
+        *state.integrations_snapshot.borrow_mut() = Some(rows);
     }
 
     fn refresh_application_settings(&self) {
@@ -1877,12 +2022,26 @@ impl MenuController {
                 self.mtm(),
             )
         };
+        let frame = if transparent {
+            frame
+        } else {
+            rect(
+                frame.origin.x - BUTTON_HOVER_PADDING,
+                frame.origin.y - BUTTON_HOVER_PADDING,
+                frame.size.width + 2.0 * BUTTON_HOVER_PADDING,
+                frame.size.height + 2.0 * BUTTON_HOVER_PADDING,
+            )
+        };
         button.setFrame(frame);
         button.setBordered(false);
         button.setTransparent(transparent);
         button.setIdentifier(Some(&NSString::from_str(id)));
         if !transparent {
-            let background = hover_background(self.mtm(), frame, 6.0);
+            let background = hover_background(
+                self.mtm(),
+                frame,
+                frame.size.width.min(frame.size.height) / 2.0,
+            );
             let base_alpha = if action == sel!(respondToRequest:) {
                 0.5
             } else {
@@ -2449,23 +2608,36 @@ impl MenuController {
         let view: Retained<SessionListView> = unsafe {
             msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(6.0, 8.0, 338.0, 0.0)]
         };
+        let directory = session.working_directory();
+        let full_directory = directory.display().to_string();
+        let short_directory = match directory.strip_prefix(core::home()) {
+            Ok(relative) if relative.as_os_str().is_empty() => "~".into(),
+            Ok(relative) => format!("~/{}", relative.display()),
+            Err(_) => full_directory.clone(),
+        };
         let mut rows = vec![(
             "folder",
             "Working directory",
-            session.working_directory().display().to_string(),
+            short_directory,
+            full_directory,
         )];
         if let Some(branch) = &session.git_branch {
-            rows.push(("arrow.triangle.branch", "Git branch", branch.clone()));
+            rows.push((
+                "arrow.triangle.branch",
+                "Git branch",
+                branch.clone(),
+                branch.clone(),
+            ));
         }
         let mut y = 0.0;
-        for (symbol, description, value) in rows {
+        for (symbol, description, value, tooltip) in rows {
             if y > 0.0 {
                 y += 4.0;
             }
             let height = 16.0;
             let label = self.label(&view, &value, rect(20.0, y, 318.0, height), 11.0, 0.0, true);
             label.setSelectable(true);
-            label.setToolTip(Some(&NSString::from_str(&value)));
+            label.setToolTip(Some(&NSString::from_str(&tooltip)));
             // Align the symbol with the visible letter height, not the text field's
             // frame, whose baseline and descender leave extra space below the text.
             let text_bounds = label
@@ -2569,6 +2741,11 @@ impl MenuController {
             }
             y += session_gap;
             let controls = request_controls(session);
+            let is_question = session.approval.is_some();
+            let question_padding = if is_question { 10.0 } else { 0.0 };
+            let metadata_gap = if is_question { 8.0 } else { 0.0 };
+            let content_width = 338.0 - 2.0 * question_padding;
+            let content_x = 6.0 + question_padding;
             let control_sizes: Vec<_> = controls
                 .iter()
                 .map(|control| {
@@ -2578,7 +2755,8 @@ impl MenuController {
                     );
                     natural.setFont(Some(&NSFont::systemFontOfSize(12.0)));
                     natural.sizeToFit();
-                    let width = (natural.frame().size.width.ceil() + 24.0).clamp(52.0, 338.0);
+                    let width =
+                        (natural.frame().size.width.ceil() + 24.0).clamp(52.0, content_width);
                     let measure = NSTextField::wrappingLabelWithString(
                         &NSString::from_str(&control.label),
                         self.mtm(),
@@ -2597,7 +2775,8 @@ impl MenuController {
                     NSSize::new(width, height)
                 })
                 .collect();
-            let (control_frames, controls_height) = answer_button_layout(&control_sizes, 338.0);
+            let (control_frames, controls_height) =
+                answer_button_layout(&control_sizes, content_width);
             let is_expanded = expanded.contains(&session.key());
             let detail = if is_expanded
                 || reveal
@@ -2624,13 +2803,13 @@ impl MenuController {
                 let height = label
                     .cell()
                     .map(|cell| {
-                        cell.cellSizeForBounds(rect(0.0, 0.0, 338.0, 1000000.0))
+                        cell.cellSizeForBounds(rect(0.0, 0.0, content_width, 1000000.0))
                             .height
                             .ceil()
                     })
                     .unwrap_or(60.0)
                     .max(22.0);
-                label.setFrame(rect(0.0, 0.0, 338.0, height));
+                label.setFrame(rect(0.0, 0.0, content_width, height));
                 let (metadata, metadata_height) = self.session_metadata(session);
                 Some((label, height, metadata, metadata_height))
             } else {
@@ -2639,7 +2818,13 @@ impl MenuController {
             let detail_height = detail
                 .as_ref()
                 .map(|(_, height, _, metadata_height)| {
-                    height + metadata_height + MESSAGE_TOP_GAP + 16.0 + controls_height
+                    height
+                        + metadata_height
+                        + MESSAGE_TOP_GAP
+                        + 16.0
+                        + controls_height
+                        + 2.0 * question_padding
+                        + metadata_gap
                 })
                 .unwrap_or(0.0);
             let height = SESSION_HEADER_HEIGHT + detail_height;
@@ -2727,7 +2912,7 @@ impl MenuController {
                 image.setTemplate(true);
                 // SAFETY: This NSView subclass has no ivars or custom initialization.
                 let decoration: Retained<StatusContentView> = unsafe {
-                    msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 26.0, 24.0)]
+                    msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(BUTTON_HOVER_PADDING, BUTTON_HOVER_PADDING, 26.0, 24.0)]
                 };
                 let icon = NSImageView::imageViewWithImage(&image, self.mtm());
                 icon.setFrame(rect(6.0, 5.0, 14.0, 14.0));
@@ -2765,11 +2950,40 @@ impl MenuController {
                 let document: Retained<SessionListView> = unsafe {
                     msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 372.0, detail_height)]
                 };
-                let message_end = MESSAGE_TOP_GAP + text_height;
-                let footer_y = message_end + 8.0 + controls_height;
+                let message_top = MESSAGE_TOP_GAP + question_padding;
+                let message_end = message_top + text_height;
+                let footer_y =
+                    message_end + 8.0 + controls_height + question_padding + metadata_gap;
+                if is_question {
+                    let frame = rect(
+                        6.0,
+                        MESSAGE_TOP_GAP,
+                        338.0,
+                        footer_y - MESSAGE_TOP_GAP - metadata_gap,
+                    );
+                    // SAFETY: Decorative view ignores hit testing, preserving text selection,
+                    // answer buttons and scrolling across the entire question card.
+                    let decoration: Retained<StatusContentView> = unsafe {
+                        msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: frame]
+                    };
+                    let card = NSBox::initWithFrame(
+                        NSBox::alloc(self.mtm()),
+                        rect(0.0, 0.0, frame.size.width, frame.size.height),
+                    );
+                    card.setBoxType(NSBoxType::Custom);
+                    card.setTitlePosition(NSTitlePosition::NoTitle);
+                    card.setContentViewMargins(NSSize::new(0.0, 0.0));
+                    card.setCornerRadius(12.0);
+                    card.setBorderWidth(1.0);
+                    let tint = detail_text_color(true);
+                    card.setBorderColor(&tint.colorWithAlphaComponent(0.24));
+                    card.setFillColor(&tint.colorWithAlphaComponent(0.08));
+                    decoration.addSubview(&card);
+                    document.addSubview(&decoration);
+                }
                 metadata.setFrameOrigin(NSPoint::new(6.0, footer_y));
                 document.addSubview(&metadata);
-                label.setFrameOrigin(NSPoint::new(6.0, MESSAGE_TOP_GAP));
+                label.setFrameOrigin(NSPoint::new(content_x, message_top));
                 document.addSubview(&label);
                 if let Some(key) = session.approval_key() {
                     for (index, control) in controls.into_iter().enumerate() {
@@ -2780,7 +2994,7 @@ impl MenuController {
                             sel!(respondToRequest:),
                             &id,
                             rect(
-                                6.0 + control_frames[index].origin.x,
+                                content_x + control_frames[index].origin.x,
                                 message_end + 8.0 + control_frames[index].origin.y,
                                 control_frames[index].size.width,
                                 control_frames[index].size.height,
@@ -3196,11 +3410,7 @@ impl MenuController {
                 }
                 let requests: HashSet<_> = sessions
                     .iter()
-                    .filter(|session| {
-                        session.approval.as_ref().is_some_and(|request| {
-                            !request.can_allow || request.id.starts_with("ipc:")
-                        })
-                    })
+                    .filter(|session| session.approval.is_some())
                     .filter_map(Session::approval_key)
                     .collect();
                 let mut previous = state.session_notifications.borrow_mut();
@@ -3314,6 +3524,7 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<bool> {
         }
         return Ok(false);
     }
+    crate::app::ipc::start()?;
     RESIDENT.store(true, Ordering::Relaxed);
     let controller = MenuController::create(mtm, lock);
     // Wait for launch completion before an explicit CLI request opens the menu.
@@ -3339,6 +3550,14 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<bool> {
                     if let Some(controller) = slot.borrow().as_ref() {
                         controller.update_badge(pending_count);
                         controller.receive_sessions();
+                        if controller
+                            .ivars()
+                            .settings_window
+                            .get()
+                            .is_some_and(|window| window.isVisible())
+                        {
+                            controller.refresh_integration_settings();
+                        }
                         if controller
                             .ivars()
                             .last_refresh

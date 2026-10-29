@@ -116,13 +116,7 @@ pub struct Message {
 pub enum NativeCommand {
     Listen,
     Sessions,
-    Setup,
-    NotificationSettings,
     OpenTarget(String),
-    Send {
-        message: Message,
-        response: Option<String>,
-    },
 }
 
 #[cfg(test)]

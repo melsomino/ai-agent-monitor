@@ -12,9 +12,9 @@ The bundle identifier remains `local.codex.agent-monitor.notify` to preserve exi
 
 ## First-launch setup and disk images
 
-Only the resident app invokes onboarding. Notification senders, permission hooks, and diagnostic commands never install integrations. Onboarding discovers existing Codex/Claude configuration or known VS Code extensions and Cline storage, then runs the existing idempotent installers off the UI thread. It does not install agent software, enable login items, override Codex trust, or toggle Cline's own hook setting.
+Only the resident app invokes onboarding. Hook clients and diagnostic commands never install integrations. If the resident is not running, a hook can launch the installed app in the background; its normal first-launch setup remains the only automatic installer. Onboarding discovers existing Codex/Claude configuration or known VS Code extensions and Cline storage, then runs the existing idempotent installers off the UI thread. It does not install agent software, enable login items, override Codex trust, or toggle Cline's own hook setting.
 
-Successful setup is remembered per agent, configuration directory, and executable path. Failures remain retryable; unrelated agents can still complete setup. New agents can be connected on a later launch or using **Set up integrations…** in General settings. The initial summary explains remaining agent-side steps, and macOS handles its own notification authorization prompt.
+Successful setup is remembered per agent, configuration directory, and executable path. Failures remain retryable; unrelated agents can still complete setup. New agents can be connected on a later launch or using **Check & set up** in the Integrations settings section. The section shows detected agents, inspects the current hook configuration, reports setup progress and errors, and explains remaining agent-side steps. No separate setup-results window is shown; macOS still handles its own notification authorization prompt.
 
 Hooks from another copy of this app bundle are migrated to the current executable path. Commands outside the named app bundle, extra arguments, and unrelated hooks are preserved. Configuration backups and existing installer validation still apply.
 
@@ -58,15 +58,33 @@ The shared `Interaction` / `Response` model represents offered actions, answer c
 
 Each live notification receives its own immutable action category. A response must match the request key and exact category. Up to four actions are registered; larger sets route through a full form or expanded monitor view. The visible banner layout and number of directly visible actions belong to macOS.
 
-Category registration is serialized across the resident process and short-lived hook senders, preserving unrelated active categories. Registration is acknowledged before posting. Resolved requests remove their notification bindings and categories; cancellation is rechecked around asynchronous delivery. After a text-response failure, the full form can reopen with the draft preserved.
+The resident owns all notification category registration, preserving unrelated active categories. Registration is acknowledged before posting. Resolved requests remove their notification bindings and categories; cancellation is rechecked around asynchronous delivery. After a text-response failure, the full form can reopen with the draft preserved.
 
-### Permission hooks
+### Resident-owned hook requests
 
-Codex CLI and Claude Code permission hooks wait for a one-time response for up to 60 seconds. Only explicit **Allow** emits the corresponding permission decision. Timeout, dismissal, failure, or opening the editor returns control to the agent's normal permission UI.
+```mermaid
+flowchart LR
+    Agent[Agent hook] -->|event over local socket| Monitor[Resident monitor]
+    Monitor --> State[Pending request state]
+    State --> Menu[Session menu / answer form]
+    State --> Notification[macOS notification]
+    Menu --> Respond[One response handler]
+    Notification --> Respond
+    Respond -->|validate and resolve once| State
+    Respond -->|hook reply / provider protocol| Agent
+```
 
-Each pending file-backed response uses a separate user-owned temporary directory with mode `0700`. Responses are consumed once; symlink substitution is rejected. The directory is removed after the response or timeout. An expired notification cannot authorize a subsequent request.
+All Codex, Claude Code, and Cline hook commands are thin IPC clients. They forward their event and originating process identity to the resident over `monitor.sock`, then print its result to the agent. They never post notifications or interpret a permission decision themselves. If the resident is not running, the client starts the installed app in the background and waits for the socket. Failure returns control to the agent without granting permission.
 
-For Codex hooks, the native permission dialog appears after the hook finishes waiting. Other independently installed hooks may run in parallel. If native notification delivery is unavailable, a plain `osascript` fallback has no approval button or click navigation and returns control to Codex immediately.
+`sessions --json`, `setup`, and `notification-settings` are also IPC clients. Notification authorization and diagnostic queries execute in the resident, so a short-lived diagnostic command cannot register a competing Notification Center client. Only the resident creates the notification delegate.
+
+The socket is owned by the current user with mode `0600`; peers are checked with `getpeereid`. Messages use bounded, length-prefixed JSON and timeouts. `AI_AGENT_MONITOR_SOCKET` can select an explicit socket for isolated diagnostics; an explicit override disables automatic app launch. Agent hook stdout contains only the monitor's protocol result.
+
+Pending hook approvals live in the monitor's memory with unique process-scoped request IDs. They are merged into session discovery immediately, including requests whose session has not otherwise been discovered. Only the monitor registers and posts their request-specific notification actions. There are no per-notification sender processes or response files for new requests.
+
+`Session::respond` routes the menu, answer forms, and notification actions through `app::monitor::respond`. This handler rejects duplicate in-flight submissions, validates the current request snapshot, and either resolves the waiting hook or calls the agent provider. Providers no longer manage notifications. Successful responses remove the notification and refresh the UI through the monitor.
+
+A hook waits up to 60 seconds for an explicit one-time **Allow**. Expiry, a disconnected hook client, or a monitor restart invalidates the request without approval. Dismissing a notification leaves its request available in the monitor until it is answered or expires. Clicking the notification body opens the editor and defers a hook request to the agent’s own prompt without approving it. Old notification bindings are removed on resident startup. Legacy file-backed requests can be read during an upgrade, but no new ones are published.
 
 ## Claude Code and Cline
 

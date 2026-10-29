@@ -5,12 +5,12 @@ use std::{
     collections::HashSet,
     env, fs,
     io::{self, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(test)]
+use std::{os::unix::fs::PermissionsExt, thread, time::Instant};
 use url::Url;
 
 pub const WAIT: Duration = Duration::from_secs(60);
@@ -288,6 +288,7 @@ pub fn respond(path: &Path, action: Action) -> bool {
         .is_ok()
 }
 
+#[cfg(test)]
 pub fn wait_response(path: &Path, duration: Duration) -> Option<Action> {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
@@ -300,31 +301,12 @@ pub fn wait_response(path: &Path, duration: Duration) -> Option<Action> {
     None
 }
 
+#[cfg(test)]
 pub fn approval_directory() -> io::Result<tempfile::TempDir> {
     tempfile::Builder::new()
         .prefix("agent-monitor-approval-")
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in("/tmp")
-}
-
-fn run_timeout(command: &mut Command, timeout: Duration) -> Result<bool> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status.success());
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("notification sender timed out");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
 }
 
 pub fn deliver(event: &Value, approval: bool) -> Result<Option<Action>> {
@@ -341,40 +323,7 @@ pub fn deliver_content(
     event: &Value,
     approval: bool,
 ) -> Result<Option<Action>> {
-    let executable = bundle_executable();
-    let send = |response: Option<&Path>| -> Result<bool> {
-        let mut command = Command::new(&executable);
-        command
-            .arg(if response.is_some() {
-                "--send-approval"
-            } else {
-                "--send"
-            })
-            .args([&content.title, "", &content.body, &content.target]);
-        if let Some(path) = response {
-            command.arg(path);
-        }
-        run_timeout(&mut command, Duration::from_secs(2))
-    };
-    if approval {
-        let directory = approval_directory()?;
-        let response = directory.path().join("response");
-        crate::agents::pending::publish(directory.path(), event, &content.body, WAIT.as_secs())?;
-        if matches!(send(Some(&response)), Ok(true)) {
-            return Ok(wait_response(&response, WAIT));
-        }
-    } else if matches!(send(None), Ok(true)) {
-        return Ok(None);
-    }
-    // Preserve passive notifications when native notification permission is unavailable.
-    let script = "on run argv\n display notification (item 2 of argv) with title (item 1 of argv) sound name \"Glass\"\nend run";
-    if !run_timeout(
-        Command::new("/usr/bin/osascript").args(["-e", script, &content.title, &content.body]),
-        Duration::from_secs(2),
-    )? {
-        bail!("notification delivery failed");
-    }
-    Ok(None)
+    crate::app::monitor::ask(content, event, approval)
 }
 
 pub fn decision(action: Option<Action>, test: bool) -> Option<Value> {

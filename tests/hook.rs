@@ -70,3 +70,63 @@ fn malformed_new_agent_hooks_never_grant_permissions_or_cancel_cline() {
         assert!(!stdout.contains("allow"));
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn hook_is_only_an_ipc_client_and_prints_the_monitors_reply() {
+    use std::{
+        fs,
+        io::Read,
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+    };
+    let home = tempfile::Builder::new()
+        .prefix("aim-ipc-test-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let directory = home
+        .path()
+        .join("Library/Application Support/AI Agent Monitor");
+    fs::create_dir_all(&directory).unwrap();
+    let socket = directory.join("monitor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let expected = serde_json::json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}});
+    let reply = expected.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut header = [0; 4];
+        stream.read_exact(&mut header).unwrap();
+        let mut data = vec![0; u32::from_le_bytes(header) as usize];
+        stream.read_exact(&mut data).unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(request["type"], "hook");
+        assert_eq!(request["event"]["session_id"], "ipc-test");
+        let reply = serde_json::to_vec(&serde_json::json!({"result":reply,"error":null})).unwrap();
+        stream
+            .write_all(&(reply.len() as u32).to_le_bytes())
+            .unwrap();
+        stream.write_all(&reply).unwrap();
+    });
+    let mut hook = Command::new(env!("CARGO_BIN_EXE_AIAgentMonitor"))
+        .arg("hook")
+        .env("AI_AGENT_MONITOR_SOCKET", &socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hook.stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"hook_event_name\":\"PermissionRequest\",\"session_id\":\"ipc-test\"}")
+        .unwrap();
+    let output = hook.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        expected
+    );
+    assert!(!home.path().join(".codex").exists());
+    assert!(!home.path().join(".claude").exists());
+}
