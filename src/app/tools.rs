@@ -123,3 +123,52 @@ pub fn check_hooks(binary: &str) -> Result<()> {
     let _ = reader.join();
     result
 }
+
+/// Package the current architecture. This intentionally uses the running binary,
+/// so a release asset's version cannot drift from the bundled executable.
+pub fn dmg() -> Result<()> {
+    bundle()?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = root.join("build/release");
+    fs::create_dir_all(&output)?;
+    let stage = tempfile::tempdir()?;
+    let result = Command::new("/usr/bin/ditto")
+        .arg(root.join("build").join(core::APP_NAME))
+        .arg(stage.path().join(core::APP_NAME))
+        .output()?;
+    if !result.status.success() {
+        bail!("ditto: {}", String::from_utf8_lossy(&result.stderr));
+    }
+    std::os::unix::fs::symlink("/Applications", stage.path().join("Applications"))?;
+    let architecture = match env::consts::ARCH {
+        "aarch64" => "apple-silicon",
+        "x86_64" => "intel",
+        other => bail!("Unsupported macOS architecture: {other}"),
+    };
+    let image = output.join(format!("AI-Agent-Monitor-{architecture}.dmg"));
+    let result = Command::new("/usr/bin/hdiutil")
+        .args(["create", "-volname", "AI Agent Monitor", "-srcfolder"])
+        .arg(stage.path())
+        .args(["-fs", "HFS+", "-format", "UDZO", "-ov"])
+        .arg(&image)
+        .output()?;
+    if !result.status.success() {
+        bail!("hdiutil: {}", String::from_utf8_lossy(&result.stderr));
+    }
+    let checksum = Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .arg(image.file_name().context("DMG filename")?)
+        .current_dir(&output)
+        .output()?;
+    if !checksum.status.success() {
+        bail!("Could not compute the DMG checksum");
+    }
+    fs::write(output.join("SHA256SUMS"), &checksum.stdout)?;
+    println!("Version: {}", core::VERSION);
+    println!("Disk image: {}", image.display());
+    println!(
+        "Checksum: {}",
+        String::from_utf8_lossy(&checksum.stdout).trim()
+    );
+    Ok(())
+}

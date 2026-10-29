@@ -91,6 +91,7 @@ fn run(command: Option<Command>) -> Result<()> {
             }
         }
         Some(Command::Bundle) => tools::bundle()?,
+        Some(Command::Dmg) => tools::dmg()?,
         Some(Command::Sessions { json: true }) => {
             let sessions = sessions::open()?;
             println!(

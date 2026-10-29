@@ -268,6 +268,14 @@ pub fn install(directory: &Path, executable: &Path) -> Result<bool> {
         for group in groups.iter_mut() {
             if let Some(handlers) = group["hooks"].as_array_mut() {
                 handlers.retain(|handler| {
+                    if handler["type"] == "command"
+                        && handler["command"].as_str().is_some_and(|previous| {
+                            previous != command
+                                && core::monitor_hook(previous, &["agent-hook", "claude"])
+                        })
+                    {
+                        return false;
+                    }
                     if handler["command"] == command && handler["type"] == "command" {
                         if found {
                             false
@@ -370,5 +378,18 @@ mod tests {
         let v: Value = serde_json::from_slice(&fs::read(p).unwrap()).unwrap();
         assert_eq!(v["permissions"]["deny"][0], "Bash(rm *)");
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "existing");
+    }
+    #[test]
+    fn install_migrates_its_moved_hook_and_preserves_unrelated_handlers() {
+        let home = tempfile::tempdir().unwrap();
+        let old = "'/old/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor' agent-hook claude";
+        std::fs::write(home.path().join("settings.json"), serde_json::to_vec(&serde_json::json!({"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":old},{"type":"command","command":"echo custom"}]}]}})).unwrap()).unwrap();
+        let executable =
+            Path::new("/Applications/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor");
+        assert!(install(home.path(), executable).unwrap());
+        assert!(!install(home.path(), executable).unwrap());
+        let data = std::fs::read_to_string(home.path().join("settings.json")).unwrap();
+        assert!(!data.contains("/old/"));
+        assert!(data.contains("echo custom"));
     }
 }

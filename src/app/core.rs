@@ -385,6 +385,26 @@ pub fn decision(action: Option<Action>, test: bool) -> Option<Value> {
     })
 }
 
+/// Identify this app's own hook after a move, without touching other hook commands.
+pub fn monitor_hook(command: &str, arguments: &[&str]) -> bool {
+    let Some(words) = shlex::split(command) else {
+        return false;
+    };
+    let Some((executable, args)) = words.split_first() else {
+        return false;
+    };
+    let path = Path::new(executable);
+    args.iter()
+        .map(String::as_str)
+        .eq(arguments.iter().copied())
+        && path
+            .file_name()
+            .is_some_and(|name| name == "AIAgentMonitor")
+        && path
+            .parent()
+            .is_some_and(|p| p.ends_with("AI Agent Monitor.app/Contents/MacOS"))
+}
+
 pub fn install(home: &Path, executable: &Path, legacy_script: &Path) -> Result<bool> {
     fs::create_dir_all(home)?;
     let path = home.join("hooks.json");
@@ -430,15 +450,18 @@ pub fn install(home: &Path, executable: &Path, legacy_script: &Path) -> Result<b
         let mut index = 0;
         while index < handlers.len() {
             let ours = handlers[index]["type"] == "command"
-                && handlers[index]["command"]
+                && (handlers[index]["command"]
                     .as_str()
-                    .and_then(shlex::split)
-                    .is_some_and(|args| {
-                        args.first().is_some_and(|p| {
-                            let path = Path::new(p);
-                            path == executable || legacy_executable.as_deref() == Some(path)
-                        }) || args.get(1).is_some_and(|p| Path::new(p) == legacy_script)
-                    });
+                    .is_some_and(|command| monitor_hook(command, &["hook"]))
+                    || handlers[index]["command"]
+                        .as_str()
+                        .and_then(shlex::split)
+                        .is_some_and(|args| {
+                            args.first().is_some_and(|p| {
+                                let path = Path::new(p);
+                                path == executable || legacy_executable.as_deref() == Some(path)
+                            }) || args.get(1).is_some_and(|p| Path::new(p) == legacy_script)
+                        }));
             if ours {
                 if found {
                     handlers.remove(index);

@@ -470,6 +470,11 @@ define_class!(
             self.show_settings();
         }
 
+        #[unsafe(method(setupIntegrations:))]
+        fn setup_integrations(&self, _sender: Option<&AnyObject>) {
+            crate::macos::onboarding::begin(self.mtm(), true);
+        }
+
         #[unsafe(method(toggleLogin:))]
         fn toggle_login(&self, sender: &NSButton) {
             let result = settings::set_launch_at_login(sender.state() == NSControlStateValueOn);
@@ -1263,6 +1268,10 @@ impl MenuController {
             unsafe { let _: () = msg_send![&*clear, setAccessibilityLabel: ns_string!("Clear keyboard shortcut")]; }
             view.addSubview(&clear);
             state.shortcut_clear.set(clear).expect("shortcut clear button initialized once");
+            // SAFETY: Implemented selector and target retained for the window lifetime.
+            let setup = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Set up integrations…"), Some(self), Some(sel!(setupIntegrations:)), self.mtm()) };
+            setup.setFrame(rect(264.0, 16.0, 172.0, 28.0));
+            view.addSubview(&setup);
             let applications_view = NSView::initWithFrame(
                 NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 304.0),
             );

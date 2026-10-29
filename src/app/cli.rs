@@ -63,6 +63,8 @@ pub enum Command {
     },
     /// Package this binary and the icon into a signed macOS app.
     Bundle,
+    /// Build a drag-and-drop macOS disk image from this binary.
+    Dmg,
     /// Install or update the Codex approval hook.
     Install {
         /// Codex configuration directory (defaults to CODEX_HOME or ~/.codex).

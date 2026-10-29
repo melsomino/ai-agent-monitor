@@ -1,381 +1,297 @@
-# AI Agent Monitor — Rust
+<div align="center">
+  <img src="assets/AppIcon-robots.png" width="128" alt="AI Agent Monitor — two robots">
 
-Один Rust-бинарник внутри macOS-приложения. Показывает открытые сеансы Codex,
-Claude Code и Cline, их состояние, последние сообщения и запросы подтверждения.
-Codex CLI и расширение Codex для VS Code используют общий `CODEX_HOME`
-(обычно `~/.codex`). Claude Code и Cline подключаются через lifecycle hooks.
-Python и Swift не нужны для обычной сборки и запуска. Используются системные
-AppKit, UserNotifications и SQLite.
+  <h1>AI Agent Monitor</h1>
 
-В уведомлении — название чата и причина запроса. У Codex и Claude Code доступна
-кнопка **Allow**. Запросы Cline открываются для подтверждения в самом Cline:
-его публичный API не позволяет адресно подтвердить конкретный запрос.
+  <p><strong>Your coding agents, one menu away.</strong></p>
+  <p>A native macOS menu bar app for Codex, Claude Code, and Cline.<br>See what is running, catch requests for input, and get back to the right project.</p>
 
-## Иконка в строке меню и сессии
+  <p>
+    <img src="https://img.shields.io/badge/macOS-13%2B-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 13 or later">
+    <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=flat-square&logo=rust&logoColor=white" alt="Built with Rust">
+    <img src="https://img.shields.io/badge/UI-native_AppKit-147EFB?style=flat-square" alt="Native AppKit UI">
+  </p>
 
-В открытом меню клавиши **↑ / ↓** выбирают сеанс системным цветом выделения,
-**Enter** открывает его проект в редакторе, **→** разворачивает подробности,
-**←** сворачивает. Набор текста, включая пробелы, накапливает фильтр: все слова
-должны встречаться в заголовке без учёта регистра. Совпадения подсвечиваются,
-**Backspace** удаляет последний символ. Фильтр виден в подвале и очищается при
-закрытии меню. Фокус сохраняется при автообновлении списка и сбрасывается при
-закрытии меню. Ховер мыши работает независимо.
+  <p><a href="https://github.com/melsomino/ai-agent-monitor/releases/latest/download/AI-Agent-Monitor-apple-silicon.dmg"><strong>Download for Mac · Apple Silicon</strong></a></p>
 
-В нижнем левом углу указан номер монитора, например `v0.1.0+7`.
-`build.rs` автоматически увеличивает `build-number.txt` при каждом запуске сборки
-Cargo (включая повторный запуск без изменений). Номер сохраняется в бинарнике,
-`--version` и `CFBundleVersion`; повторная упаковка того же бинарника сохраняет
-его номер. Проверки Cargo тоже получают свой номер сборки.
+  <p><a href="#features">Features</a> · <a href="#installation">Installation</a> · <a href="#connect-your-agents">Agent setup</a> · <a href="#using-the-monitor">Usage</a> · <a href="#troubleshooting">Troubleshooting</a></p>
+</div>
 
-В закреплённом подвале — лимиты Codex: оставшийся процент и дата/время сброса
-(например, `Codex Weekly · 81% · Nov 4`). Берётся последний отчёт `token_count.rate_limits`
-из недавних локальных сеансов, включая закрытые; проверка новых данных — раз
-в 10 секунд. Это последний известный лимит, а не отдельный сетевой запрос: изменения
-на других устройствах появятся после нового отчёта Codex. В подсказке — время
-отчёта и точное время сброса. После истечения окна до нового отчёта показывается `—`.
+## Features
 
-Обычный запуск `build/AI Agent Monitor.app` не открывает окон: в строке меню появляется одноцветная иконка двух роботов с бэджем числа ожидающих подтверждений поверх правого нижнего угла значка.
-Бэдж обновляется и при закрытой панели. Без подтверждений работающие сеансы подсвечивают глаза роботов зелёным: восемь шагов с яркостью 0%, 50% и 100%, по 150 мс на шаг (полный цикл 1,2 с). Во время работы незажжённые глаза скрыты, зелёные — круглые. Без работающих сеансов все глаза круглые обычного цвета.
-Нажмите её, чтобы открыть системное `NSMenu` с собственным представлением списка сессий.
-Закрытием меню и восстановлением фокуса управляет AppKit; верхнего указателя больше нет. Прямой запуск панели:
+- **All open sessions in one place.** Sessions are grouped by application and sorted by name. Working, waiting, and idle sessions stay visible; closed chat history stays out of the list.
+- **Status at a glance.** Green robot eyes show activity in the menu bar. A count badge takes priority when requests need a response.
+- **Useful details, inline.** Expand a session to see its latest message or pending question, working directory, and Git branch. Working sessions and pending requests expand automatically when you open the menu.
+- **Answer without switching windows.** Approve supported requests, choose an offered answer, or open a form for custom text and multiple questions. Actions also appear in macOS notifications when supported.
+- **Jump back to the project.** Click a session or notification to open its project in VS Code. Live VS Code workspace information takes priority over directories used by individual commands.
+- **Keyboard navigation and instant filtering.** Move through sessions with the arrow keys, expand details, or start typing to filter titles. Matching words are highlighted.
+- **A compact, live view.** The list refreshes in the background every two seconds. The menu follows its contents up to 80% of the screen height, then scrolls.
+- **Your preferences, remembered.** Launch at login, choose a global shortcut, toggle menu bar animation, and hide sessions from selected applications.
+- **Codex usage in the footer.** See the last reported remaining quota and reset date alongside the monitor's build version.
 
-```sh
-"build/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor" sessions
-```
+One Rust executable, native AppKit controls, and macOS notifications. No Python or Swift runtime is needed.
 
-В панели — только загруженные сессии, включая простаивающие, и названия проектов.
-Иконки показывают источник: терминал, VS Code или Codex Desktop. История закрытых чатов не отображается.
-Список обновляется каждые 2 секунды в фоне, в том числе при закрытой панели;
-сеансы сгруппированы по приложениям, внутри группы отсортированы по имени; состояние показано значком с подсказкой. Клик по строке открывает
-проект сессии в VS Code. Для сеансов IDE проект определяется по текущему окну:
-`Codex.log` связывает ID чата с окном, `exthost.log` — с `workspaceStorage`,
-а `workspace.json` содержит папку или файл workspace. Принимаются только окна,
-лог которых держит работающий Code Helper, и записи после запуска текущего extension host.
-При нескольких привязках выбирается самая свежая; неоднозначные совпадения не используются.
-Логи кешируются с учётом дописывания и ротации. Каталоги выполняемых команд не используются.
-Исходный `cwd` чата сохраняется отдельно и служит запасным вариантом, если привязки окна нет.
-Та же привязка используется для ссылки из уведомления. Если подходящего существующего пути нет,
-приложение переключается в VS Code без открытия удалённой папки. Конкретный чат внутри VS Code не переключается.
-Стрелка раскрывает подробности прямо под строкой: последний текст ассистента или
-ожидающий запрос разрешения. При открытии панели сеансы с подтверждением и работающие сеансы раскрываются автоматически;
-Allow находится под текстом запроса внизу раскрытой секции и обновляет список, не закрывая панель.
-Успешное разрешение из панели удаляет соответствующее уведомление macOS.
-Высота панели следует содержимому и ограничена 80% экрана; при переполнении список прокручивается. Кнопка использует тот же одноразовый
-ответ, что и уведомление, и действует только пока hook ждёт ответ (60 секунд).
-Для статуса используются события начала и завершения хода из локального диалога;
-если версия Codex не записывает эти события, показывается «Unknown status».
-Обновления и анимация работают в цикле отслеживания меню через общий режим run loop.
-Раскрытие плавно меняет высоту и прозрачность блока за 240 мс; стрелка поворачивается,
-а строки подсвечиваются при наведении. Повторный клик разворачивает текущую анимацию.
-Раскрытые сообщения прокручиваются вместе со всем списком; внутренней прокрутки у них нет.
-Gear и power находятся в закреплённом подвале под списком сеансов.
-Пока панель открыта, hover сверяется с реальной экранной позицией указателя с частотой 60 Гц независимо от first responder: активен только один элемент — строка, кнопка или стрелка. При выходе за пределы окна подсветка снимается.
-Учитываются файлы диалогов, открытые на запись процессами `codex` текущего
-пользователя. Метаданные и последние 4 МиБ диалога читаются локально для последнего сообщения.
-Если событие статуса осталось за пределами хвоста, оно ищется назад по журналу потоково.
-Результат кешируется; новые данные вне хвоста проверяются перед повторным использованием статуса,
-а идентификатор файла и содержимое на границе кеша защищают от устаревшего состояния после перезаписи.
-Запросов к модели нет.
-Названия и проекты читаются из локальной базы только для найденных ID.
-Открытая сессия не обязательно выполняет задачу: простаивающие тоже включены.
-Сервер Codex может сохранять загруженную сессию некоторое время после закрытия
-клиента. Этот способ рассчитан на локальные серверы, которые держат файл диалога
-открытым; другие варианты хранения могут не отображаться. Если источник
-недоступен, панель сообщает об этом и не подставляет историю.
-Посмотреть тот же список без панели: `AIAgentMonitor sessions --json`.
+## Supported agents
 
-Клик вне панели или повторный клик по иконке закрывает её и оставляет иконку и приложение работающими; кнопка power справа в подвале завершает
-приложение в строке меню. Уведомления hook продолжают работать отдельными короткими
-процессами. Клик по уведомлению и Allow не завершают постоянное приложение.
-При закрытии панели все сессии сворачиваются, незавершённое раскрытие отменяется.
-Повторный запуск команды `sessions` открывает существующую панель без второй иконки.
-Кнопки gear и power расположены справа внизу подвала. Gear открывает нативное окно настроек с разделами **General** и **Applications** в панели инструментов, как в Finder. В **General** находятся автозапуск, анимация и горячая клавиша; в **Applications** — список обнаруженных приложений:
+| Agent | Session discovery | Respond from the monitor | Setup |
+| --- | --- | --- | --- |
+| **Codex** | Local CLI, VS Code, and desktop sessions | Approval actions, supported questions, custom answers | Automatic local discovery; optional approval hook for CLI requests |
+| **Claude Code** | Lifecycle hooks in terminal and VS Code | One-time **Allow** for permission requests | Install hooks and restart Claude Code |
+| **Cline** | Lifecycle hooks and the current task's messages | Open the project and respond in Cline | Install hooks and enable them in Cline |
 
-- **Launch at login** — системный Login Item через `SMAppService`. По умолчанию автозапуск не включается. Состояние перечитывается при возвращении в окно; если macOS требует подтверждения, появляется переход в системные настройки входа.
-- **Menu bar animation** — сохраняется между запусками и применяется сразу. При отключении во время работы оба глаза постоянно зелёные. Анимация статуса внутри списка не меняется. Системное «Уменьшение движения» также останавливает анимацию меню-бара.
-- **Applications** — список приложений автоматически пополняется при обнаружении сеансов и сохраняется между запусками. Снимите чекбокс, чтобы скрыть сеансы приложения из окна монитора. Выбор сохраняется после закрытия и повторного открытия приложения; уведомления и индикатор меню-бара продолжают учитывать все сеансы.
-- **Keyboard shortcut** — глобальное сочетание для открытия меню; повторное нажатие закрывает его, как Escape. Нажмите **Record shortcut**, затем сочетание с ⌘, ⌥ или ⌃. Escape отменяет запись, × удаляет сочетание. Запись отменяется при закрытии настроек или переходе в другое окно. Настройка сохраняется между запусками; по умолчанию сочетание не назначено. Используется системная регистрация горячей клавиши через Carbon, без глобального перехвата клавиатуры. Если регистрация обнаруживает конфликт, новое сочетание не сохраняется; после отмены записи восстанавливается прежнее.
+The monitor runs on the Mac that hosts the agents. SSH, containers, and remote development environments need a separate delivery mechanism. Linux is not supported yet.
 
-Пока меню открыто, это сочетание обрабатывается нативной командой `NSMenuItem`,
-а глобальная регистрация приостановлена, чтобы клавиши не буферизовались до закрытия меню.
-После закрытия глобальный хоткей восстанавливается. Открытие из Carbon-обработчика
-отложено через таймер в общем режиме run loop, чтобы обработчик успел завершиться до начала отслеживания меню.
+## Installation
 
-Значок idle у простаивающих сессий скрыт.
+### Download the app — no terminal required
 
-Командная строка описана через `clap` с `derive`. Общая справка — `AIAgentMonitor --help`,
-справка команды — например, `AIAgentMonitor test --help`. Пропущенные значения
-и неизвестные аргументы отклоняются до запуска системного интерфейса.
+1. Download the [latest DMG for Apple Silicon](https://github.com/melsomino/ai-agent-monitor/releases/latest/download/AI-Agent-Monitor-apple-silicon.dmg) from [GitHub Releases](https://github.com/melsomino/ai-agent-monitor/releases/latest).
+2. Open the DMG and drag **AI Agent Monitor** to **Applications**.
+3. Open the app from Applications. It connects detected agents automatically and requests notification permission.
+4. Follow the setup summary: restart the connected agents, review Codex's hook in `/hooks`, or enable Cline hooks if needed.
 
-## Сборка и установка
+Requires **macOS 13+** and **Apple Silicon** for the prebuilt DMG. Agents are installed separately. Rust, Xcode, and terminal commands are not needed to run the downloaded app.
 
-Нужны Rust/Cargo и Command Line Tools macOS (линкер и codesign).
+The current release is ad-hoc signed and **not notarized by Apple**. If macOS blocks the first launch, follow [Apple's instructions for opening an unnotarized app](https://support.apple.com/en-us/102445): after attempting to open it, use **System Settings → Privacy & Security → Open Anyway** if you trust this release. No system-wide security settings need to be disabled.
+
+The robot icon appears in the menu bar. To start automatically next time, enable **Settings → General → Launch at login**. Setup can be rerun from **Settings → General → Set up integrations…**, including after installing another agent. Existing unrelated hooks are preserved.
+
+### Build from source
+
+For development or a native Intel build, install Rust/Cargo with support for the **2024 edition** and Xcode Command Line Tools, then:
 
 ```sh
-cargo build --release --locked
+git clone https://github.com/melsomino/ai-agent-monitor.git
+cd ai-agent-monitor
+
 cargo run --release --locked -- bundle
-cargo run --release --locked -- install
+
+mkdir -p "$HOME/Applications"
+ditto "build/AI Agent Monitor.app" "$HOME/Applications/AI Agent Monitor.app"
 ```
 
-`bundle` создаёт `build/AI Agent Monitor.app` из того же бинарника Rust, готовой
-иконки и Info.plist. Приложение подписывается локальной подписью. Идентификатор
-приложения сохранён: `local.codex.agent-monitor.notify`. Предыдущий отправитель
-при первой пересборке сохраняется как `build/AIAgentMonitor.previous`.
+The build creates a locally signed app bundle. Install it at its final location **before** configuring hooks: hooks store the absolute executable path.
 
-Установщик заменяет прежний Python-hook и hook Codex Notify на актуальный Rust-hook, сохраняя остальные hooks
-и резервную копию `hooks.json`. Повторный запуск не добавляет дубликатов.
-В конфигурации записывается абсолютный путь к исполняемому файлу внутри `.app`:
-не перемещайте приложение после установки. Для отдельного каталога Codex:
+Define these paths for the commands below:
 
 ```sh
-cargo run --release --locked -- install --codex-home /path/to/codex-home
+monitor_app="$HOME/Applications/AI Agent Monitor.app"
+monitor_bin="$monitor_app/Contents/MacOS/AIAgentMonitor"
 ```
 
-Перезапустите CLI и VS Code. В Codex откройте `/hooks`, проверьте и доверьте
-обновлённое определение «macOS notification». Изменение команды hook требует
-повторного доверия. Если macOS запросит разрешение для AI Agent Monitor, разрешите
-уведомления. При первой установке запросить его можно так:
+Start the installed app; first-launch setup handles notification permission and detected integrations:
 
 ```sh
-open -W -n -g "build/AI Agent Monitor.app" --args --setup
+open -g "$monitor_app"
 ```
 
-## Allow
+Normal launches keep only the robot icon in the menu bar. Click it to see your sessions.
 
-Hook получает JSON через stdin и ожидает ответ до 60 секунд.
+## Connect your agents
 
-- **Allow** выдаёт разовое разрешение именно текущему запросу.
-- Обычный клик открывает проект в VS Code и сразу передаёт подтверждение
-  в штатный интерфейс Codex.
-- Закрытие уведомления или истечение минуты возвращает запрос в Codex.
-- После окончания ожидания кнопка старого уведомления не разрешает команду,
-  а только открывает проект.
+**First-launch setup does this automatically for detected agents.** The commands below are optional: use them for custom configuration directories, manual setup, or diagnostics. For the DMG installation, the executable is `/Applications/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor`; set `monitor_bin` to that path before using these examples.
 
-Штатный диалог Codex появляется после завершения hook, поэтому в течение этой
-минуты он ещё не отображается. Кнопка Allow может быть видна в меню действий
-уведомления — это зависит от оформления macOS. Разрешение на всю сессию
-не выдаётся. Ошибки и таймауты не разрешают действие автоматически.
+<details>
+<summary><strong>Manual agent setup and custom paths</strong></summary>
 
-Ответ хранится в отдельном временном каталоге с правами `0700`, принадлежащем
-текущему пользователю. Запись ответа одноразовая, подмена файла симлинком запрещена.
-Каталог удаляется после ответа или таймаута. Разные запросы не используют общий
-файл ответа. Только явное Allow выводит JSON-решение в stdout; ошибки — в stderr.
+### Codex
 
-Если нативная доставка недоступна, отправляется обычное уведомление через
-системный osascript, а подтверждение сразу передаётся в Codex. У такого резервного
-уведомления нет кнопки Allow и перехода по клику.
+Open local Codex sessions are discovered automatically from local state and process activity. The VS Code and desktop integrations can expose live requests and questions through Codex's local client connection.
 
-## Название чата и переход в VS Code
+For approval notifications from Codex CLI, install the permission hook:
 
-В список VS Code входят чаты, привязанные к живому extension host текущего окна.
-Открытый журнал в общем процессе Codex сам по себе не означает, что окно ещё открыто.
-После закрытия окна его сеансы исключаются при обновлении; повторное открытие
-возвращает их. Удалённая папка проекта не скрывает чат живого окна. При недоступности
-проверки окон сохраняется прежнее обнаружение по журналам.
+```sh
+"$monitor_bin" install
+```
 
-Название читается по точному `session_id` из локальной базы Codex в режиме
-только чтения. Переименованное название имеет приоритет. Если база недоступна
-или название не найдено, заголовок — «Codex». Название другого чата не подбирается.
-Причина запроса передаётся целиком, с переносами строк; команда и её аргументы
-в уведомление не включаются. Число видимых строк и размер компактного баннера
-определяет macOS: утилита текст не обрезает.
+Restart Codex CLI and VS Code. In Codex, open `/hooks`, review **macOS notification**, and trust the updated hook. Changing its executable path requires reviewing it again.
 
-Клик открывает соответствующий проект через URL-обработчик VS Code.
-Для запуска из подпапки корень определяется по локальному кешу рабочих пространств.
-Поддерживаются рабочие пространства из нескольких папок, включая JSON с
-комментариями и завершающими запятыми. Без подходящего кеша открывается `cwd`.
-Если один проект открыт в нескольких окнах, окно выбирает VS Code.
-Отдельный чат внутри окна автоматически не переключается. Даже для CLI
-в отдельном терминале клик открывает проект в VS Code.
+The installer preserves unrelated hooks, backs up the configuration, and avoids duplicate entries. It also replaces this project's older notification hooks.
 
-## Проверка
+By default, the monitor uses `$CODEX_HOME` or `~/.codex`. To install the hook in a different configuration directory:
+
+```sh
+"$monitor_bin" install --codex-home /path/to/codex-home
+```
+
+Run the monitor with the same `CODEX_HOME` when monitoring that configuration.
+
+### Claude Code
+
+```sh
+"$monitor_bin" install-agent claude
+```
+
+Restart Claude Code to load its lifecycle and permission hooks. Sessions already open during installation appear after a new hook event.
+
+The installer updates `$CLAUDE_CONFIG_DIR/settings.json` or `~/.claude/settings.json`, preserves existing hooks and permission rules, and creates a private backup. A custom configuration directory is supported:
+
+```sh
+"$monitor_bin" install-agent claude --home /path/to/claude-config
+```
+
+### Cline
+
+```sh
+"$monitor_bin" install-agent cline
+```
+
+In Cline, turn on **Enable Hooks**, then open or resume a task. Hooks are installed in `~/Documents/Cline/Hooks`; existing hook files from other tools are not overwritten. For a custom hook directory:
+
+```sh
+"$monitor_bin" install-agent cline --home /path/to/cline-hooks
+```
+
+Cline requests are displayed and generate notifications, but approval happens in Cline. Its public approval API cannot address a specific request, so the monitor does not offer an external **Allow** button.
+
+</details>
+
+## Using the monitor
+
+### Sessions and navigation
+
+Click the robot icon, or use your configured shortcut, to open the menu. Idle sessions are included and have no status icon. Hover over a status icon for its description.
+
+- **Click the session title** to open its project in VS Code.
+- **Click the chevron** to expand or collapse details.
+- **Click outside**, press **Escape**, or use the shortcut again to close the menu.
+- Use **gear** in the footer to open settings, or **power** to quit the resident monitor.
+
+Closing the menu clears the filter and collapses the sessions. On the next opening, working sessions and requests needing a response expand again. Quitting the resident monitor does not remove installed hooks.
+
+Project navigation opens the workspace in VS Code; it does not select a particular chat. If the project folder no longer exists, the monitor switches to VS Code without trying to open the missing path. If the same project is open in several windows, VS Code chooses the window.
+
+### Keyboard controls
+
+| Key | Action |
+| --- | --- |
+| **↑ / ↓** | Select the previous or next session |
+| **Enter** | Open the selected session's project |
+| **→** | Expand the selected session |
+| **←** | Collapse the selected session |
+| **Type text** | Filter session titles |
+| **Backspace** | Delete the last filter character |
+| **Escape** | Close the menu |
+
+Filtering ignores case and splits the query on spaces. Every word must appear in the title: `api tests` matches titles containing both `api` and `tests`, in any order. The current query appears in the footer.
+
+### Approvals and questions
+
+Expand a pending request to read it and see its available actions beneath the message. Buttons follow the choices offered by the agent. When they fit, they share one row; otherwise they form a column.
+
+For supported Codex requests, actions can include one-time approval, approval for a session, decline, cancellation, or proposed policy changes. Questions can offer answer buttons, a custom response, or a separate form for multiple questions. Secret answers use a secure input field in the form.
+
+The monitor rechecks that the request is still current before sending a response. A successful response refreshes the session and removes its notification without closing the menu. Requests answered in the editor also disappear after the monitor observes the update. Unsupported request types direct you to the editor.
+
+macOS notifications use actions specific to the request. Depending on the notification layout, these may appear in an actions menu. Larger sets of answers use **More answers** or open the full form. macOS controls how many actions and text lines are visible.
+
+**Hook-based approvals:** Codex CLI and Claude Code permission hooks wait up to 60 seconds for a one-time **Allow**. Clicking the notification body, dismissing it, or reaching the timeout returns control to the agent's own permission dialog. A stale notification cannot approve a later request. Errors never grant permission automatically.
+
+### Codex quota
+
+The footer shows the latest locally reported quota, such as **Codex Weekly · 74% · Nov 4**. The percentage is **remaining**, not used. Hover for the report time and exact reset time.
+
+This is a cached report from Codex sessions, checked every ten seconds, rather than a live account query. Usage on another device appears after Codex reports updated limits locally. After a reported window expires, the monitor shows `—` until another report arrives.
+
+## Settings
+
+Settings use a native preferences toolbar with two sections.
+
+| Section | Setting | Behavior |
+| --- | --- | --- |
+| **General** | Launch at login | Registers a macOS Login Item; disabled by default |
+| **General** | Menu bar animation | Animates green robot eyes while agents work; when disabled, working eyes stay green |
+| **General** | Set up integrations… | Reconnect detected agents or retry setup after an error |
+| **General** | Keyboard shortcut | Records a global shortcut using ⌘, ⌥, or ⌃; **Escape** cancels recording and **×** clears it |
+| **Applications** | Application switches | Show or hide that application's sessions in the menu |
+
+The application list fills automatically as sessions are discovered. Entries and your choices are retained after applications close and across monitor restarts. Hiding an application affects the session list; notifications and the menu bar indicator still account for its sessions.
+
+macOS **Reduce Motion** also stops the menu bar animation. If macOS requires approval for a Login Item, settings provide a button to open the relevant system controls.
+
+## Troubleshooting
+
+### Notifications are in Notification Center, but no banner appears
+
+Check **System Settings → Notifications → AI Agent Monitor** and allow banners or alerts. Check the current **Focus / Do Not Disturb** mode as well. A successful delivery can still be silent when macOS suppresses banners.
+
+Inspect the notification configuration or send a harmless test:
+
+```sh
+"$monitor_bin" notification-settings
+"$monitor_bin" test
+"$monitor_bin" test --approval
+```
+
+The test **Allow** button only checks the response path; it does not grant any agent permissions. To use a specific Codex chat title in the test:
+
+```sh
+"$monitor_bin" test --approval --session-id THREAD_ID
+```
+
+### A session or approval is missing
+
+Check that the agent runs locally. For Claude Code, restart after hook installation; for Cline, enable hooks and reopen the task. For Codex CLI approvals, review the hook's trust in `/hooks`.
+
+```sh
+"$monitor_bin" sessions --json
+"$monitor_bin" check-hooks
+```
+
+`sessions --json` prints discovered open sessions without opening the menu; application visibility preferences only filter the window. `check-hooks` inspects Codex hook discovery and trust without starting a model. To inspect another Codex executable:
+
+```sh
+"$monitor_bin" check-hooks --binary /path/to/codex
+```
+
+Codex's local client protocol is version-dependent. If a live request cannot be read or answered, use the agent's own interface. The monitor falls back to logs and hooks when possible. Historical chats are not added as substitutes for unavailable session data.
+
+### Hooks stopped working after moving the app
+
+Run the corresponding `install` or `install-agent` command from the app's **new location**, then restart the agent. Review updated Codex hooks again in `/hooks`.
+
+## Updating and uninstalling
+
+For a downloaded app, quit the monitor using **power**, download the new DMG, and replace the app in Applications. Preferences are retained. When its location is unchanged, existing hooks keep working; setup reconnects agents if the executable path changes.
+
+For a source build, quit the monitor, pull the latest code, rebuild, and replace the installed bundle:
+
+```sh
+git pull --ff-only
+cargo run --release --locked -- bundle
+ditto "build/AI Agent Monitor.app" "$HOME/Applications/AI Agent Monitor.app"
+open -g "$HOME/Applications/AI Agent Monitor.app"
+```
+
+If the app path is unchanged, existing hooks keep pointing to it. If an integration changes in an update, run its installer again and restart the agent.
+
+To uninstall, turn off **Launch at login**, quit the monitor, and remove its hook entries before deleting the app. For Codex, disable the hook in `/hooks` or remove only the `AIAgentMonitor hook` handler from `hooks.PermissionRequest` in `hooks.json`. For Claude Code, remove this monitor's hook commands from its settings. For Cline, remove only wrappers installed by this project from its Hooks directory. Keep unrelated hooks intact.
+
+## Development
 
 ```sh
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-cargo run --release --locked -- check-hooks
 ```
 
-`check-hooks` запрашивает у Codex обнаруженные hooks и их статус доверия,
-не запуская модель. Можно проверить другой движок:
-
-```sh
-cargo run --release --locked -- check-hooks --binary /path/to/codex
-```
-
-Показать тестовое уведомление без выполнения команды:
-
-```sh
-"build/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor" test
-"build/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor" test --approval
-"build/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor" test --approval --session-id THREAD_ID
-```
-
-В режиме `test` Allow лишь подтверждает доставку ответа: JSON разрешения Codex
-не выводится. Успешная отправка не гарантирует показ баннера, если macOS скрывает
-уведомления или включён режим фокусирования. Окончательная проверка интеграции —
-реальный запрос разрешения в CLI и VS Code после доверия hook.
-
-## Ограничения и удаление
-
-Работает на том Mac, где выполняется Codex. Для SSH, контейнеров и Remote
-Development нужен отдельный канал доставки. Hook реагирует на `PermissionRequest`,
-а не на произвольные вопросы агента. Если другой hook сам разрешает запрос,
-уведомление всё равно может появиться: обработчики запускаются параллельно.
-
-Отключение — через `/hooks`. Для удаления из конфигурации удалите только
-обработчик с командой `AIAgentMonitor hook` из `hooks.PermissionRequest`
-в `~/.codex/hooks.json`.
-
-Документация: [Codex PermissionRequest](https://learn.chatgpt.com/docs/hooks#permissionrequest),
-[URL-обработчик VS Code](https://code.visualstudio.com/docs/configure/command-line#_opening-vs-code-with-urls),
-[ответ на уведомление macOS](https://developer.apple.com/documentation/usernotifications/unusernotificationcenterdelegate).
-
-## Подключение других агентов
-
-Общая модель `Session`, статусы `Activity`, приложения `Client` и данные подтверждения
-`Approval` находятся в `src/agents/sessions.rs`. Меню и команда `sessions --json` работают
-с этой моделью через `SessionProvider`. В JSON добавлено поле `agent`; `id` остаётся
-исходным идентификатором чата. Внутренние ключи интерфейса включают идентификатор
-провайдера, поэтому совпадающие ID у разных агентов не смешиваются.
-
-Реализация Codex находится в `src/agents/codex/mod.rs`: она обнаруживает открытые сеансы,
-читает базу и журналы, определяет workspace и обрабатывает Allow с повторной
-проверкой запроса и удалением уведомления. Общая модель не содержит путей к файлам
-протокола подтверждения: поле `Approval.id` — непрозрачный для интерфейса токен.
-
-Чтобы подключить другого агента, реализуйте `SessionProvider` и зарегистрируйте
-провайдер в `src/agents/mod.rs`. Интерфейс включает получение снимков открытых
-сеансов, число ожидающих подтверждений, цель перехода в приложение и явное
-разрешение запроса. Обнаружение и чтение статуса не должны выдавать разрешения;
-реализация `allow` обязана проверить актуальность запроса и его принадлежность сеансу.
-
-## Структура исходников
+`build.rs` increments `build-number.txt` on each Cargo build, including test and check builds. The compiled version, such as `0.1.0+44`, appears in `--version` and the menu footer; its numeric build suffix is stored in the bundle's `CFBundleVersion`. Packaging the same binary preserves its compiled build number.
 
 ```text
 src/
-├── main.rs                 # Точка входа и выбор команды
-├── app/                    # CLI, общая логика, сборка bundle, процессы
-├── agents/
-│   ├── mod.rs              # Реестр провайдеров
-│   ├── sessions.rs         # Общая модель сеанса и SessionProvider
-│   └── codex/              # Провайдер Codex, подтверждения и связь с VS Code
-└── macos/                  # Меню, уведомления, настройки, горячие клавиши
+├── app/         CLI, shared utilities, app bundling, and hook installation
+├── agents/      Common session/interaction models and agent providers
+│   ├── codex/   Local session discovery, live requests, questions, and usage
+│   ├── claude/  Claude Code lifecycle and permission hooks
+│   └── cline/   Cline hooks and current-task state
+└── macos/       Menu, notifications, settings, shortcuts, and answer forms
 ```
 
-Строки сеансов показывают только заголовок и статус. В подвале раскрытой секции
-отображаются каталог проекта и текущая Git-ветка — каждый в одну строку с иконкой. Для VS Code
-используется определённая папка workspace; для multi-root workspace — исходный
-рабочий каталог сеанса. Ветка читается заново при обновлении списка, включая Git
-worktree; при detached HEAD показывается короткий хеш, вне Git-репозитория строка
-ветки скрыта.
-
-## Claude Code и Cline
-
-После сборки bundle установите интеграции:
+To create a distributable disk image for the build machine's architecture:
 
 ```sh
-"build/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor" install-agent claude
-"build/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor" install-agent cline
+cargo run --release --locked -- dmg
 ```
 
-Для Claude Code установщик добавляет lifecycle hooks и `PermissionRequest` в
-`$CLAUDE_CONFIG_DIR/settings.json` или `~/.claude/settings.json`. Другие hooks и
-правила permissions сохраняются, перед изменением создаётся приватная резервная
-копия. Перезапустите Claude Code: уже открытые до установки сеансы появятся после
-нового события hook. Поддерживаются запуск в терминале и расширение VS Code.
-Allow выдаёт разрешение только текущему одноразовому запросу; ошибки и таймаут
-возвращают управление стандартному диалогу Claude Code без автоматического Allow.
+This packages the signed app and an Applications shortcut into `build/release/AI-Agent-Monitor-apple-silicon.dmg` (or `AI-Agent-Monitor-intel.dmg` for an Intel build), alongside `SHA256SUMS`. DMG packaging does not grant a Developer ID signature or notarization.
 
-Для Cline создаются исполняемые hooks в `~/Documents/Cline/Hooks`. В Cline нужно
-включить **Enable Hooks**, затем открыть или возобновить задачу. Чужие hook-файлы
-установщик не перезаписывает. Флаг `--home PATH` позволяет выбрать другой каталог
-настройки Claude или каталог hooks Cline. После обновления пути к приложению
-повторите установку hooks.
-
-Cline отслеживается по lifecycle hooks и `ui_messages.json` текущей задачи в
-стандартном хранилище VS Code или `~/.cline/data/tasks`. Показываются рабочая
-папка, Git-ветка, ответ, состояние и запрос подтверждения; уведомление открывает
-проект в VS Code. Оно удаляется после завершения запроса в Cline. **Allow для Cline
-не показывается:** его публичный `pressPrimaryButton()` не принимает ID задачи
-или запроса, поэтому устаревшая внешняя кнопка могла бы подтвердить другое действие.
-Это не меняет встроенные permissions и auto-approve Cline.
-
-Снимки Claude и Cline хранятся с правами только для текущего пользователя в
-`~/Library/Application Support/AI Agent Monitor/agents`. Они привязаны к PID и
-времени запуска родительского процесса агента/extension host: закрытые процессы
-и повторно использованные PID исключаются. Для Cline выбирается только последняя
-задача этого host, без сканирования всей истории. Закрытие задачи отслеживается
-через `SessionShutdown` в версиях Cline с этим событием; после закрытия VS Code
-все его задачи исключаются по завершению процесса.
-
-Контракты: [Claude Code hooks](https://code.claude.com/docs/en/hooks),
-[Cline hooks](https://github.com/cline/cline/blob/main/.clinerules/hooks/README.md),
-[публичный API Cline](https://github.com/cline/cline/blob/main/apps/vscode/src/exports/cline.d.ts).
-
-### Живые подтверждения Codex без hook
-
-Монитор подписывается через локальный IPC на состояние владельца уже открытого
-сеанса. `threadRuntimeStatus.activeFlags` и `requests` имеют приоритет над
-вычисленным по rollout статусом: `waitingOnApproval` и `waitingOnUserInput`
-больше не отображаются как работа. Это покрывает запросы настольного клиента и
-ожидание после истечения hook. К файлам hooks доступ сохраняется для обычного
-сценария CLI.
-
-Наблюдатель не возобновляет разговоры и не запускает модели. Он хранит только
-статус и текущие запросы, проверяет версию потока и последовательность ревизий;
-при рассинхронизации запрашивается новый снимок. При недоступности IPC остаётся
-прежнее чтение журналов и hooks. Протокол координации клиентов внутренний;
-несовместимые версии игнорируются.
-
-Для живого запроса в раскрытой секции показываются доступные действия: Allow,
-разрешение на сеанс, отказ, отмена хода и предложенные изменения правил команд
-или сети. При наличии `availableDecisions` используются только перечисленные
-Codex варианты. Запросы дополнительных permissions показывают полный набор
-запрошенных разрешений и отдельные действия для текущего хода/сеанса и отказа.
-
-У `item/tool/requestUserInput` варианты одного вопроса выводятся кнопками.
-Собственный ответ (когда разрешён) и несколько вопросов открываются в отдельной
-форме с выбором вариантов, полями текста и кнопкой Send answer. Ничего не выбирается
-и не отправляется автоматически. Секретные поля используют системный secure input.
-Backspace и текст в форме редактируют ответ, не фильтр сеансов.
-
-Общая модель `Interaction`/`Response` находится в `agents/interaction.rs`; поставщик
-агента формирует действия и вопросы, а UI не знает деталей протокола Codex.
-Перед **любым** ответом проверяются новый снимок от того же владельца и полное
-совпадение исходного запроса, включая ID треда, хода и параметры. Ответ направляется
-только исходному ID запроса, работа выполняется вне UI-потока. После ответа или
-исчезновения запроса уведомление снимается. Ошибка оставляет возможность повторить
-ответ или открыть редактор.
-
-Системные уведомления получают собственный набор действий для текущего запроса.
-У одного вопроса доступны кнопки вариантов и системный текстовый ответ, если он
-разрешён. Для трёх вариантов и своего ответа используются четыре действия; более
-длинные списки открывают полную форму через More answers. Несколько вопросов и
-секретный ввод открывают форму с соответствующими полями. Число непосредственно
-видимых кнопок и меню действий определяет macOS.
-
-Категории регистрируются до доставки уведомления, с общей блокировкой между
-резидентом и hook-процессами: один отправитель не затирает действия другого.
-Каждый ответ привязан к исходному запросу и повторно проверяется поставщиком.
-Неактуальное уведомление не может подтвердить следующий запрос. После ошибки
-текстового ответа открывается форма с сохранённым черновиком. Категории завершённых
-запросов удаляются. `notification-settings` также выводит зарегистрированные
-категории и действия для диагностики. File-backed hooks по-прежнему поддерживают одноразовый Allow.
-Неизвестные типы и `requestOptionPicker`, для которого установленный клиент не
-предоставляет адресованный ответ через IPC, показываются с переходом в редактор.
-Варианты option picker перечисляются в тексте запроса.
-
-### Асинхронные вопросы
-
-`request_user_input_async` хранит вопросы в `agentMessage.questions`, а не в
-`conversationState.requests`. Ход может завершиться и иметь статус `idle`, хотя
-вопрос ещё ожидает ответа. Монитор читает компактную проекцию истории, учитывает
-ответы `<send_user_message_question_reply>` и новый пользовательский ввод,
-отслеживает вопросы отдельно от статуса выполнения. Полные ответы агента и вывод инструментов
-в этой проекции не сохраняются.
-
-После явного выбора пользователя вопрос повторно проверяется у того же владельца.
-Ответ отправляется в нативном формате с исходным `questionItemId`: как пользовательское
-сообщение нового хода или steering текущего, с унаследованными настройками сеанса.
-Наблюдение само по себе не начинает ход и не запускает модель.
+See [Integration notes](docs/integrations.md) for discovery, response validation, local storage, and provider extension details.

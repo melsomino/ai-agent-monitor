@@ -412,6 +412,11 @@ pub fn run(command: NativeCommand) -> Result<()> {
         unsafe { msg_send![MonitorApplication::class(), sharedApplication] };
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     if matches!(command, NativeCommand::Listen | NativeCommand::Sessions)
+        && !crate::macos::onboarding::installed_location(mtm)
+    {
+        return Ok(());
+    }
+    if matches!(command, NativeCommand::Listen | NativeCommand::Sessions)
         && !crate::macos::menu::start(mtm, matches!(command, NativeCommand::Sessions))?
     {
         return Ok(());
@@ -508,7 +513,9 @@ pub fn run(command: NativeCommand) -> Result<()> {
             }
             return Ok(());
         }
-        NativeCommand::Listen | NativeCommand::Sessions => {}
+        NativeCommand::Listen | NativeCommand::Sessions => {
+            crate::macos::onboarding::begin(mtm, false)
+        }
     }
     app.run();
     // Keep the weak delegate alive for the entire run loop.

@@ -6,6 +6,7 @@ pub(crate) mod motion;
 pub(crate) mod native;
 pub(crate) mod notification_actions;
 pub(crate) mod notification_categories;
+pub(crate) mod onboarding;
 pub(crate) mod pointer;
 pub(crate) mod search;
 pub(crate) mod settings;

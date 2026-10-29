@@ -327,3 +327,25 @@ fn install_migrates_the_old_app_path_without_replacing_unrelated_codex_hooks() {
     assert!(!core::install(home.path(), executable, Path::new("/project/notify.py")).unwrap());
     assert_eq!(fs::read(path).unwrap(), data);
 }
+
+#[test]
+fn moved_app_hooks_are_replaced_without_touching_other_commands() {
+    let home = tempfile::tempdir().unwrap();
+    let old = "'/old/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor' hook";
+    let other = "'/other/AIAgentMonitor' hook";
+    fs::write(home.path().join("hooks.json"), serde_json::to_vec(&json!({"hooks":{"PermissionRequest":[{"hooks":[{"type":"command","command":old},{"type":"command","command":other}]}]}})).unwrap()).unwrap();
+    let executable = Path::new("/Applications/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor");
+    assert!(core::install(home.path(), executable, Path::new("/legacy/notify.py")).unwrap());
+    assert!(!core::install(home.path(), executable, Path::new("/legacy/notify.py")).unwrap());
+    let contents = fs::read_to_string(home.path().join("hooks.json")).unwrap();
+    assert!(!contents.contains("/old/"));
+    assert!(contents.contains(other));
+    assert!(core::monitor_hook(
+        "'/Applications/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor' agent-hook claude",
+        &["agent-hook", "claude"]
+    ));
+    assert!(!core::monitor_hook(
+        "'/Applications/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor' hook --extra",
+        &["hook"]
+    ));
+}
