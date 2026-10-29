@@ -35,6 +35,7 @@ const SESSION_HOVER_LEFT: f64 = -6.0;
 const SESSION_HOVER_WIDTH: f64 = 374.0;
 const MESSAGE_TOP_GAP: f64 = 4.0;
 const BUTTON_HOVER_PADDING: f64 = 3.0;
+const QUESTION_CARD_WIDTH: f64 = 348.0;
 
 static RESIDENT: AtomicBool = AtomicBool::new(false);
 thread_local! { static CONTROLLER: RefCell<Option<Retained<MenuController>>> = const { RefCell::new(None) }; }
@@ -2744,8 +2745,19 @@ impl MenuController {
             let is_question = session.approval.is_some();
             let question_padding = if is_question { 10.0 } else { 0.0 };
             let metadata_gap = if is_question { 8.0 } else { 0.0 };
-            let content_width = 338.0 - 2.0 * question_padding;
+            let content_width = (if is_question {
+                QUESTION_CARD_WIDTH
+            } else {
+                338.0
+            }) - 2.0 * question_padding;
             let content_x = 6.0 + question_padding;
+            // Include the expanded button's visible bounds in the card padding.
+            let control_inset = if is_question {
+                BUTTON_HOVER_PADDING
+            } else {
+                0.0
+            };
+            let control_width = content_width - 2.0 * control_inset;
             let control_sizes: Vec<_> = controls
                 .iter()
                 .map(|control| {
@@ -2756,7 +2768,7 @@ impl MenuController {
                     natural.setFont(Some(&NSFont::systemFontOfSize(12.0)));
                     natural.sizeToFit();
                     let width =
-                        (natural.frame().size.width.ceil() + 24.0).clamp(52.0, content_width);
+                        (natural.frame().size.width.ceil() + 24.0).clamp(52.0, control_width);
                     let measure = NSTextField::wrappingLabelWithString(
                         &NSString::from_str(&control.label),
                         self.mtm(),
@@ -2776,7 +2788,7 @@ impl MenuController {
                 })
                 .collect();
             let (control_frames, controls_height) =
-                answer_button_layout(&control_sizes, content_width);
+                answer_button_layout(&control_sizes, control_width);
             let is_expanded = expanded.contains(&session.key());
             let detail = if is_expanded
                 || reveal
@@ -2958,7 +2970,7 @@ impl MenuController {
                     let frame = rect(
                         6.0,
                         MESSAGE_TOP_GAP,
-                        338.0,
+                        QUESTION_CARD_WIDTH,
                         footer_y - MESSAGE_TOP_GAP - metadata_gap,
                     );
                     // SAFETY: Decorative view ignores hit testing, preserving text selection,
@@ -2973,11 +2985,11 @@ impl MenuController {
                     card.setBoxType(NSBoxType::Custom);
                     card.setTitlePosition(NSTitlePosition::NoTitle);
                     card.setContentViewMargins(NSSize::new(0.0, 0.0));
-                    card.setCornerRadius(12.0);
+                    card.setCornerRadius(17.0);
                     card.setBorderWidth(1.0);
                     let tint = detail_text_color(true);
                     card.setBorderColor(&tint.colorWithAlphaComponent(0.24));
-                    card.setFillColor(&tint.colorWithAlphaComponent(0.08));
+                    card.setFillColor(&footer_fill_color());
                     decoration.addSubview(&card);
                     document.addSubview(&decoration);
                 }
@@ -2994,8 +3006,8 @@ impl MenuController {
                             sel!(respondToRequest:),
                             &id,
                             rect(
-                                content_x + control_frames[index].origin.x,
-                                message_end + 8.0 + control_frames[index].origin.y,
+                                content_x + control_inset + control_frames[index].origin.x,
+                                message_end + 8.0 + control_inset + control_frames[index].origin.y,
                                 control_frames[index].size.width,
                                 control_frames[index].size.height,
                             ),
