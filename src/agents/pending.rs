@@ -11,6 +11,7 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
+    pub agent: String,
     pub session_id: String,
     pub body: String,
     pub response: PathBuf,
@@ -27,7 +28,7 @@ pub fn publish(directory: &Path, event: &Value, body: &str, lifetime: u64) -> io
     let Some(id) = event["session_id"].as_str().filter(|id| !id.is_empty()) else {
         return Ok(());
     };
-    let data = json!({"session_id":id,"body":body,"expires":now()+lifetime});
+    let data = json!({"agent":event["_agent"].as_str().unwrap_or("codex"),"session_id":id,"body":body,"expires":now()+lifetime});
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -35,6 +36,13 @@ pub fn publish(directory: &Path, event: &Value, body: &str, lifetime: u64) -> io
         .custom_flags(libc::O_NOFOLLOW)
         .open(directory.join("request.json"))?
         .write_all(data.to_string().as_bytes())
+}
+
+pub fn list_for(agent: &str) -> Vec<Request> {
+    list()
+        .into_iter()
+        .filter(|request| request.agent == agent)
+        .collect()
 }
 
 pub fn list() -> Vec<Request> {
@@ -50,11 +58,8 @@ fn read_directory(root: &Path) -> Vec<Request> {
         .collect()
 }
 fn read_request(directory: &Path) -> Option<Request> {
-    if !directory
-        .file_name()?
-        .to_str()?
-        .starts_with("codex-approval-")
-    {
+    let name = directory.file_name()?.to_str()?;
+    if !name.starts_with("codex-approval-") && !name.starts_with("agent-monitor-approval-") {
         return None;
     }
     let meta = fs::symlink_metadata(directory).ok()?;
@@ -85,7 +90,12 @@ fn read_request(directory: &Path) -> Option<Request> {
     if expires <= now() {
         return None;
     }
+    let agent = data["agent"].as_str().unwrap_or("codex");
+    if !matches!(agent, "codex" | "claude" | "cline") {
+        return None;
+    }
     Some(Request {
+        agent: agent.into(),
         session_id: data["session_id"].as_str()?.to_owned(),
         body: data["body"].as_str()?.to_owned(),
         response,
@@ -110,6 +120,7 @@ pub fn notification_id(response: &Path) -> Option<String> {
     }
     let name = directory.file_name()?.to_str()?;
     name.strip_prefix("codex-approval-")
+        .or_else(|| name.strip_prefix("agent-monitor-approval-"))
         .filter(|suffix| !suffix.is_empty())?;
     Some(format!("approval-{name}"))
 }
@@ -194,5 +205,31 @@ mod tests {
         fs::write(&target, "{}").unwrap();
         std::os::unix::fs::symlink(target, directory.path().join("request.json")).unwrap();
         assert!(read_request(directory.path()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+    #[test]
+    fn isolates_equal_session_ids_between_agents_and_accepts_legacy_codex_requests() {
+        let codex = core::approval_directory().unwrap();
+        let claude = core::approval_directory().unwrap();
+        publish(codex.path(), &json!({"session_id":"same"}), "Codex", 60).unwrap();
+        publish(
+            claude.path(),
+            &json!({"session_id":"same","_agent":"claude"}),
+            "Claude",
+            60,
+        )
+        .unwrap();
+        let claude_path = claude.path().join("response");
+        assert!(list_for("claude").iter().any(|r| r.response == claude_path));
+        assert!(!list_for("codex").iter().any(|r| r.response == claude_path));
+        let path = codex.path().join("request.json");
+        let mut data: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        data.as_object_mut().unwrap().remove("agent");
+        fs::write(&path, data.to_string()).unwrap();
+        assert_eq!(read_request(codex.path()).unwrap().agent, "codex");
     }
 }

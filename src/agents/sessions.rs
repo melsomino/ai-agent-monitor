@@ -9,6 +9,7 @@ pub struct Approval {
     pub id: String,
     pub body: String,
     pub expires: u64,
+    pub can_allow: bool,
 }
 
 /// Backend boundary: discovery is read-only; approval is an explicit action.
@@ -62,7 +63,10 @@ impl Registry<'_> {
     }
 
     fn allow(&self, session: &Session) -> bool {
-        session.approval.is_some()
+        session
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.can_allow)
             && self
                 .provider(session.agent)
                 .is_some_and(|provider| provider.allow(session))
@@ -137,6 +141,15 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn agent_label(&self) -> &str {
+        match self.agent {
+            "codex" => "Codex",
+            "claude" => "Claude Code",
+            "cline" => "Cline",
+            other => other,
+        }
+    }
+
     pub fn project_path(&self) -> &Path {
         self.workspace.as_deref().unwrap_or(&self.cwd)
     }
@@ -213,6 +226,7 @@ mod tests {
                     id: "same-request".into(),
                     body: "Approve?".into(),
                     expires: u64::MAX,
+                    can_allow: true,
                 }),
             }])
         }
@@ -259,6 +273,9 @@ mod tests {
         assert!(registry.open_target(&session).is_none());
         assert!(!registry.allow(&session));
         session.agent = "first";
+        session.approval.as_mut().unwrap().can_allow = false;
+        assert!(!registry.allow(&session));
+        assert!(first.allowed.lock().unwrap().is_empty());
         session.approval = None;
         assert!(!registry.allow(&session));
         assert!(first.allowed.lock().unwrap().is_empty());

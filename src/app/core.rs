@@ -260,9 +260,10 @@ pub fn respond(path: &Path, action: Action) -> bool {
         return false;
     };
     if path.file_name().is_none_or(|s| s != "response")
-        || parent
-            .file_name()
-            .is_none_or(|s| !s.to_string_lossy().starts_with("codex-approval-"))
+        || parent.file_name().is_none_or(|s| {
+            !s.to_string_lossy().starts_with("codex-approval-")
+                && !s.to_string_lossy().starts_with("agent-monitor-approval-")
+        })
         || parent
             .parent()
             .is_none_or(|p| p != Path::new("/tmp") && p != Path::new("/private/tmp"))
@@ -300,7 +301,7 @@ pub fn wait_response(path: &Path, duration: Duration) -> Option<Action> {
 
 pub fn approval_directory() -> io::Result<tempfile::TempDir> {
     tempfile::Builder::new()
-        .prefix("codex-approval-")
+        .prefix("agent-monitor-approval-")
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in("/tmp")
 }
@@ -329,6 +330,16 @@ pub fn deliver(event: &Value, approval: bool) -> Result<Option<Action>> {
     let Some(content) = notification(event) else {
         return Ok(None);
     };
+    let mut event = event.clone();
+    event["_agent"] = "codex".into();
+    deliver_content(&content, &event, approval)
+}
+
+pub fn deliver_content(
+    content: &Notification,
+    event: &Value,
+    approval: bool,
+) -> Result<Option<Action>> {
     let executable = bundle_executable();
     let send = |response: Option<&Path>| -> Result<bool> {
         let mut command = Command::new(&executable);
@@ -347,12 +358,7 @@ pub fn deliver(event: &Value, approval: bool) -> Result<Option<Action>> {
     if approval {
         let directory = approval_directory()?;
         let response = directory.path().join("response");
-        crate::agents::codex::pending::publish(
-            directory.path(),
-            event,
-            &content.body,
-            WAIT.as_secs(),
-        )?;
+        crate::agents::pending::publish(directory.path(), event, &content.body, WAIT.as_secs())?;
         if matches!(send(Some(&response)), Ok(true)) {
             return Ok(wait_response(&response, WAIT));
         }

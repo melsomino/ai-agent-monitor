@@ -99,6 +99,7 @@ struct State {
     working_epoch: OnceCell<Instant>,
     layout: RefCell<Vec<LayoutRow>>,
     caption: OnceCell<Retained<NSTextField>>,
+    session_notifications: RefCell<HashSet<String>>,
     all: RefCell<Vec<Session>>,
     visible: RefCell<Vec<Session>>,
     lock: OnceCell<File>,
@@ -237,10 +238,23 @@ define_class!(
             let Some(id) = sender.and_then(|button| button.identifier()).map(|id| id.to_string()) else { return; };
             let session = self.ivars().all.borrow().iter().find(|session| session.approval_key().is_some_and(|key| key == id)).cloned();
             if let Some(session) = session {
-                let allowed = session.allow();
-                if let Some(button) = sender { button.setEnabled(false); button.setTitle(if allowed { ns_string!("Allowed") } else { ns_string!("Request completed") }); }
-                self.update_badge(sessions::pending_count());
-                self.refresh();
+                if let Some(button) = sender { button.setEnabled(false); button.setTitle(ns_string!("Allowing…")); }
+                std::thread::spawn(move || {
+                    let allowed = session.allow();
+                    dispatch2::DispatchQueue::main().exec_async(move || {
+                        CONTROLLER.with(|slot| {
+                            if let Some(controller) = slot.borrow().as_ref() {
+                                for item in controller.ivars().buttons.borrow().iter() {
+                                    if item.button.identifier().is_some_and(|key| key.to_string() == id) {
+                                        item.button.setTitle(if allowed { ns_string!("Allowed") } else { ns_string!("Allow") });
+                                        item.button.setEnabled(!allowed);
+                                    }
+                                }
+                                controller.refresh();
+                            }
+                        });
+                    });
+                });
             }
         }
 
@@ -1974,7 +1988,11 @@ impl MenuController {
                         + metadata_height
                         + MESSAGE_TOP_GAP
                         + 16.0
-                        + if session.approval.is_some() {
+                        + if session
+                            .approval
+                            .as_ref()
+                            .is_some_and(|request| request.can_allow)
+                        {
                             36.0
                         } else {
                             0.0
@@ -2022,8 +2040,9 @@ impl MenuController {
                 true,
             );
             open.setToolTip(Some(&NSString::from_str(&format!(
-                "{} · {}\n{}\n{}",
+                "{} · {} · {}\n{}\n{}",
                 session.title,
+                session.agent_label(),
                 session.client.label(),
                 session.project_path().display(),
                 if session.project_path().exists() {
@@ -2090,7 +2109,11 @@ impl MenuController {
                 let message_end = MESSAGE_TOP_GAP + text_height;
                 let footer_y = message_end
                     + 8.0
-                    + if session.approval.is_some() {
+                    + if session
+                        .approval
+                        .as_ref()
+                        .is_some_and(|request| request.can_allow)
+                    {
                         36.0
                     } else {
                         0.0
@@ -2099,7 +2122,12 @@ impl MenuController {
                 document.addSubview(&metadata);
                 label.setFrameOrigin(NSPoint::new(26.0, MESSAGE_TOP_GAP));
                 document.addSubview(&label);
-                if let Some(key) = session.approval_key() {
+                if let Some(key) = session.approval_key().filter(|_| {
+                    session
+                        .approval
+                        .as_ref()
+                        .is_some_and(|request| request.can_allow)
+                }) {
                     let allow = self.action_button(
                         &document,
                         "Allow",
@@ -2216,6 +2244,29 @@ impl MenuController {
         state.refreshing.set(false);
         match result {
             Ok(sessions) => {
+                let requests: HashSet<_> = sessions
+                    .iter()
+                    .filter(|session| {
+                        session.approval.as_ref().is_some_and(|request| {
+                            !request.can_allow || request.id.starts_with("ipc:")
+                        })
+                    })
+                    .filter_map(Session::approval_key)
+                    .collect();
+                let mut previous = state.session_notifications.borrow_mut();
+                for old in previous.difference(&requests) {
+                    native::remove_session_notification(old);
+                }
+                for session in &sessions {
+                    if let Some(key) = session.approval_key()
+                        && requests.contains(&key)
+                        && !previous.contains(&key)
+                    {
+                        native::notify_session(session);
+                    }
+                }
+                *previous = requests;
+                drop(previous);
                 *state.all.borrow_mut() = sessions;
                 self.filter();
             }
@@ -2360,6 +2411,7 @@ mod close_tests {
                 id: path.into(),
                 body: "Подтверждение".into(),
                 expires: u64::MAX,
+                can_allow: true,
             }),
         }
     }

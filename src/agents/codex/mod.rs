@@ -1,5 +1,5 @@
 //! Codex backend and its hook/VS Code integrations.
-pub(crate) mod pending;
+pub(crate) mod runtime;
 pub(crate) mod vscode;
 
 use crate::{
@@ -27,8 +27,9 @@ const DESKTOP: Client = Client::Desktop {
     app_path: "/Applications/ChatGPT.app",
 };
 
-fn approval(request: &crate::agents::codex::pending::Request) -> Approval {
+fn approval(request: &crate::agents::pending::Request) -> Approval {
     Approval {
+        can_allow: true,
         id: request.response.to_string_lossy().into_owned(),
         body: request.body.clone(),
         expires: request.expires,
@@ -45,7 +46,9 @@ impl SessionProvider for Codex {
     }
 
     fn pending_count(&self) -> usize {
-        crate::agents::codex::pending::list().len()
+        let requests = crate::agents::pending::list_for("codex");
+        let sessions = requests.iter().map(|r| r.session_id.clone()).collect();
+        requests.len() + runtime::pending_count(&sessions)
     }
 
     fn open_target(&self, session: &Session) -> String {
@@ -62,15 +65,23 @@ impl SessionProvider for Codex {
         let Some(snapshot) = session.approval.as_ref() else {
             return false;
         };
+        if snapshot.id.starts_with("ipc:") {
+            let allowed = runtime::allow_for(session);
+            #[cfg(target_os = "macos")]
+            if allowed && let Some(key) = session.approval_key() {
+                crate::macos::native::remove_session_notification(&key);
+            }
+            return allowed;
+        }
         // Resolve the opaque token and compare the complete current snapshot.
         // pending::allow revalidates once more at the write boundary.
-        let Some(request) = crate::agents::codex::pending::list()
+        let Some(request) = crate::agents::pending::list_for("codex")
             .into_iter()
             .find(|request| request.session_id == session.id && approval(request) == *snapshot)
         else {
             return false;
         };
-        if !crate::agents::codex::pending::allow(&request) {
+        if !crate::agents::pending::allow(&request) {
             return false;
         }
         #[cfg(target_os = "macos")]
@@ -93,16 +104,24 @@ fn open(home: &Path) -> Result<Vec<Session>> {
     let files = open_files(&output, home);
     let ids = files.keys().cloned().collect();
     let mut sessions = read_open(home, &ids)?;
-    let pending = crate::agents::codex::pending::list();
+    let pending = crate::agents::pending::list_for("codex");
+    let mut runtime = runtime::views(&ids);
     for session in &mut sessions {
         if let Some(path) = files.get(&session.id) {
             enrich(session, path);
         }
-        session.approval = pending
+        if let Some(live) = runtime.remove(&session.id) {
+            session.activity = live.activity;
+            session.approval = live.approval;
+        }
+        let hook_approval = pending
             .iter()
             .filter(|request| request.session_id == session.id)
             .max_by_key(|request| request.expires)
             .map(approval);
+        if hook_approval.is_some() {
+            session.approval = hook_approval;
+        }
         if session.approval.is_some() {
             session.activity = Activity::Confirmation;
         }
@@ -536,7 +555,7 @@ mod tests {
     #[test]
     fn approval_cannot_be_reassigned_to_another_session_or_changed_in_the_ui() {
         let directory = crate::app::core::approval_directory().unwrap();
-        crate::agents::codex::pending::publish(
+        crate::agents::pending::publish(
             directory.path(),
             &serde_json::json!({"session_id":"original"}),
             "Approve?",
@@ -544,7 +563,7 @@ mod tests {
         )
         .unwrap();
         let response = directory.path().join("response");
-        let request = crate::agents::codex::pending::list()
+        let request = crate::agents::pending::list_for("codex")
             .into_iter()
             .find(|request| request.response == response)
             .unwrap();
@@ -566,7 +585,7 @@ mod tests {
         session.approval.as_mut().unwrap().body = "Changed".into();
         assert!(!Codex.allow(&session));
         assert!(!response.exists());
-        assert!(crate::agents::codex::pending::allow(&request));
+        assert!(crate::agents::pending::allow(&request));
     }
 
     #[test]

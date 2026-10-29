@@ -86,6 +86,24 @@ define_class!(
                     action == UNNotificationDismissActionIdentifier.to_string(),
                 )
             };
+            if action == "ALLOW_ONCE" && response_path.starts_with("ipc:") {
+                let identifier = response.notification().request().identifier().to_string();
+                completion.call(());
+                std::thread::spawn(move || {
+                    let allowed = crate::agents::codex::runtime::allow(&response_path);
+                    DispatchQueue::main().exec_async(move || {
+                        if allowed {
+                            remove_notification(&identifier);
+                        } else {
+                            open_target(&target);
+                        }
+                        if !crate::macos::menu::is_resident() {
+                            std::process::exit(0);
+                        }
+                    });
+                });
+                return;
+            }
             let should_open = if action == "ALLOW_ONCE" {
                 !core::respond(path, Action::Allow)
             } else if is_default {
@@ -134,7 +152,7 @@ fn remove_notification(identifier: &str) {
 }
 
 pub fn dismiss_approval(response: &Path) {
-    let Some(identifier) = crate::agents::codex::pending::notification_id(response) else {
+    let Some(identifier) = crate::agents::pending::notification_id(response) else {
         return;
     };
     remove_notification(&identifier);
@@ -146,7 +164,7 @@ pub fn dismiss_approval(response: &Path) {
         for index in 0..notifications.count() {
             let request = notifications.objectAtIndex(index).request();
             let stored = info_string(&request.content().userInfo(), ns_string!("response"));
-            if crate::agents::codex::pending::notification_id(Path::new(&stored)).as_deref()
+            if crate::agents::pending::notification_id(Path::new(&stored)).as_deref()
                 == Some(identifier.as_str())
             {
                 remove_notification(&request.identifier().to_string());
@@ -157,9 +175,63 @@ pub fn dismiss_approval(response: &Path) {
         .getDeliveredNotificationsWithCompletionHandler(&callback);
 }
 
+/// Live requests without a file-backed hook: only addressed Codex requests get Allow.
+pub fn notify_session(session: &crate::agents::sessions::Session) {
+    let Some(approval) = session
+        .approval
+        .as_ref()
+        .filter(|request| !request.can_allow || request.id.starts_with("ipc:"))
+    else {
+        return;
+    };
+    let Some(key) = session.approval_key() else {
+        return;
+    };
+    let content = UNMutableNotificationContent::new();
+    content.setTitle(&NSString::from_str(&session.title));
+    content.setSubtitle(&NSString::from_str(session.agent_label()));
+    content.setBody(&NSString::from_str(&approval.body));
+    content.setSound(Some(&UNNotificationSound::defaultSound()));
+    let target = NSString::from_str(&session.open_target().unwrap_or_default());
+    let response_token =
+        NSString::from_str(if approval.id.starts_with("ipc:") && approval.can_allow {
+            &approval.id
+        } else {
+            ""
+        });
+    let info = NSDictionary::<NSString, NSString>::from_slices(
+        &[ns_string!("target"), ns_string!("response")],
+        &[&target, &response_token],
+    );
+    if approval.id.starts_with("ipc:") && approval.can_allow {
+        content.setCategoryIdentifier(ns_string!("CODEX_APPROVAL"));
+    }
+    // SAFETY: The property-list dictionary contains only retained NSString values.
+    unsafe {
+        let _: () = msg_send![&*content, setUserInfo: &*info];
+    }
+    let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+        &NSString::from_str(&format!("session-{key}")),
+        &content,
+        None,
+    );
+    let callback = RcBlock::new(|error: *mut NSError| {
+        // SAFETY: The framework supplies a live NSError or null.
+        if let Some(error) = unsafe { error.as_ref() } {
+            eprintln!("ai-agent-monitor: {}", error.localizedDescription());
+        }
+    });
+    UNUserNotificationCenter::currentNotificationCenter()
+        .addNotificationRequest_withCompletionHandler(&request, Some(&callback));
+}
+
+pub fn remove_session_notification(key: &str) {
+    remove_notification(&format!("session-{key}"));
+}
+
 fn send(message: &Message, response: Option<&str>) {
     // The panel may answer while notification authorization/delivery is in flight.
-    if response.is_some_and(|path| crate::agents::codex::pending::is_resolved(Path::new(path))) {
+    if response.is_some_and(|path| crate::agents::pending::is_resolved(Path::new(path))) {
         std::process::exit(0);
     }
     let content = UNMutableNotificationContent::new();
@@ -183,7 +255,7 @@ fn send(message: &Message, response: Option<&str>) {
         content.setCategoryIdentifier(ns_string!("CODEX_APPROVAL"));
     }
     let identifier = response
-        .and_then(|path| crate::agents::codex::pending::notification_id(Path::new(path)))
+        .and_then(|path| crate::agents::pending::notification_id(Path::new(path)))
         .unwrap_or_else(|| {
             format!(
                 "{}-{}",
@@ -207,7 +279,7 @@ fn send(message: &Message, response: Option<&str>) {
         }
         if response_path
             .as_deref()
-            .is_some_and(crate::agents::codex::pending::is_resolved)
+            .is_some_and(crate::agents::pending::is_resolved)
         {
             remove_notification(&identifier);
         }

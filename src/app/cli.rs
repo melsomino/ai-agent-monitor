@@ -1,7 +1,7 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-/// Native macOS notifications for Codex approval requests.
+/// Native macOS session monitor and approval notifications for coding agents.
 #[derive(Debug, Parser)]
 #[command(name = "AIAgentMonitor", version)]
 pub struct Cli {
@@ -10,10 +10,41 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum AgentKind {
+    #[value(alias = "claude-code")]
+    Claude,
+    Cline,
+}
+impl AgentKind {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Cline => "cline",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Process a Codex PermissionRequest event from JSON on stdin.
     Hook,
+    /// Receive a lifecycle/permission hook from Claude Code or Cline.
+    AgentHook {
+        #[arg(value_enum)]
+        agent: AgentKind,
+        /// Cline event filename, provided by the generated wrapper.
+        #[arg(long)]
+        event: Option<String>,
+    },
+    /// Install the hooks for an additional agent, preserving existing settings.
+    InstallAgent {
+        #[arg(value_enum)]
+        agent: AgentKind,
+        /// Claude config directory or Cline Hooks directory.
+        #[arg(long)]
+        home: Option<PathBuf>,
+    },
     /// Open the sessions window and keep an icon in the macOS menu bar.
     Sessions {
         /// Print only currently open sessions as JSON without opening the window.

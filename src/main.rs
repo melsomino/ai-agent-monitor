@@ -10,9 +10,13 @@ use macos::native;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use cli::{Cli, Command, NativeCommand};
+use cli::{AgentKind, Cli, Command, NativeCommand};
 use serde_json::{Value, json};
-use std::{env, io, path::Path};
+use std::{
+    env,
+    io::{self, Read},
+    path::Path,
+};
 
 fn run(command: Option<Command>) -> Result<()> {
     match command {
@@ -22,6 +26,52 @@ fn run(command: Option<Command>) -> Result<()> {
             let action = core::deliver(&event, true)?;
             if let Some(result) = core::decision(action, false) {
                 println!("{result}");
+            }
+        }
+        Some(Command::AgentHook { agent, event }) => {
+            let input: Value = serde_json::from_reader(io::stdin().take(2 * 1024 * 1024))
+                .context("invalid agent hook event")?;
+            let owner = agents::tracking::owner(agent.id())?;
+            let root = agents::tracking::root();
+            match agent {
+                AgentKind::Claude => {
+                    if let Some(result) = agents::claude::hook(&input, &root, owner, true)? {
+                        println!("{result}");
+                    }
+                }
+                AgentKind::Cline => println!(
+                    "{}",
+                    agents::cline::hook(&input, event.as_deref(), &root, owner)?
+                ),
+            }
+        }
+        Some(Command::InstallAgent { agent, home }) => {
+            let executable = core::bundle_executable();
+            anyhow::ensure!(executable.is_file(), "Build the app bundle first");
+            let home = home.unwrap_or_else(|| match agent {
+                AgentKind::Claude => agents::claude::home(),
+                AgentKind::Cline => agents::cline::hooks_home(),
+            });
+            let changed = match agent {
+                AgentKind::Claude => agents::claude::install(&home, &executable)?,
+                AgentKind::Cline => agents::cline::install(&home, &executable)?,
+            };
+            println!(
+                "{} {} hooks: {}",
+                if changed {
+                    "Installed"
+                } else {
+                    "Already installed"
+                },
+                agent.id(),
+                home.display()
+            );
+            if matches!(agent, AgentKind::Cline) {
+                println!(
+                    "Enable Hooks in Cline settings, then reopen/resume the task. Approvals remain in Cline."
+                );
+            } else {
+                println!("Restart Claude Code to load lifecycle and permission hooks.");
             }
         }
         Some(Command::Test {
@@ -49,7 +99,7 @@ fn run(command: Option<Command>) -> Result<()> {
                     "sessions": sessions.iter().map(|session| serde_json::json!({
                         "agent":session.agent,"id":session.id,"title":session.title,"cwd":session.cwd,"workspace":session.workspace,"gitBranch":session.git_branch,"updatedAt":session.updated_at,
                         "client":session.client.label(),"status":session.activity.label(),"lastMessage":session.last_message,
-                        "approval":session.approval.as_ref().map(|request| serde_json::json!({"body":request.body,"expiresAt":request.expires}))
+                        "approval":session.approval.as_ref().map(|request| serde_json::json!({"body":request.body,"expiresAt":request.expires,"canAllow":request.can_allow}))
                     })).collect::<Vec<_>>()
                 }))?
             );
@@ -107,10 +157,20 @@ fn run_native(command: NativeCommand) -> Result<()> {
 
 fn main() {
     let cli = Cli::parse();
-    let is_hook = matches!(cli.command, Some(Command::Hook));
+    let is_cline_hook = matches!(
+        cli.command,
+        Some(Command::AgentHook {
+            agent: AgentKind::Cline,
+            ..
+        })
+    );
+    let is_hook = matches!(cli.command, Some(Command::Hook | Command::AgentHook { .. }));
     if let Err(error) = run(cli.command) {
         eprintln!("ai-agent-monitor: {error:#}");
-        // A failed hook must return control to Codex without granting permission.
+        if is_cline_hook {
+            println!("{{\"cancel\":false}}");
+        }
+        // Failed hooks return control to the agent without granting permission.
         if !is_hook {
             std::process::exit(1);
         }
