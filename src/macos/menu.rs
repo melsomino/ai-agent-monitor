@@ -31,7 +31,7 @@ const APPLICATION_HEADER_HEIGHT: f64 = 34.0;
 const SESSION_SPACING: f64 = 12.0;
 const LIST_BOTTOM_PADDING: f64 = 8.0;
 const SESSION_HOVER_PADDING: f64 = 4.0;
-const SESSION_HOVER_LEFT: f64 = -6.0;
+const SESSION_HOVER_LEFT: f64 = 6.0;
 const SESSION_HOVER_WIDTH: f64 = 374.0;
 const MESSAGE_TOP_GAP: f64 = 4.0;
 const BUTTON_HOVER_PADDING: f64 = 3.0;
@@ -141,6 +141,17 @@ pub fn refresh_after_response() {
         }
     });
 }
+#[derive(Clone, Default)]
+struct MessageHistory {
+    messages: Vec<crate::agents::history::Message>,
+    cursor: Option<String>,
+    anchor: String,
+    loading: bool,
+    exhausted: bool,
+    error: Option<String>,
+    ticket: u64,
+}
+
 #[derive(Clone)]
 enum ControlKind {
     Reply(Response),
@@ -283,6 +294,8 @@ struct State {
     buttons: RefCell<Vec<ButtonHover>>,
     request_controls: RefCell<HashMap<String, RequestControl>>,
     responding: RefCell<HashSet<String>>,
+    message_history: RefCell<HashMap<String, MessageHistory>>,
+    history_generation: Cell<u64>,
     toolbar_buttons: RefCell<Vec<ButtonHover>>,
     hovered: Cell<Option<pointer::Target>>,
     keyboard_focus: RefCell<Option<String>>,
@@ -313,6 +326,9 @@ impl State {
         self.reveal.borrow_mut().clear();
         self.opened_approvals.borrow_mut().clear();
         self.opened_working.borrow_mut().clear();
+        self.message_history.borrow_mut().clear();
+        self.history_generation
+            .set(self.history_generation.get().wrapping_add(1));
     }
 
     fn expand_active_sessions(&self, sessions: &[Session]) -> bool {
@@ -423,6 +439,45 @@ define_class!(
         fn expand_session(&self, sender: Option<&NSButton>) {
             let Some(id) = sender.and_then(|button| button.identifier()).map(|id| id.to_string()) else { return; };
             self.begin_disclosure(&id);
+        }
+
+        #[unsafe(method(previousMessage:))]
+        fn previous_message(&self, sender: &NSButton) {
+            let Some(key) = sender.identifier().map(|id| id.to_string()) else { return; };
+            let state = self.ivars();
+            let Some(session) = state.all.borrow().iter().find(|session| session.key() == key).cloned() else { return; };
+            let ticket = state.history_generation.get().wrapping_add(1);
+            state.history_generation.set(ticket);
+            let before = {
+                let mut histories = state.message_history.borrow_mut();
+                let history = histories.entry(key.clone()).or_default();
+                if history.loading || history.exhausted { return; }
+                if history.cursor.is_none() && session.approval.is_none() { history.anchor = session.last_message.clone(); }
+                history.loading = true;
+                history.error = None;
+                history.ticket = ticket;
+                history.cursor.clone()
+            };
+            self.render_rows(&state.filtered_sessions());
+            std::thread::spawn(move || {
+                let result = session.previous_message(before.as_deref());
+                dispatch2::DispatchQueue::main().exec_async(move || {
+                    CONTROLLER.with(|slot| {
+                        let Some(controller) = slot.borrow().as_ref().cloned() else { return; };
+                        {
+                            let mut histories = controller.ivars().message_history.borrow_mut();
+                            let Some(history) = histories.get_mut(&key).filter(|history| history.ticket == ticket) else { return; };
+                            history.loading = false;
+                            match result {
+                                Ok(Some(message)) => { history.cursor = Some(message.cursor.clone()); history.messages.insert(0, message); }
+                                Ok(None) => history.exhausted = true,
+                                Err(error) => { history.error = Some(format!("{error:#}")); history.cursor = None; history.messages.clear(); }
+                            }
+                        }
+                        controller.render_rows(&controller.ivars().filtered_sessions());
+                    });
+                });
+            });
         }
 
         #[unsafe(method(respondToRequest:))]
@@ -829,6 +884,12 @@ struct ButtonHover {
     button: Retained<NSButton>,
     background: Retained<NSBox>,
     base_alpha: f64,
+    gutter: Option<GutterHover>,
+}
+
+struct GutterHover {
+    message: NSRect,
+    icon: Retained<StatusContentView>,
 }
 
 struct LayoutRow {
@@ -846,7 +907,8 @@ struct LayoutRow {
 /// Use one row only when the entire set fits; otherwise keep natural widths
 /// in a left-aligned column. The final gap separates controls from metadata.
 fn answer_button_layout(sizes: &[NSSize], available: f64) -> (Vec<NSRect>, f64) {
-    let gap = 6.0;
+    let halo = 2.0 * BUTTON_HOVER_PADDING;
+    let gap = halo + 6.0;
     if sizes.is_empty() {
         return (vec![], 0.0);
     }
@@ -863,7 +925,7 @@ fn answer_button_layout(sizes: &[NSSize], available: f64) -> (Vec<NSRect>, f64) 
                 frame
             })
             .collect();
-        (frames, height + gap)
+        (frames, height + halo)
     } else {
         let mut y = 0.0;
         let frames = sizes
@@ -874,7 +936,7 @@ fn answer_button_layout(sizes: &[NSSize], available: f64) -> (Vec<NSRect>, f64) 
                 frame
             })
             .collect();
-        (frames, y)
+        (frames, y - gap + halo)
     }
 }
 
@@ -1881,7 +1943,7 @@ impl MenuController {
     }
 
     fn separator(&self, view: &NSView, y: f64, width: f64) {
-        let line = NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(6.0, y, width, 1.0));
+        let line = NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(18.0, y, width, 1.0));
         line.setBoxType(NSBoxType::Separator);
         view.addSubview(&line);
     }
@@ -2054,6 +2116,7 @@ impl MenuController {
                 button: button.clone(),
                 background,
                 base_alpha,
+                gutter: None,
             });
         }
         view.addSubview(&button);
@@ -2108,7 +2171,7 @@ impl MenuController {
             Some(&NSString::from_str(activity.label())),
         ) {
             image.setTemplate(true);
-            let frame = rect(311.0, y + 1.0, 14.0, 14.0);
+            let frame = rect(323.0, y + 1.0, 14.0, 14.0);
             if activity == Activity::Working {
                 let allocated = WorkingIconView::alloc(self.mtm()).set_ivars(WorkingIconState {
                     angle: Cell::new(0.0),
@@ -2393,6 +2456,11 @@ impl MenuController {
     }
 
     fn clear_hover(&self) {
+        for item in self.ivars().buttons.borrow().iter() {
+            if let Some(gutter) = &item.gutter {
+                gutter.icon.setHidden(true);
+            }
+        }
         self.apply_hover(None);
     }
 
@@ -2443,6 +2511,35 @@ impl MenuController {
                 }
             }
         };
+        for item in state.buttons.borrow().iter() {
+            if let Some(gutter) = &item.gutter {
+                // SAFETY: All views are retained and accessed on the main thread.
+                let message = unsafe { item.button.superview() }.map(|parent| {
+                    area(list.convertRect_fromView(gutter.message, Some(&parent))).intersected(
+                        area(list.convertRect_fromView(parent.visibleRect(), Some(&parent))),
+                    )
+                });
+                let visible = !item.button.isHiddenOrHasHiddenAncestor()
+                    && message.is_some_and(|message| {
+                        pointer::gutter_visible(
+                            (p.x, p.y),
+                            window,
+                            viewport,
+                            message,
+                            area(
+                                list.convertRect_fromView(item.button.bounds(), Some(&item.button)),
+                            )
+                            .intersected(area(
+                                list.convertRect_fromView(
+                                    item.button.visibleRect(),
+                                    Some(&item.button),
+                                ),
+                            )),
+                        )
+                    });
+                gutter.icon.setHidden(!visible);
+            }
+        }
         let toolbar: Vec<_> = state
             .toolbar_buttons
             .borrow()
@@ -2572,7 +2669,7 @@ impl MenuController {
             item.view
                 .setFrame(rect(frame.origin.x, y, frame.size.width, height));
             if let Some(detail) = &item.detail {
-                detail.setFrame(rect(0.0, 0.0, 372.0, detail_height));
+                detail.setFrame(rect(0.0, 0.0, 384.0, detail_height));
                 detail.setAlphaValue(progress);
                 detail.setHidden(progress <= 0.0);
                 detail.scrollToPoint(NSPoint::new(0.0, 0.0));
@@ -2750,7 +2847,7 @@ impl MenuController {
             } else {
                 338.0
             }) - 2.0 * question_padding;
-            let content_x = 6.0 + question_padding;
+            let content_x = 18.0 + question_padding;
             // Include the expanded button's visible bounds in the card padding.
             let control_inset = if is_question {
                 BUTTON_HOVER_PADDING
@@ -2790,6 +2887,55 @@ impl MenuController {
             let (control_frames, controls_height) =
                 answer_button_layout(&control_sizes, control_width);
             let is_expanded = expanded.contains(&session.key());
+            let history = self
+                .ivars()
+                .message_history
+                .borrow()
+                .get(&session.key())
+                .cloned()
+                .unwrap_or_default();
+            let mut earlier = history
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !history.anchor.is_empty()
+                && (is_question || history.anchor.trim_end() != session.last_message.trim_end())
+                && !history.messages.is_empty()
+            {
+                earlier.push_str("\n\n");
+                earlier.push_str(history.anchor.trim_end());
+            }
+            let mut earlier_label = None;
+            let mut earlier_height = 0.0;
+            if is_question
+                && !earlier.is_empty()
+                && (is_expanded
+                    || reveal
+                        .get(&session.key())
+                        .is_some_and(|progress| *progress > 0.0))
+            {
+                let label =
+                    NSTextField::wrappingLabelWithString(&NSString::from_str(&earlier), self.mtm());
+                label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                label.setTextColor(Some(&detail_text_color(false)));
+                label.setSelectable(true);
+                label.setMaximumNumberOfLines(0);
+                let height = label
+                    .cell()
+                    .map(|cell| {
+                        cell.cellSizeForBounds(rect(0.0, 0.0, 338.0, 1000000.0))
+                            .height
+                            .ceil()
+                    })
+                    .unwrap_or(22.0)
+                    .max(22.0);
+                label.setFrame(rect(18.0, MESSAGE_TOP_GAP, 338.0, height));
+                earlier_height = height + 8.0;
+                earlier_label = Some(label);
+            }
+            let mut first_message_height = 22.0;
             let detail = if is_expanded
                 || reveal
                     .get(&session.key())
@@ -2806,8 +2952,44 @@ impl MenuController {
                 } else {
                     text
                 };
-                let label =
-                    NSTextField::wrappingLabelWithString(&NSString::from_str(text), self.mtm());
+                let first_text = history
+                    .messages
+                    .first()
+                    .map(|message| message.text.as_str())
+                    .unwrap_or(text);
+                let first_label = NSTextField::wrappingLabelWithString(
+                    &NSString::from_str(first_text.trim_end()),
+                    self.mtm(),
+                );
+                first_label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                first_label.setMaximumNumberOfLines(0);
+                let first_width = if history.messages.is_empty() {
+                    content_width
+                } else {
+                    338.0
+                };
+                first_message_height = first_label
+                    .cell()
+                    .map(|cell| {
+                        cell.cellSizeForBounds(rect(0.0, 0.0, first_width, 1000000.0))
+                            .height
+                            .ceil()
+                    })
+                    .unwrap_or(22.0)
+                    .max(22.0);
+                let combined = if !is_question && !earlier.is_empty() {
+                    if session.last_message.trim().is_empty() {
+                        earlier.clone()
+                    } else {
+                        format!("{earlier}\n\n{text}")
+                    }
+                } else {
+                    text.to_owned()
+                };
+                let label = NSTextField::wrappingLabelWithString(
+                    &NSString::from_str(&combined),
+                    self.mtm(),
+                );
                 label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
                 label.setTextColor(Some(&detail_text_color(session.approval.is_some())));
                 label.setSelectable(true);
@@ -2837,10 +3019,11 @@ impl MenuController {
                         + controls_height
                         + 2.0 * question_padding
                         + metadata_gap
+                        + earlier_height
                 })
                 .unwrap_or(0.0);
             let height = SESSION_HEADER_HEIGHT + detail_height;
-            let row = SessionRowView::create(self.mtm(), rect(12.0, y, 372.0, height));
+            let row = SessionRowView::create(self.mtm(), rect(0.0, y, 384.0, height));
             if session_gap > 0.0 {
                 // Draw in the existing gap. Pinning to the row's top below keeps
                 // the divider aligned while either session expands or collapses.
@@ -2851,7 +3034,7 @@ impl MenuController {
                 &row,
                 &session.title,
                 rect(
-                    6.0,
+                    18.0,
                     height - SESSION_HEADER_HEIGHT / 2.0 - 11.0,
                     text_width,
                     22.0,
@@ -2884,7 +3067,7 @@ impl MenuController {
                 sel!(openSession:),
                 &session.key(),
                 rect(
-                    2.0,
+                    14.0,
                     height - SESSION_HEADER_HEIGHT,
                     text_width + 8.0,
                     SESSION_HEADER_HEIGHT,
@@ -2909,7 +3092,7 @@ impl MenuController {
                 sel!(expandSession:),
                 &session.key(),
                 rect(
-                    336.0,
+                    348.0,
                     height - SESSION_HEADER_HEIGHT / 2.0 - 12.0,
                     26.0,
                     24.0,
@@ -2955,23 +3138,24 @@ impl MenuController {
                 // The clip only reveals content; the main list is the sole scroller.
                 // SAFETY: NSClipView initializes this ivar-free subclass.
                 let clip: Retained<RevealClipView> = unsafe {
-                    msg_send![RevealClipView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 372.0, detail_height)]
+                    msg_send![RevealClipView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 384.0, detail_height)]
                 };
                 clip.setDrawsBackground(false);
                 // SAFETY: NSView's initializer is valid for this ivar-free subclass.
                 let document: Retained<SessionListView> = unsafe {
-                    msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 372.0, detail_height)]
+                    msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 384.0, detail_height)]
                 };
-                let message_top = MESSAGE_TOP_GAP + question_padding;
+                let question_top = MESSAGE_TOP_GAP + earlier_height;
+                let message_top = question_top + question_padding;
                 let message_end = message_top + text_height;
                 let footer_y =
                     message_end + 8.0 + controls_height + question_padding + metadata_gap;
                 if is_question {
                     let frame = rect(
-                        6.0,
-                        MESSAGE_TOP_GAP,
+                        18.0,
+                        question_top,
                         QUESTION_CARD_WIDTH,
-                        footer_y - MESSAGE_TOP_GAP - metadata_gap,
+                        footer_y - question_top - metadata_gap,
                     );
                     // SAFETY: Decorative view ignores hit testing, preserving text selection,
                     // answer buttons and scrolling across the entire question card.
@@ -2993,10 +3177,79 @@ impl MenuController {
                     decoration.addSubview(&card);
                     document.addSubview(&decoration);
                 }
-                metadata.setFrameOrigin(NSPoint::new(6.0, footer_y));
+                metadata.setFrameOrigin(NSPoint::new(18.0, footer_y));
                 document.addSubview(&metadata);
                 label.setFrameOrigin(NSPoint::new(content_x, message_top));
                 document.addSubview(&label);
+                if let Some(label) = earlier_label {
+                    document.addSubview(&label);
+                }
+                let first_top = if earlier_height > 0.0 {
+                    MESSAGE_TOP_GAP
+                } else {
+                    message_top
+                };
+                let gutter_frame = rect(1.0, first_top, 16.0, first_message_height);
+                let background = hover_background(self.mtm(), gutter_frame, 8.0);
+                document.addSubview(&background);
+                let previous = self.action_button(
+                    &document,
+                    "",
+                    sel!(previousMessage:),
+                    &session.key(),
+                    gutter_frame,
+                    true,
+                );
+                // Keep the full gutter clickable while its decoration is hidden.
+                // SAFETY: This decoration-only subclass uses NSView's initializer.
+                let decoration: Retained<StatusContentView> = unsafe {
+                    msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 16.0, first_message_height)]
+                };
+                if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    ns_string!("chevron.up"),
+                    Some(ns_string!("Previous message")),
+                ) {
+                    image.setTemplate(true);
+                    let icon = NSImageView::imageViewWithImage(&image, self.mtm());
+                    icon.setFrame(rect(3.0, (first_message_height - 12.0) / 2.0, 10.0, 12.0));
+                    icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+                    decoration.addSubview(&icon);
+                }
+                decoration.setHidden(true);
+                previous.addSubview(&decoration);
+                self.ivars().buttons.borrow_mut().push(ButtonHover {
+                    button: previous.clone(),
+                    background,
+                    base_alpha: 0.0,
+                    gutter: Some(GutterHover {
+                        message: rect(
+                            if earlier_height > 0.0 {
+                                18.0
+                            } else {
+                                content_x
+                            },
+                            first_top,
+                            if earlier_height > 0.0 {
+                                338.0
+                            } else {
+                                content_width
+                            },
+                            first_message_height,
+                        ),
+                        icon: decoration,
+                    }),
+                });
+                previous.setEnabled(!history.loading && !history.exhausted);
+                let tooltip = if let Some(error) = &history.error {
+                    format!("Could not load history: {error}. Click to retry.")
+                } else if history.loading {
+                    "Loading previous message…".into()
+                } else if history.exhausted {
+                    "No earlier agent messages".into()
+                } else {
+                    "Show previous agent message".into()
+                };
+                previous.setToolTip(Some(&NSString::from_str(&tooltip)));
                 if let Some(key) = session.approval_key() {
                     for (index, control) in controls.into_iter().enumerate() {
                         let id = format!("response:{key}:{index}");
@@ -3649,8 +3902,8 @@ mod close_tests {
             row,
             vec![
                 rect(0.0, 0.0, 60.0, 28.0),
-                rect(66.0, 0.0, 80.0, 28.0),
-                rect(152.0, 0.0, 100.0, 28.0)
+                rect(72.0, 0.0, 80.0, 28.0),
+                rect(164.0, 0.0, 100.0, 28.0)
             ]
         );
         assert_eq!(height, 34.0);
@@ -3659,11 +3912,29 @@ mod close_tests {
             column,
             vec![
                 rect(0.0, 0.0, 60.0, 28.0),
-                rect(0.0, 34.0, 80.0, 28.0),
-                rect(0.0, 68.0, 100.0, 28.0)
+                rect(0.0, 40.0, 80.0, 28.0),
+                rect(0.0, 80.0, 100.0, 28.0)
             ]
         );
-        assert_eq!(height, 102.0);
+        assert_eq!(height, 114.0);
+        for pair in row.windows(2) {
+            assert_eq!(
+                pair[1].origin.x
+                    - pair[0].origin.x
+                    - pair[0].size.width
+                    - 2.0 * BUTTON_HOVER_PADDING,
+                6.0
+            );
+        }
+        for pair in column.windows(2) {
+            assert_eq!(
+                pair[1].origin.y
+                    - pair[0].origin.y
+                    - pair[0].size.height
+                    - 2.0 * BUTTON_HOVER_PADDING,
+                6.0
+            );
+        }
         assert_eq!(answer_button_layout(&[], 318.0), (vec![], 0.0));
     }
 

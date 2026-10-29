@@ -150,6 +150,27 @@ impl SessionProvider for Cline {
             })
             .collect())
     }
+    fn previous_message(
+        &self,
+        session: &Session,
+        before: Option<&str>,
+    ) -> Result<Option<crate::agents::history::Message>> {
+        let record = tracking::load(&tracking::root(), "cline", &session.id)
+            .ok_or_else(|| anyhow::anyhow!("Task history is unavailable"))?;
+        let path = task_files(&record)
+            .into_iter()
+            .find(|path| path.is_file())
+            .ok_or_else(|| anyhow::anyhow!("Task history is unavailable"))?;
+        crate::agents::history::cline(
+            &path,
+            before,
+            session
+                .approval
+                .is_none()
+                .then_some(session.last_message.as_str()),
+        )
+    }
+
     fn pending_count(&self) -> usize {
         self.sessions()
             .unwrap_or_default()

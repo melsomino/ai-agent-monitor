@@ -18,7 +18,6 @@ use std::{
 pub struct Notice {
     pub key: String,
     pub title: String,
-    pub subtitle: String,
     pub body: String,
     pub target: String,
     pub token: String,
@@ -183,7 +182,6 @@ fn update(
 fn post(notice: &Notice, category: Option<&str>) {
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(&notice.title));
-    content.setSubtitle(&NSString::from_str(&notice.subtitle));
     content.setBody(&NSString::from_str(&notice.body));
     content.setSound(Some(&UNNotificationSound::defaultSound()));
     if let Some(category) = category {

@@ -212,3 +212,69 @@ mod target_tests {
         assert_eq!(resolve((100.0, 200.0)), None);
     }
 }
+
+/// Reveal the history affordance only over the first message or its gutter.
+pub fn gutter_visible(
+    point: (f64, f64),
+    window: Area,
+    viewport: Area,
+    message: Area,
+    gutter: Area,
+) -> bool {
+    window.contains(point)
+        && viewport.contains(point)
+        && (message.contains(point) || gutter.contains(point))
+}
+
+#[cfg(test)]
+mod gutter_tests {
+    use super::*;
+    #[test]
+    fn first_message_and_full_gutter_reveal_icon_without_hovering_other_messages() {
+        let window = Area {
+            x: 0.0,
+            y: 0.0,
+            width: 384.0,
+            height: 400.0,
+        };
+        let viewport = Area {
+            y: 20.0,
+            height: 300.0,
+            ..window
+        };
+        let message = Area {
+            x: 18.0,
+            y: 30.0,
+            width: 338.0,
+            height: 100.0,
+        };
+        let gutter = Area {
+            x: 1.0,
+            width: 16.0,
+            ..message
+        };
+        let visible = |p| gutter_visible(p, window, viewport, message, gutter);
+        assert!(visible((100.0, 40.0)));
+        assert!(visible((8.0, 120.0)));
+        assert!(!visible((0.0, 40.0)));
+        assert!(!visible((17.0, 40.0)));
+        assert!(!visible((8.0, 130.0)));
+        assert!(!visible((100.0, 140.0)));
+        assert!(!visible((400.0, 40.0)));
+        let clipped = Area {
+            y: 60.0,
+            ..viewport
+        };
+        assert!(!gutter_visible(
+            (8.0, 40.0),
+            window,
+            clipped,
+            message,
+            gutter
+        ));
+        assert_eq!(
+            target_at((8.0, 120.0), window, viewport, &[], &[gutter], &[]),
+            Some(Target::Button(0))
+        );
+    }
+}

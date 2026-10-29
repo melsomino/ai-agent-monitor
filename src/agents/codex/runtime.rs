@@ -368,7 +368,7 @@ fn respond_inner(token: &str, response: &Response) -> Result<bool> {
         return Ok(false);
     };
     let asynchronous = ticket.request["method"] == async_questions::METHOD;
-    let wire = requests::wire_response(&ticket.request, response);
+    let wire = requests::follower_response(&ticket.request, &ticket.session, response);
     let async_text = if asynchronous {
         async_questions::reply_text(&ticket.request, response)
     } else {
@@ -428,20 +428,61 @@ fn respond_inner(token: &str, response: &Response) -> Result<bool> {
             let result = connection.request(method, params, version, Some(&owner))?;
             return Ok(result["resultType"] == "success");
         }
-        let Some((method, field, value)) = wire else {
+        let Some((method, params)) = wire else {
             return Ok(false);
         };
-        let id = &ticket.request["id"];
-        let request_id = id
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| id.to_string());
-        let mut params = json!({"conversationId":ticket.session,"requestId":request_id});
-        params[field] = value;
+        let mut confirmed = HashMap::new();
+        if !apply_change(&mut confirmed, &ticket.session, &owner, change) {
+            return Ok(false);
+        }
         let result = connection.request(method, params, 1, Some(&owner))?;
-        return Ok(result["resultType"] == "success" && result["result"]["ok"] == true);
+        if result["resultType"] != "success" || result["result"]["ok"] != true {
+            return Ok(false);
+        }
+        // The owner returns ok even when its strict request lookup finds nothing.
+        // A transport acknowledgement alone must not make the UI report Sent.
+        connection.follow(&ticket.session, &owner, true)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let Some(message) = connection.next()? else {
+                continue;
+            };
+            if message["method"] != "thread-stream-state-changed"
+                || message["sourceClientId"] != owner
+                || message["version"] != STREAM_VERSION
+                || message["params"]["conversationId"] != ticket.session
+                || message["params"]["hostId"] != "local"
+            {
+                continue;
+            }
+            if !apply_change(
+                &mut confirmed,
+                &ticket.session,
+                &owner,
+                &message["params"]["change"],
+            ) {
+                connection.follow(&ticket.session, &owner, true)?;
+                continue;
+            }
+            if request_resolved(&confirmed, &ticket) {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
     }
     Ok(false)
+}
+
+fn request_resolved(live: &HashMap<String, Live>, ticket: &Ticket) -> bool {
+    live.get(&ticket.session)
+        .filter(|current| current.owner == ticket.owner)
+        .and_then(|current| current.state["requests"].as_array())
+        .is_some_and(|requests| {
+            !requests.iter().any(|request| {
+                request["id"] == ticket.request["id"]
+                    && request["method"] == ticket.request["method"]
+            })
+        })
 }
 
 struct Connection {
@@ -980,5 +1021,24 @@ mod tests {
         assert_eq!(c.read().unwrap(), Some(value));
         c.bytes = ((MAX_FRAME + 1) as u32).to_le_bytes().to_vec();
         assert!(c.read().is_err());
+    }
+    #[test]
+    fn an_rpc_acknowledgement_is_not_resolution_until_the_exact_request_is_gone() {
+        let request = json!({"id":42,"method":"item/commandExecution/requestApproval","params":{"threadId":"chat"}});
+        let ticket = Ticket {
+            session: "chat".into(),
+            owner: "owner".into(),
+            request: request.clone(),
+        };
+        let mut live = HashMap::new();
+        assert!(!request_resolved(&live, &ticket));
+        let pending = json!({"type":"snapshot","revision":1,"conversationState":{"id":"chat","requests":[request],"threadRuntimeStatus":{"type":"active"}}});
+        assert!(apply_change(&mut live, "chat", "owner", &pending));
+        assert!(!request_resolved(&live, &ticket));
+        let removed = json!({"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"remove","path":["requests",0]}]});
+        assert!(apply_change(&mut live, "chat", "owner", &removed));
+        assert!(request_resolved(&live, &ticket));
+        live.get_mut("chat").unwrap().owner = "other owner".into();
+        assert!(!request_resolved(&live, &ticket));
     }
 }

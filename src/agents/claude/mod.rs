@@ -63,6 +63,27 @@ impl SessionProvider for Claude {
             })
             .collect())
     }
+    fn previous_message(
+        &self,
+        session: &Session,
+        before: Option<&str>,
+    ) -> Result<Option<crate::agents::history::Message>> {
+        let record = tracking::load(&tracking::root(), "claude", &session.id)
+            .ok_or_else(|| anyhow::anyhow!("Session transcript is unavailable"))?;
+        let path = record
+            .transcript
+            .ok_or_else(|| anyhow::anyhow!("Session transcript is unavailable"))?;
+        crate::agents::history::jsonl(
+            &path,
+            before,
+            session
+                .approval
+                .is_none()
+                .then_some(session.last_message.as_str()),
+            crate::agents::history::claude,
+        )
+    }
+
     fn pending_count(&self) -> usize {
         pending::list_for("claude").len()
     }

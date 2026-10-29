@@ -152,8 +152,9 @@ Cline requests are displayed and generate notifications, but approval happens in
 
 Click the robot icon, or use your configured shortcut, to open the menu. Idle sessions are included and have no status icon. Hover over a status icon for its description.
 
-- **Click the session title** to open its project in VS Code.
+- **Click the session title** to switch to its host. VS Code sessions open their project; terminal sessions activate their terminal app. Terminal and iTerm select the matching tab when it can be identified; Warp currently supports app activation only. macOS may ask for Automation permission to select terminal tabs.
 - **Click the chevron** to expand or collapse details.
+- **Click the small up-chevron in the left gutter** beside the first displayed message to prepend one earlier agent message. Repeat to read further back. History loads locally for Codex, Claude Code, and Cline; closing the menu resets it.
 - **Click outside**, press **Escape**, or use the shortcut again to close the menu.
 - Use **gear** in the footer to open settings, or **power** to quit the resident monitor.
 

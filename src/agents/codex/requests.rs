@@ -8,12 +8,12 @@ fn decisions(request: &Value) -> Vec<Value> {
     if let Some(decisions) = params["availableDecisions"].as_array() {
         return decisions.clone();
     }
-    let mut decisions = vec![
-        json!("accept"),
-        json!("acceptForSession"),
-        json!("decline"),
-        json!("cancel"),
-    ];
+    let mut decisions = vec![json!("accept")];
+    if request["method"] == "item/fileChange/requestApproval"
+        || params["networkApprovalContext"].is_object()
+    {
+        decisions.push(json!("acceptForSession"));
+    }
     if request["method"] == "item/commandExecution/requestApproval" {
         if let Some(amendment) = params["proposedExecpolicyAmendment"]
             .as_array()
@@ -30,28 +30,42 @@ fn decisions(request: &Value) -> Vec<Value> {
             }
         }
     }
+    decisions.push(json!("decline"));
     decisions
 }
-fn decision_label(value: &Value) -> Option<String> {
+fn decision_label(value: &Value, request: &Value) -> Option<String> {
     match value.as_str() {
-        Some("accept") => Some("Allow".into()),
-        Some("acceptForSession") => Some("Allow for this session".into()),
-        Some("decline") => Some("Decline".into()),
-        Some("cancel") => Some("Cancel turn".into()),
+        Some("accept") => Some("Allow once".into()),
+        Some("acceptForSession") => Some(
+            if request["method"] == "item/fileChange/requestApproval" {
+                "Allow all edits"
+            } else {
+                "Allow this conversation"
+            }
+            .into(),
+        ),
+        Some("decline") => Some("Deny".into()),
+        Some("cancel") => Some(
+            if decisions(request).iter().any(|choice| choice == "decline") {
+                "Cancel turn"
+            } else {
+                "Deny"
+            }
+            .into(),
+        ),
         _ if value.get("acceptWithExecpolicyAmendment").is_some() => {
             Some("Allow similar commands".into())
         }
         _ if value.get("applyNetworkPolicyAmendment").is_some() => {
             let amendment = &value["applyNetworkPolicyAmendment"]["network_policy_amendment"];
-            Some(format!(
-                "Always {} {}",
+            Some(
                 if amendment["action"] == "deny" {
-                    "deny"
+                    "Always deny"
                 } else {
-                    "allow"
-                },
-                amendment["host"].as_str().unwrap_or("this host")
-            ))
+                    "Always allow"
+                }
+                .into(),
+            )
         }
         _ => None,
     }
@@ -62,7 +76,7 @@ pub fn interaction(request: &Value) -> Interaction {
     match request["method"].as_str() {
         Some("item/commandExecution/requestApproval" | "item/fileChange/requestApproval") => {
             for (index, value) in decisions(request).into_iter().enumerate() {
-                if let Some(label) = decision_label(&value) {
+                if let Some(label) = decision_label(&value, request) {
                     result.actions.push(Action {
                         id: if value == "accept" {
                             "allow".into()
@@ -84,17 +98,17 @@ pub fn interaction(request: &Value) -> Interaction {
             result.actions = vec![
                 Action {
                     id: "permissions:turn".into(),
-                    label: "Allow for this turn".into(),
+                    label: "Allow once".into(),
                     detail: detail.clone(),
                 },
                 Action {
                     id: "permissions:session".into(),
-                    label: "Allow for this session".into(),
+                    label: "Allow this conversation".into(),
                     detail,
                 },
                 Action {
                     id: "permissions:decline".into(),
-                    label: "Decline".into(),
+                    label: "Deny".into(),
                     detail: String::new(),
                 },
             ];
@@ -213,6 +227,22 @@ pub fn wire_response(
     }
 }
 
+/// The owner compares request IDs with strict equality; preserve their JSON type.
+pub fn follower_response(
+    request: &Value,
+    conversation: &str,
+    response: &Response,
+) -> Option<(&'static str, Value)> {
+    let id = request.get("id")?;
+    if !id.is_string() && !id.is_number() {
+        return None;
+    }
+    let (method, field, value) = wire_response(request, response)?;
+    let mut params = json!({"conversationId":conversation,"requestId":id});
+    params[field] = value;
+    Some((method, params))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +281,51 @@ mod tests {
         let (_, _, deny) =
             wire_response(&request, &Response::Action("permissions:decline".into())).unwrap();
         assert_eq!(deny["permissions"], json!({}));
+    }
+    #[test]
+    fn numeric_and_string_request_ids_keep_their_exact_wire_types() {
+        for id in [json!(42), json!("42")] {
+            let request = json!({"id":id,"method":"item/commandExecution/requestApproval","params":{"availableDecisions":["accept",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["cargo","test"]}},"cancel"]}});
+            let (method, params) =
+                follower_response(&request, "chat", &Response::Action("allow".into())).unwrap();
+            assert_eq!(method, "thread-follower-command-approval-decision");
+            assert_eq!(params["requestId"], id);
+            assert_eq!(params["decision"], "accept");
+            assert_eq!(
+                interaction(&request)
+                    .actions
+                    .iter()
+                    .map(|action| action.label.as_str())
+                    .collect::<Vec<_>>(),
+                ["Allow once", "Allow similar commands", "Deny"]
+            );
+            assert_eq!(
+                follower_response(&request, "chat", &Response::Action("decision:2".into()))
+                    .unwrap()
+                    .1["decision"],
+                "cancel"
+            );
+        }
+    }
+    #[test]
+    fn default_buttons_match_codex_and_do_not_invent_session_or_cancel_actions() {
+        let command = json!({"method":"item/commandExecution/requestApproval","params":{}});
+        assert_eq!(
+            interaction(&command)
+                .actions
+                .iter()
+                .map(|action| action.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Allow once", "Deny"]
+        );
+        let file = json!({"method":"item/fileChange/requestApproval","params":{}});
+        assert_eq!(
+            interaction(&file)
+                .actions
+                .iter()
+                .map(|action| action.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Allow once", "Allow all edits", "Deny"]
+        );
     }
 }

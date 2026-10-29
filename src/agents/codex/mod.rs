@@ -48,6 +48,23 @@ impl SessionProvider for Codex {
         open(&crate::app::core::codex_home())
     }
 
+    fn previous_message(
+        &self,
+        session: &Session,
+        before: Option<&str>,
+    ) -> Result<Option<crate::agents::history::Message>> {
+        let path = history_path(&crate::app::core::codex_home(), &session.id)?;
+        crate::agents::history::jsonl(
+            &path,
+            before,
+            session
+                .approval
+                .is_none()
+                .then_some(session.last_message.as_str()),
+            crate::agents::history::codex,
+        )
+    }
+
     fn pending_count(&self) -> usize {
         let requests = crate::agents::pending::list_for("codex");
         let mut sessions = crate::app::monitor::hook_ids("codex");
@@ -77,7 +94,9 @@ impl SessionProvider for Codex {
             .as_ref()
             .is_some_and(|request| request.can_allow)
         {
-            crate::agents::interaction::Interaction::allow()
+            let mut interaction = crate::agents::interaction::Interaction::allow();
+            interaction.actions[0].label = "Allow once".into();
+            interaction
         } else {
             crate::agents::interaction::Interaction::default()
         }
@@ -269,6 +288,62 @@ fn read_open(home: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
     }
 }
 
+/// Original launch directory, unaffected by later tool commands in other folders.
+#[cfg(target_os = "macos")]
+pub(crate) fn initial_directory(id: &str) -> Option<PathBuf> {
+    use std::io::BufRead;
+    let path = history_path(&crate::app::core::codex_home(), id).ok()?;
+    let file = fs::File::open(path).ok()?;
+    let mut line = String::new();
+    BufReader::new(file.take(131072))
+        .read_line(&mut line)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_str(&line).ok()?;
+    value["payload"]["cwd"]
+        .as_str()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn history_path(home: &Path, id: &str) -> Result<PathBuf> {
+    let mut databases: Vec<_> = fs::read_dir(home)?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let version = path
+                .file_name()?
+                .to_str()?
+                .strip_prefix("state_")?
+                .strip_suffix(".sqlite")?
+                .parse::<u32>()
+                .ok()?;
+            Some((version, path))
+        })
+        .collect();
+    databases.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+    for (_, path) in databases {
+        let lookup = || -> rusqlite::Result<PathBuf> {
+            let db = Connection::open_with_flags(
+                &path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            db.busy_timeout(Duration::from_millis(150))?;
+            db.query_row(
+                "SELECT rollout_path FROM threads WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .map(PathBuf::from)
+        };
+        if let Ok(path) = lookup()
+            && path.starts_with(home)
+            && path.is_file()
+        {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("No transcript found for this Codex session")
+}
+
 fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
     let db = Connection::open_with_flags(
         path,
@@ -346,6 +421,10 @@ fn enrich(session: &mut Session, path: &Path) {
             .is_some_and(|s| s.contains("Desktop"))
         {
             DESKTOP
+        } else if meta["originator"].as_str() == Some("codex-tui") {
+            // A terminal client using the shared app-server can retain a
+            // "vscode" source. Its explicit TUI origin identifies the host.
+            Client::Terminal
         } else {
             match meta["source"].as_str() {
                 Some("vscode") => Client::VSCode,
@@ -734,6 +813,7 @@ mod tests {
         let transcript = home.path().join("rollout.jsonl");
         for (source, originator, client) in [
             ("cli", "codex-tui", Client::Terminal),
+            ("vscode", "codex-tui", Client::Terminal),
             ("vscode", "codex_vscode", Client::VSCode),
             ("vscode", "Codex Desktop", DESKTOP),
         ] {
@@ -808,5 +888,29 @@ mod tests {
             ),
             Some(id.into())
         );
+    }
+    #[test]
+    fn history_lookup_uses_the_exact_session_and_existing_rollout() {
+        let home = tempfile::tempdir().unwrap();
+        let first = home.path().join("one.jsonl");
+        let second = home.path().join("two.jsonl");
+        fs::write(&first, "").unwrap();
+        fs::write(&second, "").unwrap();
+        let db = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        db.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT)", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, ?2)",
+            ["one", first.to_str().unwrap()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, ?2)",
+            ["two", second.to_str().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(history_path(home.path(), "one").unwrap(), first);
+        assert_eq!(history_path(home.path(), "two").unwrap(), second);
+        assert!(history_path(home.path(), "missing").is_err());
     }
 }

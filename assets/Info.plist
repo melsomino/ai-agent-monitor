@@ -9,6 +9,7 @@
 <key>CFBundleVersion</key><string>@BUILD_NUMBER@</string>
 <key>CFBundleShortVersionString</key><string>@VERSION@</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
+<key>NSAppleEventsUsageDescription</key><string>Select the terminal tab running the agent session you open.</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
 <key>LSMinimumSystemVersion</key><string>13.0</string>

@@ -18,6 +18,13 @@ pub trait SessionProvider: Sync {
     fn id(&self) -> &'static str;
     fn sessions(&self) -> Result<Vec<Session>>;
     fn pending_count(&self) -> usize;
+    fn previous_message(
+        &self,
+        _session: &Session,
+        _before: Option<&str>,
+    ) -> Result<Option<crate::agents::history::Message>> {
+        Ok(None)
+    }
     fn open_target(&self, session: &Session) -> String;
     fn allow(&self, session: &Session) -> bool;
     fn interaction(&self, session: &Session) -> Interaction {
@@ -225,6 +232,10 @@ impl Session {
     }
 
     pub fn open_target(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        if self.client == Client::Terminal {
+            return Some(crate::macos::terminal::target(self));
+        }
         crate::app::monitor::hook_target(self).or_else(|| registry().open_target(self))
     }
 
@@ -233,6 +244,16 @@ impl Session {
             .provider(self.agent)
             .map(|provider| provider.interaction(self))
             .unwrap_or_default()
+    }
+
+    pub fn previous_message(
+        &self,
+        before: Option<&str>,
+    ) -> Result<Option<crate::agents::history::Message>> {
+        registry()
+            .provider(self.agent)
+            .context("Unknown agent")?
+            .previous_message(self, before)
     }
 
     pub fn respond(&self, response: &Response) -> bool {

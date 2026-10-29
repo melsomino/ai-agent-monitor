@@ -48,6 +48,9 @@ define_class!(
 );
 
 pub fn open_target(value: &str) -> bool {
+    if let Some(result) = super::terminal::open(value) {
+        return result;
+    }
     let Some(path) = core::vscode_path(value) else {
         return false;
     };
@@ -286,7 +289,6 @@ pub fn notify_session(session: &crate::agents::sessions::Session) {
         crate::macos::notification_categories::Notice {
             key,
             title: session.title.clone(),
-            subtitle: session.agent_label().into(),
             body,
             target: session.open_target().unwrap_or_default(),
             token: approval.id.clone(),
