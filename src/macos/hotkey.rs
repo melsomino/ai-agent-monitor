@@ -12,12 +12,7 @@ const CONTROL: u32 = 1 << 12;
 const MODIFIERS: u32 = COMMAND | SHIFT | OPTION | CONTROL;
 const SIGNATURE: u32 = u32::from_be_bytes(*b"CDXN");
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Shortcut {
-    pub key_code: u32,
-    pub modifiers: u32,
-    pub key_name: String,
-}
+pub use crate::domain::shortcut::Shortcut;
 
 impl Shortcut {
     pub fn from_event(
@@ -223,7 +218,7 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-unsafe extern "C" fn pressed(_: *mut c_void, event: *mut c_void, _: *mut c_void) -> i32 {
+unsafe extern "C" fn pressed(_: *mut c_void, event: *mut c_void, context: *mut c_void) -> i32 {
     let mut id = HotKeyId::default();
     // SAFETY: Carbon supplies a live keyboard event. The direct parameter is
     // copied into a correctly sized, repr(C) EventHotKeyID from the SDK header.
@@ -241,24 +236,28 @@ unsafe extern "C" fn pressed(_: *mut c_void, event: *mut c_void, _: *mut c_void)
     if status != 0 || id.signature != SIGNATURE || id.id != 1 {
         return -9874;
     }
-    if MainThreadMarker::new().is_some() {
-        crate::macos::menu::toggle_from_hotkey();
-    } else {
-        dispatch2::DispatchQueue::main().exec_async(crate::macos::menu::toggle_from_hotkey);
+    if let Some(sender) = unsafe { context.cast::<crate::macos::bridge::Sender>().as_ref() } {
+        let _ = sender.try_send(crate::macos::bridge::Event::Toggle);
     }
     0
 }
 
 pub struct Registration {
+    callback: Box<crate::macos::bridge::Sender>,
     key: *mut c_void,
     handler: *mut c_void,
     _main_thread: PhantomData<Rc<()>>,
 }
 
 impl Registration {
-    pub fn new(shortcut: &Shortcut, _mtm: MainThreadMarker) -> Result<Self> {
+    pub fn new(
+        shortcut: &Shortcut,
+        _mtm: MainThreadMarker,
+        events: crate::macos::bridge::Sender,
+    ) -> Result<Self> {
         anyhow::ensure!(shortcut.valid(), "Use ⌘, ⌥ or ⌃ with a key.");
         let mut registration = Self {
+            callback: Box::new(events),
             key: ptr::null_mut(),
             handler: ptr::null_mut(),
             _main_thread: PhantomData,
@@ -276,7 +275,7 @@ impl Registration {
                 pressed,
                 1,
                 &event_type,
-                ptr::null_mut(),
+                (&mut *registration.callback as *mut crate::macos::bridge::Sender).cast(),
                 &mut registration.handler,
             );
             anyhow::ensure!(
@@ -321,12 +320,17 @@ impl Drop for Registration {
 /// Raw key events are dispatched directly by NSMenu, bypassing NSEvent monitors.
 /// Registered only while our menu is tracking, without a global keyboard tap.
 pub struct MenuKeyboard {
+    callback: Box<objc2::rc::Weak<crate::macos::menu::MenuController>>,
     handler: *mut c_void,
     _main_thread: PhantomData<Rc<()>>,
 }
 impl MenuKeyboard {
-    pub fn new(_mtm: MainThreadMarker) -> Result<Self> {
+    pub fn new(
+        _mtm: MainThreadMarker,
+        controller: objc2::rc::Weak<crate::macos::menu::MenuController>,
+    ) -> Result<Self> {
         let mut registration = Self {
+            callback: Box::new(controller),
             handler: ptr::null_mut(),
             _main_thread: PhantomData,
         };
@@ -347,7 +351,9 @@ impl MenuKeyboard {
                 menu_key_pressed,
                 types.len(),
                 types.as_ptr(),
-                ptr::null_mut(),
+                (&mut *registration.callback
+                    as *mut objc2::rc::Weak<crate::macos::menu::MenuController>)
+                    .cast(),
                 &mut registration.handler,
             )
         };
@@ -371,13 +377,13 @@ impl Drop for MenuKeyboard {
 unsafe extern "C" fn menu_key_pressed(
     handler: *mut c_void,
     event: *mut c_void,
-    _: *mut c_void,
+    context: *mut c_void,
 ) -> i32 {
     if MainThreadMarker::new().is_some()
         && let Some(event_ref) = std::ptr::NonNull::new(event)
         // SAFETY: Carbon supplies a live event for the duration of this callback.
         && let Some(event) = (unsafe { objc2_app_kit::NSEvent::eventWithEventRef(event_ref) })
-        && crate::macos::menu::handle_menu_key(&event)
+        && unsafe{context.cast::<objc2::rc::Weak<crate::macos::menu::MenuController>>().as_ref()}.and_then(|weak|weak.load()).is_some_and(|controller|controller.handle_session_key(&event))
     {
         return 0;
     }

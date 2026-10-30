@@ -4,17 +4,11 @@ use crate::{
     app::{core, setup},
 };
 use block2::RcBlock;
-use dispatch2::DispatchQueue;
 use objc2::{MainThreadMarker, runtime::Bool};
 use objc2_app_kit::{NSAlert, NSApplication};
 use objc2_foundation::{NSError, NSString, NSUserDefaults, ns_string};
 use objc2_user_notifications::{UNAuthorizationOptions, UNUserNotificationCenter};
-use std::{
-    path::Path,
-    sync::atomic::{AtomicBool, AtomicU8, Ordering},
-};
-
-static BUSY: AtomicBool = AtomicBool::new(false);
+use std::path::Path;
 
 fn signature(integration: &setup::Integration, executable: &Path) -> String {
     format!(
@@ -46,31 +40,8 @@ pub fn installed_location(mtm: MainThreadMarker) -> bool {
     true
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Phase {
-    Detected,
-    Installing,
-    Installed,
-    Failed,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Row {
-    pub agent: setup::Agent,
-    pub phase: Phase,
-    pub detail: String,
-    pub directory: String,
-}
-impl Row {
-    pub fn status(&self) -> &'static str {
-        match self.phase {
-            Phase::Detected => "Needs setup",
-            Phase::Installing => "Setting up…",
-            Phase::Installed => "Hooks installed",
-            Phase::Failed => "Needs attention",
-        }
-    }
-}
-static INSTALLING: AtomicU8 = AtomicU8::new(0);
+pub use crate::domain::integrations::{Phase, Row};
+
 fn bit(agent: setup::Agent) -> u8 {
     match agent {
         setup::Agent::Codex => 1,
@@ -88,24 +59,19 @@ fn save_string(key: &NSString, value: &str) {
             .setObject_forKey(Some(&NSString::from_str(value)), key);
     }
 }
-pub fn busy() -> bool {
-    BUSY.load(Ordering::Relaxed)
-}
 pub fn notification_note() -> String {
     NSUserDefaults::standardUserDefaults()
         .stringForKey(ns_string!("IntegrationSetup.NotificationError"))
         .map(|value| value.to_string())
         .unwrap_or_default()
 }
-pub fn rows() -> Vec<Row> {
+pub fn rows(installing: u8) -> Vec<Row> {
     let executable = core::bundle_executable();
     let defaults = NSUserDefaults::standardUserDefaults();
     setup::discover(&core::home(), core::codex_home(), agents::claude::home())
         .into_iter()
         .map(|integration| {
-            let (phase, detail) = if INSTALLING.load(Ordering::Relaxed) & bit(integration.agent)
-                != 0
-            {
+            let (phase, detail) = if installing & bit(integration.agent) != 0 {
                 (
                     Phase::Installing,
                     "Connecting hooks to AI Agent Monitor.".into(),
@@ -136,82 +102,118 @@ pub fn rows() -> Vec<Row> {
         .collect()
 }
 
-pub fn begin(_mtm: MainThreadMarker, force: bool) {
-    if BUSY.swap(true, Ordering::Relaxed) {
-        return;
+pub type InstallResult = (setup::Agent, String, Result<bool, String>);
+pub struct Setup {
+    busy: bool,
+    installing: u8,
+    monitor: crate::actors::monitor::Handle,
+    events: crate::macos::bridge::Sender,
+}
+impl Setup {
+    pub fn new(
+        monitor: crate::actors::monitor::Handle,
+        events: crate::macos::bridge::Sender,
+    ) -> Self {
+        Self {
+            busy: false,
+            installing: 0,
+            monitor,
+            events,
+        }
     }
-    let executable = core::bundle_executable();
-    let defaults = NSUserDefaults::standardUserDefaults();
-    let first_launch = !defaults.boolForKey(ns_string!("FirstLaunchSetupCompleted"));
-    let pending: Vec<_> =
-        setup::discover(&core::home(), core::codex_home(), agents::claude::home())
-            .into_iter()
-            .filter(|integration| {
-                force
-                    || defaults
-                        .stringForKey(&key(integration.agent))
-                        .is_none_or(|saved| {
-                            saved.to_string() != signature(integration, &executable)
-                        })
-                    || !integration.installed(&executable).unwrap_or(false)
-            })
-            .collect();
-    if !first_launch && pending.is_empty() && !force {
-        BUSY.store(false, Ordering::Relaxed);
-        return;
-    }
-    INSTALLING.store(
-        pending
-            .iter()
-            .fold(0, |mask, integration| mask | bit(integration.agent)),
-        Ordering::Relaxed,
-    );
-    std::thread::spawn(move || {
-        let results: Vec<_> = pending
-            .into_iter()
-            .map(|integration| {
-                let result = integration
-                    .install(&executable)
-                    .map_err(|error| format!("{error:#}"));
-                (
-                    integration.agent,
-                    signature(&integration, &executable),
-                    result,
-                )
-            })
-            .collect();
-        DispatchQueue::main().exec_async(move || {
-            let defaults = NSUserDefaults::standardUserDefaults();
-            for (agent, signature, result) in results {
-                match result {
-                    Ok(_) => { save_string(&key(agent), &signature); defaults.removeObjectForKey(&error_key(agent)); }
-                    Err(error) => save_string(&error_key(agent), &error),
-                }
-            }
-            INSTALLING.store(0, Ordering::Relaxed);
-            defaults.setBool_forKey(true, ns_string!("FirstLaunchSetupCompleted"));
-            crate::macos::menu::refresh_integrations();
-            let callback = RcBlock::new(move |allowed: Bool, error: *mut NSError| {
-                // SAFETY: UserNotifications keeps NSError alive for this callback.
-                let error = unsafe { error.as_ref() }.map(|error| error.localizedDescription().to_string());
-                DispatchQueue::main().exec_async(move || {
-                    let key = ns_string!("IntegrationSetup.NotificationError");
-                    if let Some(error) = error {
-                        save_string(key, &format!("Notifications: {error}"));
-                    } else if !allowed.as_bool() {
-                        save_string(key, "Enable notifications in System Settings → Notifications → AI Agent Monitor.");
-                    } else {
-                        NSUserDefaults::standardUserDefaults().removeObjectForKey(key);
-                    }
-                    BUSY.store(false, Ordering::Relaxed);
-                    crate::macos::menu::refresh_integrations();
-                });
+    pub fn publish(&self) {
+        let _ = self
+            .monitor
+            .send(crate::actors::monitor::Command::IntegrationsObserved {
+                rows: rows(self.installing),
+                busy: self.busy,
+                note: notification_note(),
             });
-            UNUserNotificationCenter::currentNotificationCenter().requestAuthorizationWithOptions_completionHandler(
-                UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound, &callback,
-            );
+    }
+    pub fn begin(&mut self, force: bool) {
+        if self.busy {
+            return;
+        }
+        let executable = core::bundle_executable();
+        let defaults = NSUserDefaults::standardUserDefaults();
+        let first_launch = !defaults.boolForKey(ns_string!("FirstLaunchSetupCompleted"));
+        let pending: Vec<_> =
+            setup::discover(&core::home(), core::codex_home(), agents::claude::home())
+                .into_iter()
+                .filter(|i| {
+                    force
+                        || defaults
+                            .stringForKey(&key(i.agent))
+                            .is_none_or(|v| v.to_string() != signature(i, &executable))
+                        || !i.installed(&executable).unwrap_or(false)
+                })
+                .collect();
+        if !first_launch && pending.is_empty() && !force {
+            self.publish();
+            return;
+        }
+        self.busy = true;
+        self.installing = pending.iter().fold(0, |mask, i| mask | bit(i.agent));
+        self.publish();
+        let events = self.events.clone();
+        std::thread::spawn(move || {
+            let results = pending
+                .into_iter()
+                .map(|i| {
+                    let result = i.install(&executable).map_err(|e| e.to_string());
+                    (i.agent, signature(&i, &executable), result)
+                })
+                .collect();
+            let _ = events.blocking_send(crate::macos::bridge::Event::Platform(
+                crate::macos::bridge::PlatformCommand::SetupFinished(results),
+            ));
         });
-    });
+    }
+    pub fn installed(&mut self, results: Vec<InstallResult>) {
+        let defaults = NSUserDefaults::standardUserDefaults();
+        for (agent, signature, result) in results {
+            match result {
+                Ok(_) => {
+                    save_string(&key(agent), &signature);
+                    defaults.removeObjectForKey(&error_key(agent));
+                }
+                Err(e) => save_string(&error_key(agent), &e),
+            }
+        }
+        self.installing = 0;
+        defaults.setBool_forKey(true, ns_string!("FirstLaunchSetupCompleted"));
+        self.publish();
+        let events = self.events.clone();
+        let callback = RcBlock::new(move |allowed: Bool, error: *mut NSError| {
+            let error = unsafe { error.as_ref() }.map(|e| e.localizedDescription().to_string());
+            let _ = events.try_send(crate::macos::bridge::Event::Platform(
+                crate::macos::bridge::PlatformCommand::NotificationPermission(
+                    allowed.as_bool(),
+                    error,
+                ),
+            ));
+        });
+        UNUserNotificationCenter::currentNotificationCenter()
+            .requestAuthorizationWithOptions_completionHandler(
+                UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+                &callback,
+            );
+    }
+    pub fn permission(&mut self, allowed: bool, error: Option<String>) {
+        let key = ns_string!("IntegrationSetup.NotificationError");
+        if let Some(error) = error {
+            save_string(key, &format!("Notifications: {error}"));
+        } else if !allowed {
+            save_string(
+                key,
+                "Enable notifications in System Settings → Notifications → AI Agent Monitor.",
+            );
+        } else {
+            NSUserDefaults::standardUserDefaults().removeObjectForKey(key);
+        }
+        self.busy = false;
+        self.publish();
+    }
 }
 
 fn activate(mtm: MainThreadMarker) {

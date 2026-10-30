@@ -171,6 +171,7 @@ impl SessionProvider for Cline {
         )
     }
 
+    #[cfg(test)]
     fn pending_count(&self) -> usize {
         self.sessions()
             .unwrap_or_default()
@@ -331,7 +332,7 @@ mod tests {
         );
         assert_eq!(session.activity, Activity::Confirmation);
         assert!(!session.approval.as_ref().unwrap().can_allow);
-        assert!(!session.allow());
+        assert!(!Cline.allow(&session));
         assert!(
             session
                 .approval

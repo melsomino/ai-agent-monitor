@@ -16,13 +16,14 @@ use std::{
     collections::BTreeMap,
 };
 
-thread_local! { static FORMS: RefCell<Vec<Retained<AnswerForm>>> = const { RefCell::new(Vec::new()) }; }
 struct Input {
     question: Question,
     choice: Option<Retained<NSPopUpButton>>,
     text: Option<Retained<NSTextField>>,
 }
-struct State {
+pub struct State {
+    monitor: crate::actors::monitor::Handle,
+    ui: crate::macos::bridge::Sender,
     session: Session,
     interaction: Interaction,
     window: OnceCell<Retained<NSWindow>>,
@@ -36,15 +37,12 @@ define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[ivars = State]
-    struct AnswerForm;
+    pub struct AnswerForm;
     unsafe impl NSObjectProtocol for AnswerForm {}
     unsafe impl NSWindowDelegate for AnswerForm {
         #[unsafe(method(windowWillClose:))]
         fn closed(&self, _notification: &NSNotification) {
-            let key = self.ivars().session.approval_key();
-            dispatch2::DispatchQueue::main().exec_async(move || {
-                FORMS.with(|forms| forms.borrow_mut().retain(|form| form.ivars().session.approval_key() != key));
-            });
+            if let Some(key)=self.key(){let _=self.ivars().ui.try_send(crate::macos::bridge::Event::FormClosed(key));}
         }
     }
     impl AnswerForm {
@@ -65,27 +63,14 @@ define_class!(
                 self.ivars().status.get().unwrap().setStringValue(ns_string!("Please answer every question."));
                 return;
             }
-            self.ivars().submit.get().unwrap().setEnabled(false);
-            self.ivars().status.get().unwrap().setStringValue(ns_string!("Sending…"));
-            let session = self.ivars().session.clone();
-            std::thread::spawn(move || {
-                let sent = session.respond(&Response::Answers(answers));
-                let key = session.approval_key();
-                dispatch2::DispatchQueue::main().exec_async(move || {
-                    let form = FORMS.with(|forms| forms.borrow().iter().find(|form| form.ivars().session.approval_key() == key).cloned());
-                    if let Some(form) = form {
-                        if sent { form.ivars().window.get().unwrap().close(); } else {
-                            form.ivars().submit.get().unwrap().setEnabled(true);
-                            form.ivars().status.get().unwrap().setStringValue(ns_string!("Could not send. The request may have changed."));
-                        }
-                    }
-                    crate::macos::menu::refresh_after_response();
-                });
-            });
+            if let Err(error)=self.ivars().monitor.submit(&self.ivars().session,Response::Answers(answers)){
+                self.ivars().submit.get().unwrap().setEnabled(true);
+                self.ivars().status.get().unwrap().setStringValue(&NSString::from_str(&error));
+            }
         }
         #[unsafe(method(openEditor:))]
         fn open_editor(&self, _sender: Option<&AnyObject>) {
-            if let Some(target) = self.ivars().session.open_target() { crate::macos::native::open_target(&target); }
+            self.ivars().monitor.open(&self.ivars().session);
         }
     }
 );
@@ -130,32 +115,78 @@ fn text(
     view.addSubview(&label);
     height
 }
-pub fn show(session: Session) {
-    show_with_draft(session, None);
+impl AnswerForm {
+    pub fn key(&self) -> Option<String> {
+        self.ivars().session.approval_key()
+    }
+    pub fn reconcile(&self, state: &crate::actors::monitor::State) {
+        let key = self.key();
+        let active = state.sessions.iter().any(|s| {
+            s.key() == self.ivars().session.key()
+                && s.approval.is_some()
+                && s.approval == self.ivars().session.approval
+        });
+        if !active {
+            if let Some(window) = self.ivars().window.get() {
+                window.close();
+            }
+            return;
+        }
+        if let Some(key) = key {
+            let phase = state.submissions.get(&key);
+            self.ivars().submit.get().unwrap().setEnabled(
+                state
+                    .sessions
+                    .iter()
+                    .find(|s| s.key() == self.ivars().session.key())
+                    .is_some_and(|s| s.authoritative)
+                    && !matches!(
+                        phase,
+                        Some(
+                            crate::actors::monitor::Submission::Sending
+                                | crate::actors::monitor::Submission::Reconciling
+                        )
+                    ),
+            );
+            self.ivars()
+                .status
+                .get()
+                .unwrap()
+                .setStringValue(&NSString::from_str(match phase {
+                    Some(crate::actors::monitor::Submission::Sending) => "Sending…",
+                    Some(crate::actors::monitor::Submission::Reconciling) => "Checking delivery…",
+                    Some(crate::actors::monitor::Submission::Failed(e)) => e,
+                    None => "",
+                }));
+        }
+    }
 }
-
-pub fn show_with_draft(session: Session, draft: Option<BTreeMap<String, Vec<String>>>) {
+pub fn show_with_draft(
+    session: Session,
+    draft: Option<BTreeMap<String, Vec<String>>>,
+    monitor: crate::actors::monitor::Handle,
+    ui: crate::macos::bridge::Sender,
+    forms: &[Retained<AnswerForm>],
+) -> Option<Retained<AnswerForm>> {
     let mtm = MainThreadMarker::new().expect("answer forms are main-thread only");
-    let existing = FORMS.with(|forms| {
-        forms
-            .borrow()
-            .iter()
-            .find(|form| form.ivars().session.approval_key() == session.approval_key())
-            .cloned()
-    });
-    if let Some(form) = existing {
+    if let Some(form) = forms
+        .iter()
+        .find(|form| form.key() == session.approval_key())
+    {
         form.ivars()
             .window
             .get()
             .unwrap()
             .makeKeyAndOrderFront(None);
-        return;
+        return None;
     }
     let interaction = session.interaction();
     if interaction.questions.is_empty() {
-        return;
+        return None;
     }
     let allocated = AnswerForm::alloc(mtm).set_ivars(State {
+        monitor,
+        ui,
         session,
         interaction,
         window: OnceCell::new(),
@@ -311,8 +342,9 @@ pub fn show_with_draft(session: Session, draft: Option<BTreeMap<String, Vec<Stri
     content.addSubview(&editor);
     window.center();
     form.ivars().window.set(window.clone()).unwrap();
-    FORMS.with(|forms| forms.borrow_mut().push(form));
+
     #[allow(deprecated)]
     NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
     window.makeKeyAndOrderFront(None);
+    Some(form)
 }

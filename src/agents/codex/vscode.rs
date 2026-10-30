@@ -8,7 +8,6 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -35,8 +34,6 @@ struct CachedLog {
     anchor: [u8; 128],
     data: LogData,
 }
-
-static LOG_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedLog>>> = OnceLock::new();
 
 fn timestamp(line: &str) -> Option<&str> {
     let stamp = line.get(..23)?;
@@ -404,7 +401,16 @@ pub fn workspaces(ids: &HashSet<String>, storage: &Path) -> HashMap<String, Path
 
 /// None means discovery is unavailable; an empty verified set means no IDE
 /// windows currently have these chats loaded. Directory existence is unrelated.
+#[derive(Default)]
+pub struct LogCache(HashMap<PathBuf, CachedLog>);
 pub fn live_sessions(ids: &HashSet<String>, storage: &Path) -> Option<LiveSessions> {
+    live_sessions_cached(ids, storage, &mut LogCache::default())
+}
+pub fn live_sessions_cached(
+    ids: &HashSet<String>,
+    storage: &Path,
+    cache: &mut LogCache,
+) -> Option<LiveSessions> {
     if ids.is_empty() {
         return Some(LiveSessions {
             complete: true,
@@ -416,11 +422,7 @@ pub fn live_sessions(ids: &HashSet<String>, storage: &Path) -> Option<LiveSessio
         return None;
     }
     let live = live_logs(&paths).ok()?;
-    let mut cache = LOG_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let resolved = resolve_live(storage, ids, &live, &mut cache);
+    let resolved = resolve_live(storage, ids, &live, &mut cache.0);
     resolved.complete.then_some(resolved)
 }
 
@@ -633,6 +635,9 @@ mod tests {
         assert_eq!(result.get(CHAT), Some(&workspace));
         assert!(!result.contains_key(OTHER));
         let session = crate::agents::sessions::Session {
+            authoritative: true,
+            interaction_data: Default::default(),
+            target: None,
             agent: "codex",
             id: CHAT.into(),
             title: "Chat".into(),
@@ -646,7 +651,10 @@ mod tests {
             approval: None,
         };
         assert_eq!(
-            crate::app::core::vscode_path(&session.open_target().unwrap()),
+            crate::app::core::vscode_path(&crate::agents::sessions::SessionProvider::open_target(
+                &crate::agents::codex::Codex::default(),
+                &session
+            )),
             Some(workspace)
         );
         fs::write(

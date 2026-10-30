@@ -18,12 +18,16 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
 /// Codex database, transcript, hook and VS Code integration.
-pub struct Codex;
+#[derive(Default)]
+pub struct Codex {
+    runtime: runtime::Runtime,
+    activity: std::cell::RefCell<HashMap<PathBuf, ActivityCheckpoint>>,
+    vscode: std::cell::RefCell<vscode::LogCache>,
+}
 
 const DESKTOP: Client = Client::Desktop {
     name: "Codex",
@@ -45,7 +49,12 @@ impl SessionProvider for Codex {
     }
 
     fn sessions(&self) -> Result<Vec<Session>> {
-        open(&crate::app::core::codex_home())
+        open(
+            &crate::app::core::codex_home(),
+            &self.runtime,
+            &self.activity,
+            &self.vscode,
+        )
     }
 
     fn previous_message(
@@ -65,11 +74,13 @@ impl SessionProvider for Codex {
         )
     }
 
+    #[cfg(test)]
     fn pending_count(&self) -> usize {
-        let requests = crate::agents::pending::list_for("codex");
-        let mut sessions = crate::app::monitor::hook_ids("codex");
-        sessions.extend(requests.iter().map(|r| r.session_id.clone()));
-        requests.len() + runtime::pending_count(&sessions)
+        self.sessions()
+            .unwrap_or_default()
+            .iter()
+            .filter(|s| s.approval.is_some())
+            .count()
     }
 
     fn open_target(&self, session: &Session) -> String {
@@ -88,7 +99,7 @@ impl SessionProvider for Codex {
             .as_ref()
             .is_some_and(|request| request.id.starts_with("ipc:"))
         {
-            runtime::interaction_for(session)
+            self.runtime.interaction_for(session)
         } else if session
             .approval
             .as_ref()
@@ -101,13 +112,30 @@ impl SessionProvider for Codex {
             crate::agents::interaction::Interaction::default()
         }
     }
+    fn deliver(
+        &self,
+        session: &Session,
+        response: &crate::agents::interaction::Response,
+    ) -> crate::agents::interaction::Delivery {
+        if session
+            .approval
+            .as_ref()
+            .is_some_and(|a| a.id.starts_with("ipc:"))
+        {
+            self.runtime.deliver_for(session, response)
+        } else if self.respond(session, response) {
+            crate::agents::interaction::Delivery::Confirmed
+        } else {
+            crate::agents::interaction::Delivery::NotSent
+        }
+    }
     fn respond(&self, session: &Session, response: &crate::agents::interaction::Response) -> bool {
         if session
             .approval
             .as_ref()
             .is_some_and(|request| request.id.starts_with("ipc:"))
         {
-            runtime::respond_for(session, response)
+            self.runtime.respond_for(session, response)
         } else {
             response == &crate::agents::interaction::Response::Action("allow".into())
                 && self.allow(session)
@@ -119,7 +147,7 @@ impl SessionProvider for Codex {
             return false;
         };
         if snapshot.id.starts_with("ipc:") {
-            return runtime::allow_for(session);
+            return self.runtime.allow_for(session);
         }
         // Resolve the opaque token and compare the complete current snapshot.
         // pending::allow revalidates once more at the write boundary.
@@ -136,7 +164,12 @@ impl SessionProvider for Codex {
     }
 }
 
-fn open(home: &Path) -> Result<Vec<Session>> {
+fn open(
+    home: &Path,
+    runtime: &runtime::Runtime,
+    cache: &std::cell::RefCell<HashMap<PathBuf, ActivityCheckpoint>>,
+    vscode_cache: &std::cell::RefCell<vscode::LogCache>,
+) -> Result<Vec<Session>> {
     // SAFETY: geteuid has no preconditions and scopes discovery to this user.
     let uid = unsafe { libc::geteuid() }.to_string();
     let mut command = Command::new("/usr/sbin/lsof");
@@ -152,7 +185,7 @@ fn open(home: &Path) -> Result<Vec<Session>> {
     let mut sessions = read_open(home, &ids)?;
     for session in &mut sessions {
         if let Some(path) = files.get(&session.id) {
-            enrich(session, path);
+            enrich_cached(session, path, &mut cache.borrow_mut());
         }
     }
     #[cfg(target_os = "macos")]
@@ -164,7 +197,9 @@ fn open(home: &Path) -> Result<Vec<Session>> {
         .collect();
     let storage =
         crate::app::core::home().join("Library/Application Support/Code/User/workspaceStorage");
-    if let Some(mut live) = vscode::live_sessions(&vscode_ids, &storage) {
+    if let Some(mut live) =
+        vscode::live_sessions_cached(&vscode_ids, &storage, &mut vscode_cache.borrow_mut())
+    {
         // A shared backend can keep writing a rollout after its IDE window closed.
         // Only a live extension host's current stream membership proves it is open.
         sessions.retain(|session| {
@@ -176,11 +211,14 @@ fn open(home: &Path) -> Result<Vec<Session>> {
     }
     let visible_ids = sessions.iter().map(|session| session.id.clone()).collect();
     let pending = crate::agents::pending::list_for("codex");
-    let mut runtime = runtime::views(&visible_ids);
+    let mut runtime = runtime.views(&visible_ids);
     for session in &mut sessions {
         if let Some(live) = runtime.remove(&session.id) {
             session.activity = live.activity;
             session.approval = live.approval;
+            session.authoritative = true;
+        } else {
+            session.authoritative = false;
         }
         let hook_approval = pending
             .iter()
@@ -391,6 +429,9 @@ fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
     statement
         .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
             Ok(Session {
+                authoritative: true,
+                interaction_data: Default::default(),
+                target: None,
                 agent: "codex",
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -408,7 +449,15 @@ fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn enrich(session: &mut Session, path: &Path) {
+    enrich_cached(session, path, &mut HashMap::new());
+}
+fn enrich_cached(
+    session: &mut Session,
+    path: &Path,
+    cache: &mut HashMap<PathBuf, ActivityCheckpoint>,
+) {
     let Ok(mut file) = fs::File::open(path) else {
         return;
     };
@@ -457,8 +506,15 @@ fn enrich(session: &mut Session, path: &Path) {
     tail.push_str(&String::from_utf8_lossy(&bytes));
     session.activity = Activity::Unknown;
     parse_events(session, &tail);
-    session.activity =
-        recover_activity(&mut file, path, &metadata, start, &bytes, session.activity);
+    session.activity = recover_activity(
+        &mut file,
+        path,
+        &metadata,
+        start,
+        &bytes,
+        session.activity,
+        cache,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -473,8 +529,6 @@ struct ActivityCheckpoint {
     activity: Activity,
 }
 
-static ACTIVITY_CACHE: OnceLock<Mutex<HashMap<PathBuf, ActivityCheckpoint>>> = OnceLock::new();
-
 fn recover_activity(
     file: &mut fs::File,
     path: &Path,
@@ -482,14 +536,9 @@ fn recover_activity(
     tail_start: u64,
     tail: &[u8],
     activity: Activity,
+    cache: &mut HashMap<PathBuf, ActivityCheckpoint>,
 ) -> Activity {
-    let cache = ACTIVITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let previous = cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(path)
-        .copied();
-    let previous = previous.filter(|checkpoint| {
+    let previous = cache.get(path).copied().filter(|checkpoint| {
         checkpoint.device == metadata.dev()
             && checkpoint.inode == metadata.ino()
             && (metadata.len() > checkpoint.length
@@ -547,7 +596,6 @@ fn recover_activity(
         anchor,
         activity,
     };
-    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
     if cache.len() >= 512 && !cache.contains_key(path) {
         cache.clear();
     }
@@ -685,6 +733,9 @@ mod tests {
             .find(|request| request.response == response)
             .unwrap();
         let mut session = Session {
+            authoritative: true,
+            interaction_data: Default::default(),
+            target: None,
             agent: "codex",
             id: "other".into(),
             title: "Chat".into(),
@@ -697,10 +748,10 @@ mod tests {
             last_message: String::new(),
             approval: Some(approval(&request)),
         };
-        assert!(!Codex.allow(&session));
+        assert!(!Codex::default().allow(&session));
         session.id = "original".into();
         session.approval.as_mut().unwrap().body = "Changed".into();
-        assert!(!Codex.allow(&session));
+        assert!(!Codex::default().allow(&session));
         assert!(!response.exists());
         assert!(crate::agents::pending::allow(&request));
     }
@@ -710,6 +761,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("large.jsonl");
         let mut session = Session {
+            authoritative: true,
+            interaction_data: Default::default(),
+            target: None,
             agent: "codex",
             id: "one".into(),
             title: "Chat".into(),
@@ -766,6 +820,9 @@ mod tests {
     #[test]
     fn reads_activity_and_last_assistant_message_without_tool_output() {
         let mut session = Session {
+            authoritative: true,
+            interaction_data: Default::default(),
+            target: None,
             agent: "codex",
             id: "one".into(),
             title: "Chat".into(),

@@ -1,5 +1,6 @@
 //! Native macOS interface, notifications and user preferences.
 pub(crate) mod answers;
+pub(crate) mod bridge;
 pub(crate) mod hotkey;
 pub(crate) mod keychain;
 pub(crate) mod menu;
@@ -11,5 +12,4 @@ pub(crate) mod onboarding;
 pub(crate) mod pointer;
 pub(crate) mod search;
 pub(crate) mod settings;
-pub(crate) mod telegram;
 pub(crate) mod terminal;

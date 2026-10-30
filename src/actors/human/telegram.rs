@@ -1,114 +1,79 @@
 //! Personal Telegram bots: the resident owns delivery, pairing and replies.
 use crate::{
+    actors::monitor,
     agents::{
         interaction::{Interaction, Response},
         sessions::Session,
     },
-    app::{core, monitor},
+    app::core,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     process::{Command, Stdio},
-    sync::{Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 
-static COMMANDS: OnceLock<mpsc::Sender<Event>> = OnceLock::new();
-static STATUS: OnceLock<Mutex<Status>> = OnceLock::new();
-#[derive(Clone, Default)]
-pub struct Status {
-    pub connected: bool,
-    pub enabled: bool,
-    pub paired: bool,
-    pub text: String,
-    pub link: Option<String>,
-    pub queued: usize,
-    pub delivered: usize,
-    pub snapshot_pending: usize,
-    pub suppressed: usize,
+pub use crate::domain::telegram::Status;
+pub fn diagnostics(status: &Status) -> Value {
+    json!({"connected":status.connected,"enabled":status.enabled,"paired":status.paired,"status":status.text,"queued":status.queued,"delivered":status.delivered,"snapshotPending":status.snapshot_pending,"suppressed":status.suppressed,"commandMenuReady":status.command_menu_ready})
 }
-fn state() -> &'static Mutex<Status> {
-    STATUS.get_or_init(|| {
-        Mutex::new(Status {
-            text: "Not connected".into(),
-            ..Status::default()
-        })
-    })
-}
-pub fn status() -> Status {
-    state().lock().unwrap().clone()
-}
-pub fn diagnostics() -> Value {
-    let status = status();
-    json!({"connected":status.connected,"enabled":status.enabled,"paired":status.paired,"status":status.text,"queued":status.queued,"delivered":status.delivered,"snapshotPending":status.snapshot_pending,"suppressed":status.suppressed})
-}
-enum Event {
+pub enum Event {
     Connect(String),
     Disconnect,
     Enable(bool),
     Sync(Vec<Session>),
     Observe(Box<Session>),
-    Resolve(String),
     Test,
     Updates(u64, Result<Value>),
 }
-fn send(event: Event) {
-    if let Some(tx) = COMMANDS.get() {
-        let _ = tx.send(event);
-    }
-}
-pub fn connect(token: String) {
-    send(Event::Connect(token));
-}
-pub fn disconnect() {
-    send(Event::Disconnect);
-}
-pub fn enable(value: bool) {
-    send(Event::Enable(value));
-}
-pub fn sync(sessions: &[Session]) {
-    if status().connected {
-        send(Event::Sync(sessions.to_vec()));
-    }
-}
-pub fn observe(session: &Session) {
-    if status().connected {
-        send(Event::Observe(Box::new(session.clone())));
-    }
-}
-pub fn resolved(key: &str) {
-    if status().connected {
-        send(Event::Resolve(key.into()));
-    }
-}
-pub fn test() {
-    send(Event::Test);
-}
-pub fn start() {
-    let (tx, rx) = mpsc::channel();
-    if COMMANDS.set(tx).is_err() {
-        return;
-    }
-    std::thread::spawn(move || {
-        let mut worker = Worker::load();
+pub async fn run(
+    mut rx: tokio::sync::mpsc::Receiver<Event>,
+    monitor: monitor::Handle,
+    tx: tokio::sync::mpsc::Sender<Event>,
+) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut snapshots = monitor.subscribe();
+        let mut worker = Worker::load(monitor, tx);
+        let mut previous = Vec::new();
         loop {
-            if let Ok(event) = rx.recv_timeout(Duration::from_millis(100)) {
+            if snapshots.has_changed().is_err() {
+                break;
+            }
+            let snapshot = snapshots.borrow_and_update().clone();
+            if snapshot.stopping {
+                worker.retire_all("Monitor stopped. Answer in the agent app.");
+                break;
+            }
+            if snapshot.sessions != previous {
+                previous = snapshot.sessions.clone();
+                worker.event(Event::Sync(previous.clone()));
+            }
+            for event in rx
+                .try_recv()
+                .into_iter()
+                .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+                .take(64)
+            {
                 worker.event(event);
             }
-            for event in rx.try_iter().take(64) {
-                worker.event(event);
-            }
+            worker.reconcile_phases(&snapshot);
             worker.flush();
             worker.update_counts();
             worker.poll();
+            std::thread::sleep(Duration::from_millis(50));
+            if rx.is_closed() {
+                break;
+            }
         }
-    });
+    })
+    .await;
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Config {
@@ -239,6 +204,7 @@ struct Pending {
     message: Option<i64>,
     question: usize,
     answers: BTreeMap<String, Vec<String>>,
+    phase: Option<monitor::Submission>,
 }
 impl Pending {
     fn new(session: Session) -> Result<Self> {
@@ -250,19 +216,17 @@ impl Pending {
             message: None,
             question: 0,
             answers: BTreeMap::new(),
+            phase: None,
         })
     }
     fn content(&self) -> (String, Value) {
-        let mut text = format!(
-            "{}\n{}\n\n{}",
-            self.session.title,
-            self.session.agent_label(),
-            self.session
-                .approval
-                .as_ref()
-                .map(|a| a.body.as_str())
-                .unwrap_or_default()
-        );
+        let body = self
+            .session
+            .approval
+            .as_ref()
+            .map(|a| a.body.trim())
+            .unwrap_or_default();
+        let mut text = format!("{}\n{body}", self.session.title);
         let mut rows = Vec::new();
         if let Some(question) = self.interaction.questions.get(self.question) {
             text.push_str(&format!(
@@ -297,6 +261,18 @@ impl Pending {
             if rows.is_empty() {
                 text.push_str("\n\nOpen the agent app to respond.");
             }
+        }
+        match &self.phase {
+            Some(monitor::Submission::Sending) => {
+                text.push_str("\n\nSending answer…");
+                rows.clear();
+            }
+            Some(monitor::Submission::Reconciling) => {
+                text.push_str("\n\nChecking whether the agent received the answer…");
+                rows.clear();
+            }
+            Some(monitor::Submission::Failed(error)) => text.push_str(&format!("\n\n{error}")),
+            None => {}
         }
         (short(&text, 3900), json!({"inline_keyboard":rows}))
     }
@@ -342,24 +318,34 @@ impl Pending {
     }
 }
 struct Worker {
+    monitor: monitor::Handle,
+    tx: tokio::sync::mpsc::Sender<Event>,
+    status: RefCell<Status>,
+    last_published: RefCell<Status>,
     token: String,
     config: Config,
     pending: HashMap<String, Pending>,
     pair: Option<(String, Instant)>,
     retry: Instant,
     generation: u64,
-    closed: HashSet<String>,
     polling: bool,
     poll_retry: Instant,
+    commands_ready: bool,
+    commands_retry: Instant,
+    outbox: VecDeque<String>,
 }
 impl Worker {
-    fn load() -> Self {
+    fn load(monitor: monitor::Handle, tx: tokio::sync::mpsc::Sender<Event>) -> Self {
         let config = fs::read(config_path())
             .ok()
             .and_then(|v| serde_json::from_slice(&v).ok())
             .unwrap_or_default();
-        let credential = super::keychain::load();
+        let credential = crate::macos::keychain::load();
         let mut worker = Self {
+            monitor,
+            tx,
+            status: RefCell::new(Status::default()),
+            last_published: RefCell::new(Status::default()),
             token: credential
                 .as_ref()
                 .ok()
@@ -370,9 +356,11 @@ impl Worker {
             pair: None,
             retry: Instant::now(),
             generation: 0,
-            closed: HashSet::new(),
             polling: false,
             poll_retry: Instant::now(),
+            commands_ready: false,
+            commands_retry: Instant::now(),
+            outbox: VecDeque::new(),
         };
         worker.publish();
         if let Err(error) = credential {
@@ -388,7 +376,7 @@ impl Worker {
         api(&self.token, method, payload)
     }
     fn publish(&self) {
-        *state().lock().unwrap() = Status {
+        *self.status.borrow_mut() = Status {
             connected: !self.token.is_empty(),
             enabled: self.config.enabled,
             paired: self.config.user.is_some(),
@@ -409,6 +397,7 @@ impl Worker {
             } else {
                 "Reconnect to pair your Telegram account.".into()
             },
+            command_menu_ready: self.commands_ready,
             snapshot_pending: 0,
             suppressed: 0,
             queued: self
@@ -426,18 +415,17 @@ impl Worker {
                 .as_ref()
                 .map(|(code, _)| format!("https://t.me/{}?start={code}", self.config.username)),
         };
+        self.emit();
     }
     fn poll(&mut self) {
         if self.polling
             || self.token.is_empty()
-            || (!self.config.enabled && self.pair.is_none())
+            || (self.config.user.is_none() && self.pair.is_none())
             || Instant::now() < self.poll_retry
         {
             return;
         }
-        let Some(tx) = COMMANDS.get().cloned() else {
-            return;
-        };
+        let tx = self.tx.clone();
         let token = self.token.clone();
         let offset = self.config.offset;
         let generation = self.generation;
@@ -450,11 +438,12 @@ impl Worker {
                 "getUpdates",
                 json!({"offset":offset,"timeout":5,"allowed_updates":["message","callback_query"]}),
             );
-            let _ = tx.send(Event::Updates(generation, updates));
+            let _ = tx.blocking_send(Event::Updates(generation, updates));
         });
     }
     fn update_counts(&self) {
-        let mut status = state().lock().unwrap();
+        let mut status = self.status.borrow_mut();
+        status.command_menu_ready = self.commands_ready;
         status.queued = self
             .pending
             .values()
@@ -465,9 +454,21 @@ impl Worker {
             .values()
             .filter(|p| p.message.is_some())
             .count();
+        drop(status);
+        self.emit();
+    }
+    fn emit(&self) {
+        let status = self.status.borrow().clone();
+        if *self.last_published.borrow() != status {
+            *self.last_published.borrow_mut() = status.clone();
+            let _ = self
+                .monitor
+                .send(monitor::Command::TelegramObserved(status));
+        }
     }
     fn note(&self, text: &str) {
-        state().lock().unwrap().text = text.to_owned();
+        self.status.borrow_mut().text = text.into();
+        self.emit();
     }
     fn save(&self) {
         if persist(&self.config).is_err() {
@@ -478,13 +479,6 @@ impl Worker {
         let (text, keyboard) = pending.content();
         self.api("editMessageText", json!({"chat_id":self.config.chat,"message_id":pending.message,"text":text,"reply_markup":keyboard}))?;
         Ok(())
-    }
-    fn retire(&mut self, key: &str, text: &str) {
-        if self.closed.len() >= 2048 {
-            self.closed.clear();
-        }
-        self.closed.insert(key.to_owned());
-        self.forget(key, text);
     }
     fn forget(&mut self, key: &str, text: &str) {
         if let Some(pending) = self.pending.remove(key)
@@ -545,8 +539,9 @@ impl Worker {
                 self.retire_all(
                     "Telegram disconnected. This request can no longer be answered here.",
                 );
-                match super::keychain::delete() {
+                match crate::macos::keychain::delete() {
                     Ok(()) => {
+                        self.outbox.clear();
                         self.token.clear();
                         self.config = Config::default();
                         self.pair = None;
@@ -575,7 +570,6 @@ impl Worker {
                 if self.config.enabled
                     && let Some(key) = session.approval_key()
                     && !self.pending.contains_key(&key)
-                    && !self.closed.contains(&key)
                     && self.pending.len() < 128
                 {
                     match Pending::new(*session) {
@@ -591,9 +585,9 @@ impl Worker {
             Event::Sync(sessions) => {
                 let live: HashSet<_> = sessions.iter().filter_map(Session::approval_key).collect();
                 {
-                    let mut status = state().lock().unwrap();
+                    let mut status = self.status.borrow_mut();
                     status.snapshot_pending = live.len();
-                    status.suppressed = live.intersection(&self.closed).count();
+                    status.suppressed = 0;
                 }
                 let stale: Vec<_> = self
                     .pending
@@ -614,7 +608,6 @@ impl Worker {
                     }
                 }
             }
-            Event::Resolve(key) => self.retire(&key, "Resolved or no longer pending."),
             Event::Test => {
                 if self.config.enabled && self.config.chat.is_some() {
                     match self.api("sendMessage",json!({"chat_id":self.config.chat,"text":"AI Agent Monitor is connected. Agent questions will appear here with answer buttons."})) {
@@ -641,11 +634,13 @@ impl Worker {
             "This bot uses a webhook. Use a dedicated bot without a webhook."
         );
         let code = nonce()?;
-        super::keychain::save(token)?;
+        crate::macos::keychain::save(token)?;
         self.retire_all("Bot reconnected. Use the latest request message.");
         self.generation += 1;
-        self.closed.clear();
         self.token = token.to_owned();
+        self.outbox.clear();
+        self.commands_ready = false;
+        self.commands_retry = Instant::now();
         self.config = Config {
             username,
             ..Config::default()
@@ -657,7 +652,28 @@ impl Worker {
         self.publish();
         Ok(())
     }
+    fn reconcile_phases(&mut self, snapshot: &monitor::State) {
+        let changed: Vec<_> = self
+            .pending
+            .iter_mut()
+            .filter_map(|(key, pending)| {
+                let phase = snapshot.submissions.get(key).cloned();
+                if pending.phase != phase {
+                    pending.phase = phase;
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for key in changed {
+            if self.pending[&key].message.is_some() {
+                let _ = self.edit(&self.pending[&key]);
+            }
+        }
+    }
     fn flush(&mut self) {
+        self.ensure_commands();
         if self
             .pair
             .as_ref()
@@ -667,14 +683,14 @@ impl Worker {
             self.publish();
             self.note("Pairing expired. Reconnect to get a new link.");
         }
-        if !self.config.enabled || self.config.chat.is_none() || Instant::now() < self.retry {
+        if self.token.is_empty() || self.config.chat.is_none() || Instant::now() < self.retry {
             return;
         }
         // One request per pass avoids bursts and leaves time for local changes.
         if let Some(key) = self
             .pending
             .iter()
-            .find(|(_, p)| p.message.is_none())
+            .find(|(_, p)| self.config.enabled && p.message.is_none())
             .map(|(k, _)| k.clone())
         {
             let (text, keyboard) = self.pending[&key].content();
@@ -695,13 +711,75 @@ impl Worker {
                     self.retry = Instant::now() + Duration::from_secs(15);
                 }
             }
+            return;
+        }
+        if let Some(text) = self.outbox.front() {
+            match self.api(
+                "sendMessage",
+                json!({"chat_id":self.config.chat,"text":text,"reply_markup":command_keyboard()}),
+            ) {
+                Ok(_) => {
+                    self.outbox.pop_front();
+                    self.retry = Instant::now() + Duration::from_secs(1);
+                }
+                Err(error) => {
+                    self.note(&error.to_string());
+                    self.retry = Instant::now() + Duration::from_secs(15);
+                }
+            }
         }
     }
+    fn ensure_commands(&mut self) {
+        let Some(chat) = self.config.chat else {
+            return;
+        };
+        if self.token.is_empty() || self.commands_ready || Instant::now() < self.commands_retry {
+            return;
+        }
+        let result = self
+            .api(
+                "setMyCommands",
+                json!({"scope":{"type":"chat","chat_id":chat},"commands":[
+                    {"command":"sessions","description":"List all open agent sessions"},
+                    {"command":"status","description":"Show monitor and notification status"},
+                    {"command":"help","description":"Show available commands"}
+                ]}),
+            )
+            .and_then(|_| {
+                self.api(
+                    "setChatMenuButton",
+                    json!({"chat_id":chat,"menu_button":{"type":"commands"}}),
+                )
+            });
+        match result {
+            Ok(_) => self.commands_ready = true,
+            Err(error) => {
+                self.note(&error.to_string());
+                self.commands_retry = Instant::now() + Duration::from_secs(30);
+            }
+        }
+    }
+    fn paired(&self, user: i64, chat: i64, kind: &str) -> bool {
+        self.config.user == Some(user) && self.config.chat == Some(chat) && kind == "private"
+    }
+    fn command(&mut self, command: BotCommand) -> Result<()> {
+        let messages = match command {
+            BotCommand::Sessions => {
+                session_messages(&self.monitor.snapshot().sessions)
+            }
+            BotCommand::Status => vec![format!("AI Agent Monitor {}\nNotifications: {}\nPending questions: {}",
+                core::VERSION, if self.config.enabled {"enabled"} else {"paused"}, self.pending.len())],
+            BotCommand::Help => vec!["/sessions — List all open sessions, including idle sessions\n/status — Monitor and notification status\n/help — Show these commands\n\nUse answer buttons on question messages, or reply to one to enter a custom answer.\nCommands require your Mac and monitor to be running.".into()],
+        };
+        anyhow::ensure!(
+            self.outbox.len() + messages.len() <= 128,
+            "Previous command replies are still sending. Please try again shortly."
+        );
+        self.outbox.extend(messages);
+        Ok(())
+    }
     fn authorized(&self, user: i64, chat: i64, kind: &str) -> bool {
-        self.config.enabled
-            && self.config.user == Some(user)
-            && self.config.chat == Some(chat)
-            && kind == "private"
+        self.config.enabled && self.paired(user, chat, kind)
     }
     fn update(&mut self, update: &Value) {
         if let Some(message) = update.get("message") {
@@ -718,7 +796,16 @@ impl Worker {
                 self.pair = None;
                 self.save();
                 self.publish();
-                let _=self.api("sendMessage",json!({"chat_id":chat,"text":"Paired with AI Agent Monitor. You can now receive and answer agent questions here."}));
+                let _=self.api("sendMessage",json!({"chat_id":chat,"text":"Paired with AI Agent Monitor. Use /sessions to list open sessions, or the command buttons below.","reply_markup":command_keyboard()}));
+                return;
+            }
+            if !self.paired(user, chat, kind) {
+                return;
+            }
+            if let Some(command) = bot_command(text, &self.config.username) {
+                if let Err(error) = self.command(command) {
+                    let _ = self.api("sendMessage", json!({"chat_id":chat,"text":error.to_string(),"reply_markup":command_keyboard()}));
+                }
                 return;
             }
             if !self.authorized(user, chat, kind) {
@@ -749,7 +836,7 @@ impl Worker {
             if self.authorized(user, chat, kind) {
                 if let Some((key, index)) = self.callback_key(callback) {
                     feedback = match self.answer(&key, Some(index), None) {
-                        Ok(()) => "Answer received.".into(),
+                        Ok(()) => "Answer queued.".into(),
                         Err(error) => error.to_string(),
                     };
                 }
@@ -785,13 +872,12 @@ impl Worker {
             .pending
             .get(key)
             .context("This request is no longer available.")?;
-        // Re-read live state immediately before any remote response is accepted.
-        let sessions = crate::agents::sessions::open().map_err(|_| {
-            anyhow::anyhow!("Could not check the current request. Please try again.")
-        })?;
-        let current = sessions
-            .into_iter()
-            .find(|s| s.key() == pending.session.key() && s.approval == pending.session.approval);
+        let snapshot = self.monitor.snapshot();
+        let current = snapshot
+            .sessions
+            .iter()
+            .find(|s| s.key() == pending.session.key() && s.approval == pending.session.approval)
+            .cloned();
         let Some(current) = current else {
             self.forget(key, "Resolved or no longer pending.");
             bail!("This request is no longer pending.");
@@ -800,14 +886,24 @@ impl Worker {
             current.interaction() == pending.interaction,
             "The question changed. Answer it in the agent app."
         );
+        anyhow::ensure!(
+            current.authoritative,
+            "The agent connection is being checked. Try again shortly."
+        );
+        anyhow::ensure!(
+            !matches!(
+                snapshot.submissions.get(key),
+                Some(monitor::Submission::Sending | monitor::Submission::Reconciling)
+            ),
+            "The answer is already being sent."
+        );
         let mut pending = self.pending[key].clone();
         let response = pending.choose(index, text)?;
         if let Some(response) = response {
-            anyhow::ensure!(
-                monitor::respond(&current, &response),
-                "Could not send the answer. The request may have changed; try again."
-            );
-            self.retire(key, "Answered from Telegram.");
+            self.monitor
+                .submit(&current, response)
+                .map_err(anyhow::Error::msg)?;
+            // Do not resolve locally. Every channel observes the Monitor's next state.
         } else {
             self.edit(&pending)?;
             self.pending.insert(key.to_owned(), pending);
@@ -815,6 +911,87 @@ impl Worker {
         Ok(())
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BotCommand {
+    Sessions,
+    Status,
+    Help,
+}
+fn bot_command(text: &str, username: &str) -> Option<BotCommand> {
+    let command = text.split_whitespace().next()?;
+    let command = if let Some((command, target)) = command.split_once('@') {
+        if !target.eq_ignore_ascii_case(username) {
+            return None;
+        }
+        command
+    } else {
+        command
+    };
+    match command {
+        "/sessions" => Some(BotCommand::Sessions),
+        "/status" => Some(BotCommand::Status),
+        "/help" | "/start" => Some(BotCommand::Help),
+        _ => None,
+    }
+}
+fn command_keyboard() -> Value {
+    json!({"keyboard":[[{"text":"/sessions"},{"text":"/status"}],[{"text":"/help"}]],
+        "resize_keyboard":true,"is_persistent":true,"input_field_placeholder":"Choose a command or reply to a question"})
+}
+fn session_messages(sessions: &[Session]) -> Vec<String> {
+    if sessions.is_empty() {
+        return vec!["No open agent sessions.".into()];
+    }
+    let mut sessions: Vec<_> = sessions.iter().collect();
+    sessions.sort_by_key(|session| {
+        (
+            session.client.label().to_lowercase(),
+            session.title.to_lowercase(),
+            session.agent,
+            session.id.as_str(),
+        )
+    });
+    let mut messages = Vec::new();
+    let mut page = format!("Open sessions ({})", sessions.len());
+    let mut group = "";
+    for session in sessions {
+        let app = session.client.label();
+        let title = short(
+            &session
+                .title
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            180,
+        );
+        let status = if session.approval.is_some() {
+            "Needs response"
+        } else {
+            session.activity.label()
+        };
+        let heading = if group != app {
+            format!("\n\n{app}")
+        } else {
+            String::new()
+        };
+        let line = format!("\n• {title} · {} · {status}", session.agent_label());
+        if page.encode_utf16().count()
+            + heading.encode_utf16().count()
+            + line.encode_utf16().count()
+            > 3900
+        {
+            messages.push(page);
+            page = format!("Open sessions (continued)\n\n{app}{line}");
+        } else {
+            page.push_str(&heading);
+            page.push_str(&line);
+        }
+        group = app;
+    }
+    messages.push(page);
+    messages
+}
+
 fn pairing_matches(user: i64, chat: i64, kind: &str, text: &str, code: &str, valid: bool) -> bool {
     valid
         && user > 0
@@ -832,6 +1009,9 @@ mod tests {
     };
     fn session() -> Session {
         Session {
+            authoritative: true,
+            interaction_data: Default::default(),
+            target: None,
             agent: "codex",
             id: "session".into(),
             title: "A chat".into(),
@@ -858,10 +1038,15 @@ mod tests {
             message: Some(50),
             question: 0,
             answers: BTreeMap::new(),
+            phase: None,
         }
     }
     fn worker() -> Worker {
         Worker {
+            monitor: monitor::Handle::testing(),
+            tx: tokio::sync::mpsc::channel(128).0,
+            status: RefCell::new(Status::default()),
+            last_published: RefCell::new(Status::default()),
             token: String::new(),
             config: Config {
                 enabled: true,
@@ -873,9 +1058,11 @@ mod tests {
             pair: None,
             retry: Instant::now(),
             generation: 0,
-            closed: HashSet::new(),
             polling: false,
             poll_retry: Instant::now(),
+            commands_ready: false,
+            commands_retry: Instant::now(),
+            outbox: VecDeque::new(),
         }
     }
     fn question(id: &str, freeform: bool) -> Question {
@@ -1052,15 +1239,6 @@ mod tests {
         );
     }
     #[test]
-    fn resolved_requests_cannot_be_requeued_by_a_delayed_snapshot() {
-        let mut worker = worker();
-        let session = session();
-        let key = session.approval_key().unwrap();
-        worker.event(Event::Resolve(key.clone()));
-        worker.event(Event::Observe(Box::new(session)));
-        assert!(!worker.pending.contains_key(&key));
-    }
-    #[test]
     fn temporary_discovery_gaps_do_not_permanently_suppress_a_question() {
         let mut worker = worker();
         let session = session();
@@ -1069,7 +1247,6 @@ mod tests {
         assert!(worker.pending.contains_key(&key));
         worker.event(Event::Sync(vec![]));
         assert!(!worker.pending.contains_key(&key));
-        assert!(!worker.closed.contains(&key));
         worker.event(Event::Sync(vec![session]));
         assert!(worker.pending.contains_key(&key));
     }
@@ -1081,12 +1258,78 @@ mod tests {
         let key = session.approval_key().unwrap();
         worker.event(Event::Observe(Box::new(session)));
         assert!(worker.pending.contains_key(&key));
-        worker.event(Event::Resolve(key.clone()));
+        worker.event(Event::Sync(vec![]));
         assert!(!worker.pending.contains_key(&key));
         assert!(worker.polling);
         // Results of a poll from an old pairing/enable generation have no authority.
         worker.event(Event::Updates(99, Ok(json!([{"update_id":1000}]))));
         assert_eq!(worker.config.offset, 0);
         assert!(!worker.polling);
+    }
+    #[test]
+    fn commands_match_text_buttons_and_bot_addressing() {
+        assert_eq!(
+            bot_command("/sessions", "my_bot"),
+            Some(BotCommand::Sessions)
+        );
+        assert_eq!(
+            bot_command("/sessions@MY_BOT", "my_bot"),
+            Some(BotCommand::Sessions)
+        );
+        assert_eq!(bot_command("/status", "my_bot"), Some(BotCommand::Status));
+        assert_eq!(bot_command("/help", "my_bot"), Some(BotCommand::Help));
+        assert_eq!(bot_command("/start", "my_bot"), Some(BotCommand::Help));
+        assert_eq!(bot_command("/sessions@other_bot", "my_bot"), None);
+        assert_eq!(bot_command("ordinary answer", "my_bot"), None);
+        assert_eq!(command_keyboard()["keyboard"][0][0]["text"], "/sessions");
+    }
+    #[test]
+    fn session_list_includes_idle_sessions_groups_sorts_and_paginates() {
+        let mut a = session();
+        a.title = "Zulu".into();
+        a.approval = None;
+        a.activity = Activity::Idle;
+        let mut b = a.clone();
+        b.title = "Alpha".into();
+        b.activity = Activity::Working;
+        let text = session_messages(&[a.clone(), b]).join("\n");
+        assert!(text.contains("Terminal"));
+        assert!(text.contains("Idle"));
+        assert!(text.contains("Working"));
+        assert!(text.find("Alpha").unwrap() < text.find("Zulu").unwrap());
+        assert_eq!(session_messages(&[]), vec!["No open agent sessions."]);
+        a.title = "🤖".repeat(200);
+        let pages = session_messages(&vec![a; 100]);
+        assert!(pages.len() > 1);
+        assert!(pages.iter().all(|page| page.encode_utf16().count() <= 3900));
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page.matches("• ").count())
+                .sum::<usize>(),
+            100
+        );
+    }
+    #[test]
+    fn paused_notifications_allow_paired_commands_but_not_answers() {
+        let mut worker = worker();
+        worker.config.enabled = false;
+        assert!(worker.paired(42, 42, "private"));
+        assert!(!worker.authorized(42, 42, "private"));
+        assert!(!worker.paired(99, 42, "private"));
+        assert!(!worker.paired(42, 42, "group"));
+    }
+    #[test]
+    fn command_dispatch_rejects_unpaired_users_and_works_while_paused() {
+        let mut worker = worker();
+        worker.config.username = "my_bot".into();
+        worker.config.enabled = false;
+        worker.update(
+            &json!({"message":{"from":{"id":99},"chat":{"id":42,"type":"private"},"text":"/help"}}),
+        );
+        assert!(worker.outbox.is_empty());
+        worker.update(&json!({"message":{"from":{"id":42},"chat":{"id":42,"type":"private"},"text":"/help@my_bot"}}));
+        assert_eq!(worker.outbox.len(), 1);
+        assert!(worker.outbox.front().unwrap().contains("/sessions"));
     }
 }

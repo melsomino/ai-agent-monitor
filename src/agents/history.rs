@@ -10,11 +10,7 @@ use std::{
     path::Path,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Message {
-    pub cursor: String,
-    pub text: String,
-}
+pub use crate::domain::history::Message;
 pub struct Record {
     pub text: String,
     pub kind: u8,

@@ -8,6 +8,7 @@ name = "AIAgentMonitor"
 path = "src/main.rs"
 
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
 json5 = "1"

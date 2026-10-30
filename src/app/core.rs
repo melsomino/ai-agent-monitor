@@ -214,7 +214,7 @@ pub fn vscode_path(value: &str) -> Option<PathBuf> {
         .ok()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Notification {
     pub title: String,
     pub body: String,
@@ -244,6 +244,7 @@ pub fn notification(event: &Value) -> Option<Notification> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Allow,
+    #[allow(dead_code)]
     Open,
 }
 
@@ -307,23 +308,6 @@ pub fn approval_directory() -> io::Result<tempfile::TempDir> {
         .prefix("agent-monitor-approval-")
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in("/tmp")
-}
-
-pub fn deliver(event: &Value, approval: bool) -> Result<Option<Action>> {
-    let Some(content) = notification(event) else {
-        return Ok(None);
-    };
-    let mut event = event.clone();
-    event["_agent"] = "codex".into();
-    deliver_content(&content, &event, approval)
-}
-
-pub fn deliver_content(
-    content: &Notification,
-    event: &Value,
-    approval: bool,
-) -> Result<Option<Action>> {
-    crate::app::monitor::ask(content, event, approval)
 }
 
 pub fn decision(action: Option<Action>, test: bool) -> Option<Value> {

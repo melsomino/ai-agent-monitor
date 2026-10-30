@@ -3,10 +3,7 @@ use crate::agents::{
     interaction::{Interaction, Response},
     sessions::Session,
 };
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::{Mutex, OnceLock},
-};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -109,64 +106,49 @@ impl Plan {
     }
 }
 fn next_category() -> String {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static EPOCH: OnceLock<u128> = OnceLock::new();
-    let epoch = EPOCH.get_or_init(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    });
     format!(
-        "AGENT_DYNAMIC_{}_{}_{}",
+        "AGENT_DYNAMIC_{}_{}",
         std::process::id(),
-        epoch,
-        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        crate::app::ids::nonce()
     )
 }
-
 #[derive(Clone)]
 pub struct Binding {
     pub session: Session,
     pub plan: Plan,
 }
-static BINDINGS: OnceLock<Mutex<HashMap<String, Binding>>> = OnceLock::new();
-fn bindings() -> &'static Mutex<HashMap<String, Binding>> {
-    BINDINGS.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+pub struct Bindings {
+    values: HashMap<String, Binding>,
 }
-pub fn bind(session: &Session) -> Option<Plan> {
-    let key = session.approval_key()?;
-    let plan = Plan::new(&session.interaction());
-    bindings().lock().unwrap().insert(
-        key,
-        Binding {
-            session: session.clone(),
-            plan: plan.clone(),
-        },
-    );
-    Some(plan)
-}
-pub fn lookup(key: &str, category: &str) -> Option<Binding> {
-    bindings()
-        .lock()
-        .unwrap()
-        .get(key)
-        .filter(|binding| binding.plan.category() == category)
-        .cloned()
-}
-pub fn active(key: &str) -> bool {
-    bindings().lock().unwrap().contains_key(key)
-}
-pub fn remove(key: &str) -> bool {
-    bindings().lock().unwrap().remove(key).is_some()
-}
-pub fn categories() -> HashSet<String> {
-    bindings()
-        .lock()
-        .unwrap()
-        .values()
-        .map(|binding| binding.plan.category())
-        .collect()
+impl Bindings {
+    pub fn bind(&mut self, session: &Session) -> Option<Plan> {
+        let key = session.approval_key()?;
+        let plan = Plan::new(&session.interaction());
+        self.values.insert(
+            key,
+            Binding {
+                session: session.clone(),
+                plan: plan.clone(),
+            },
+        );
+        Some(plan)
+    }
+    pub fn lookup(&self, key: &str, category: &str) -> Option<Binding> {
+        self.values
+            .get(key)
+            .filter(|b| b.plan.category() == category)
+            .cloned()
+    }
+    pub fn active(&self, key: &str) -> bool {
+        self.values.contains_key(key)
+    }
+    pub fn remove(&mut self, key: &str) -> bool {
+        self.values.remove(key).is_some()
+    }
+    pub fn plans(&self) -> Vec<Plan> {
+        self.values.values().map(|b| b.plan.clone()).collect()
+    }
 }
 
 #[cfg(test)]

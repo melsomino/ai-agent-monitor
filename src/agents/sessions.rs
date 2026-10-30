@@ -1,22 +1,15 @@
 //! Agent-independent session snapshots and backend dispatch.
 use crate::agents::interaction::{Interaction, Response};
+pub use crate::domain::session::{Activity, Approval, Client, Session};
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
 
 /// A provider-owned opaque token plus the information needed by the UI.
 /// The provider must revalidate this snapshot before sending any response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Approval {
-    pub id: String,
-    pub body: String,
-    pub expires: u64,
-    pub can_allow: bool,
-}
-
 /// Backend boundary: discovery is read-only; approval is an explicit action.
-pub trait SessionProvider: Sync {
+pub trait SessionProvider: Send {
     fn id(&self) -> &'static str;
     fn sessions(&self) -> Result<Vec<Session>>;
+    #[cfg(test)]
     fn pending_count(&self) -> usize;
     fn previous_message(
         &self,
@@ -36,6 +29,17 @@ pub trait SessionProvider: Sync {
             Interaction::allow()
         } else {
             Interaction::default()
+        }
+    }
+    fn deliver(
+        &self,
+        session: &Session,
+        response: &Response,
+    ) -> crate::agents::interaction::Delivery {
+        if self.respond(session, response) {
+            crate::agents::interaction::Delivery::Confirmed
+        } else {
+            crate::agents::interaction::Delivery::NotSent
         }
     }
     fn respond(&self, session: &Session, response: &Response) -> bool {
@@ -70,17 +74,6 @@ impl Registry<'_> {
             );
             sessions.extend(discovered);
         }
-        for pending in crate::app::monitor::hook_sessions() {
-            if let Some(session) = sessions
-                .iter_mut()
-                .find(|session| session.key() == pending.key())
-            {
-                session.activity = Activity::Confirmation;
-                session.approval = pending.approval;
-            } else {
-                sessions.push(pending);
-            }
-        }
         let mut branches = std::collections::HashMap::new();
         for session in &mut sessions {
             session.git_branch = branches
@@ -88,22 +81,34 @@ impl Registry<'_> {
                 .or_insert_with_key(|directory| crate::app::git::branch(directory))
                 .clone();
         }
+        for session in &mut sessions {
+            if let Some(provider) = self.provider(session.agent) {
+                session.interaction_data = provider.interaction(session);
+                session.target = Some(provider.open_target(session));
+                #[cfg(target_os = "macos")]
+                if session.client == Client::Terminal {
+                    session.target = Some(crate::macos::terminal::target(session));
+                }
+            }
+        }
         Ok(sessions)
     }
 
+    #[cfg(test)]
     fn pending_count(&self) -> usize {
         self.0
             .iter()
             .map(|provider| provider.pending_count())
             .sum::<usize>()
-            + crate::app::monitor::hook_sessions().len()
     }
 
+    #[cfg(test)]
     fn open_target(&self, session: &Session) -> Option<String> {
         self.provider(session.agent)
             .map(|provider| provider.open_target(session))
     }
 
+    #[cfg(test)]
     fn allow(&self, session: &Session) -> bool {
         session
             .approval
@@ -115,165 +120,15 @@ impl Registry<'_> {
     }
 }
 
-fn registry() -> Registry<'static> {
-    Registry(crate::agents::providers())
+pub fn adapters() -> Vec<Box<dyn SessionProvider>> {
+    vec![
+        Box::new(crate::agents::codex::Codex::default()),
+        Box::new(crate::agents::claude::Claude),
+        Box::new(crate::agents::cline::Cline),
+    ]
 }
-
-pub fn open() -> Result<Vec<Session>> {
-    registry().sessions()
-}
-
-pub fn pending_count() -> usize {
-    registry().pending_count()
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Client {
-    Terminal,
-    VSCode,
-    Desktop {
-        name: &'static str,
-        app_path: &'static str,
-    },
-    #[default]
-    Unknown,
-}
-impl Client {
-    /// Stable settings identity independent of the displayed group name.
-    pub fn application_id(self) -> String {
-        match self {
-            Self::VSCode => "com.microsoft.VSCode".into(),
-            Self::Terminal => "terminal".into(),
-            Self::Desktop { app_path, .. } => format!("desktop:{app_path}"),
-            Self::Unknown => "other".into(),
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Terminal => "Terminal",
-            Self::VSCode => "VS Code",
-            Self::Desktop { name, .. } => name,
-            Self::Unknown => "Unknown",
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Activity {
-    Working,
-    Idle,
-    Confirmation,
-    #[default]
-    Unknown,
-}
-impl Activity {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Working => "Working",
-            Self::Idle => "Idle",
-            Self::Confirmation => "Needs response",
-            Self::Unknown => "Unknown status",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Session {
-    pub agent: &'static str,
-    pub id: String,
-    pub title: String,
-    pub cwd: PathBuf,
-    pub workspace: Option<PathBuf>,
-    pub git_branch: Option<String>,
-    pub updated_at: i64,
-    pub client: Client,
-    pub activity: Activity,
-    pub last_message: String,
-    pub approval: Option<Approval>,
-}
-
-impl Session {
-    pub fn agent_label(&self) -> &str {
-        match self.agent {
-            "codex" => "Codex",
-            "claude" => "Claude Code",
-            "cline" => "Cline",
-            other => other,
-        }
-    }
-
-    pub fn project_path(&self) -> &Path {
-        self.workspace.as_deref().unwrap_or(&self.cwd)
-    }
-
-    pub fn working_directory(&self) -> &Path {
-        match self.workspace.as_deref() {
-            Some(path)
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "code-workspace") =>
-            {
-                // A multi-root workspace file does not identify one project directory.
-                &self.cwd
-            }
-            _ => self.project_path(),
-        }
-    }
-
-    /// UI identity includes the backend; native session IDs may overlap.
-    pub fn key(&self) -> String {
-        format!("{}:{}", self.agent, self.id)
-    }
-
-    /// Request identity is independent of the session's next approval.
-    pub fn approval_key(&self) -> Option<String> {
-        self.approval
-            .as_ref()
-            .map(|approval| format!("{}:{}", self.agent, approval.id))
-    }
-
-    pub fn open_target(&self) -> Option<String> {
-        #[cfg(target_os = "macos")]
-        if self.client == Client::Terminal {
-            return Some(crate::macos::terminal::target(self));
-        }
-        crate::app::monitor::hook_target(self).or_else(|| registry().open_target(self))
-    }
-
-    pub fn interaction(&self) -> Interaction {
-        registry()
-            .provider(self.agent)
-            .map(|provider| provider.interaction(self))
-            .unwrap_or_default()
-    }
-
-    pub fn previous_message(
-        &self,
-        before: Option<&str>,
-    ) -> Result<Option<crate::agents::history::Message>> {
-        registry()
-            .provider(self.agent)
-            .context("Unknown agent")?
-            .previous_message(self, before)
-    }
-
-    pub fn respond(&self, response: &Response) -> bool {
-        crate::app::monitor::respond(self, response)
-    }
-
-    pub(crate) fn respond_agent(&self, response: &Response) -> bool {
-        if response == &Response::Action("allow".into()) {
-            return registry().allow(self);
-        }
-        self.approval.is_some()
-            && registry()
-                .provider(self.agent)
-                .is_some_and(|provider| provider.respond(self, response))
-    }
-
-    #[cfg(test)]
-    pub fn allow(&self) -> bool {
-        self.respond(&Response::Action("allow".into()))
-    }
+pub fn observe(provider: &dyn SessionProvider) -> Result<Vec<Session>> {
+    Registry(&[provider]).sessions()
 }
 
 #[cfg(test)]
@@ -299,6 +154,9 @@ mod tests {
         }
         fn sessions(&self) -> Result<Vec<Session>> {
             Ok(vec![Session {
+                authoritative: true,
+                interaction_data: Default::default(),
+                target: None,
                 agent: self.id,
                 id: "same-chat".into(),
                 title: "Chat".into(),
@@ -317,6 +175,7 @@ mod tests {
                 }),
             }])
         }
+        #[cfg(test)]
         fn pending_count(&self) -> usize {
             1
         }
@@ -378,6 +237,7 @@ mod tests {
             fn sessions(&self) -> Result<Vec<Session>> {
                 FakeAgent::new("other").sessions()
             }
+            #[cfg(test)]
             fn pending_count(&self) -> usize {
                 0
             }

@@ -84,6 +84,7 @@ impl SessionProvider for Claude {
         )
     }
 
+    #[cfg(test)]
     fn pending_count(&self) -> usize {
         pending::list_for("claude").len()
     }
@@ -215,28 +216,7 @@ pub fn hook(
     }
     r.updated = tracking::now();
     tracking::save(root, &r)?;
-    if notify && kind == "PermissionRequest" {
-        let tool = event["tool_name"].as_str().unwrap_or("tool");
-        let body = event["tool_input"]["description"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| core::shorten(s, 1000))
-            .unwrap_or_else(|| format!("Allow {tool} in {}?", r.cwd.display()));
-        let content = core::Notification {
-            title: r.title.clone(),
-            body,
-            target: core::vscode_file_target(&r.cwd),
-        };
-        let mut request = event.clone();
-        request["_agent"] = "claude".into();
-        let action = core::deliver_content(&content, &request, true)?;
-        if action == Some(core::Action::Allow) {
-            r.status = "working".into();
-            r.updated = tracking::now();
-            tracking::save(root, &r)?;
-        }
-        return Ok(core::decision(action, false));
-    }
+    let _ = notify;
     Ok(None)
 }
 

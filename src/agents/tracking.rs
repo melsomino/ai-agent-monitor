@@ -232,6 +232,9 @@ pub fn owner(agent: &str) -> Result<(u32, String, String)> {
 }
 pub fn snapshot(r: &Record) -> Session {
     Session {
+        authoritative: true,
+        interaction_data: Default::default(),
+        target: None,
         agent: if r.agent == "claude" {
             "claude"
         } else {

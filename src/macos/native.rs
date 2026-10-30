@@ -3,10 +3,10 @@ use crate::app::cli::NativeCommand;
 use crate::app::core;
 use anyhow::{Context, Result, bail};
 use block2::{DynBlock, RcBlock};
-use dispatch2::DispatchQueue;
 use objc2::{
-    ClassType, MainThreadMarker, MainThreadOnly, define_class, msg_send,
-    rc::Retained,
+    AllocAnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class,
+    msg_send,
+    rc::{Allocated, Retained},
     runtime::{Bool, ProtocolObject},
 };
 use objc2_app_kit::{
@@ -20,14 +20,25 @@ use objc2_foundation::{
 use objc2_user_notifications::*;
 use std::ptr::NonNull;
 
+#[derive(Default)]
+struct ApplicationState {
+    controller: std::cell::OnceCell<Retained<crate::macos::menu::MenuController>>,
+}
 define_class!(
     // SAFETY: NSApplication permits event-loop subclassing. All AppKit events
     // and the sessions controller are confined to the main thread.
     #[unsafe(super(NSApplication))]
     #[thread_kind = MainThreadOnly]
+    #[ivars=ApplicationState]
     struct MonitorApplication;
     unsafe impl NSObjectProtocol for MonitorApplication {}
     impl MonitorApplication {
+        #[unsafe(method_id(init))]
+        fn init(this: Allocated<Self>) -> Retained<Self> {
+            let this = this.set_ivars(ApplicationState::default());
+            // SAFETY: Initialize our state before AppKit creates the shared application.
+            unsafe { msg_send![super(this), init] }
+        }
         #[unsafe(method_id(nextEventMatchingMask:untilDate:inMode:dequeue:))]
         fn next_event(&self, mask: NSEventMask, expiration: Option<&NSDate>, mode: &NSRunLoopMode, dequeue: bool) -> Option<Retained<NSEvent>> {
             loop {
@@ -37,7 +48,7 @@ define_class!(
                 };
                 let Some(event) = event else { break None; };
                 if dequeue && event.r#type() == NSEventType::KeyDown
-                    && crate::macos::menu::handle_menu_key(&event)
+                    && self.ivars().controller.get().is_some_and(|c|c.handle_session_key(&event))
                 {
                     continue;
                 }
@@ -85,18 +96,24 @@ fn info_string(info: &NSDictionary, key: &NSString) -> String {
         .unwrap_or_default()
 }
 
+#[derive(Clone)]
+pub struct NotificationInput {
+    pub action: String,
+    pub key: String,
+    pub category: String,
+    pub target: String,
+    pub text: Option<String>,
+}
+struct NotificationDelegateState {
+    input: tokio::sync::mpsc::Sender<NotificationInput>,
+    monitor: crate::actors::monitor::Handle,
+    ui: crate::macos::bridge::Sender,
+}
 define_class!(
-    // SAFETY: NSObject has no additional subclassing requirements. This class
-    // has no ivars and no main-thread-bound state; callbacks dispatch UI work.
     #[unsafe(super(NSObject))]
-    #[name = "AIAgentMonitorRustDelegate"]
+    #[ivars=NotificationDelegateState]
     struct NotificationDelegate;
-
-    // SAFETY: NSObjectProtocol has no extra requirements.
     unsafe impl NSObjectProtocol for NotificationDelegate {}
-
-    // SAFETY: Signatures match UNUserNotificationCenterDelegate. The completion
-    // handlers are called exactly once; any AppKit UI work runs on the main queue.
     unsafe impl UNUserNotificationCenterDelegate for NotificationDelegate {
         #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
         fn received(
@@ -105,113 +122,41 @@ define_class!(
             response: &UNNotificationResponse,
             completion: &DynBlock<dyn Fn()>,
         ) {
-            let action = response.actionIdentifier().to_string();
-            let info = response.notification().request().content().userInfo();
-            let target = info_string(&info, ns_string!("target"));
-            // SAFETY: These immutable framework constants are valid NSStrings.
-            let is_default = unsafe { action == UNNotificationDefaultActionIdentifier.to_string() };
-            if let Some(index) = action
-                .strip_prefix("AGENT_REPLY_")
-                .and_then(|index| index.parse::<usize>().ok())
-            {
-                let key = info_string(&info, ns_string!("requestKey"));
-                let category = response
-                    .notification()
-                    .request()
-                    .content()
-                    .categoryIdentifier()
-                    .to_string();
-                let binding = crate::macos::notification_actions::lookup(&key, &category);
-                let text = response
+            let content = response.notification().request().content();
+            let info = content.userInfo();
+            let input = NotificationInput {
+                action: response.actionIdentifier().to_string(),
+                key: info_string(&info, ns_string!("requestKey")),
+                category: content.categoryIdentifier().to_string(),
+                target: info_string(&info, ns_string!("target")),
+                text: response
                     .downcast_ref::<UNTextInputNotificationResponse>()
-                    .map(|response| response.userText().to_string());
-                let identifier = response.notification().request().identifier().to_string();
-                completion.call(());
-                if let Some(binding) = binding {
-                    use crate::macos::notification_actions::Kind;
-                    let button = binding.plan.buttons.get(index).cloned();
-                    let reply = binding.plan.response(index, text.as_deref());
-                    if let Some(reply) = reply {
-                        std::thread::spawn(move || {
-                            let sent = binding.session.respond(&reply);
-                            DispatchQueue::main().exec_async(move || {
-                                if sent {
-                                    remove_session_notification(&key);
-                                } else {
-                                    let draft = match reply {
-                                        crate::agents::interaction::Response::Answers(answers) => {
-                                            Some(answers)
-                                        }
-                                        _ => None,
-                                    };
-                                    let form = !binding.session.interaction().questions.is_empty();
-                                    crate::macos::menu::show_notification_request(
-                                        binding.session,
-                                        form,
-                                        draft,
-                                    );
-                                }
-                                crate::macos::menu::refresh_after_response();
-                                if !crate::macos::menu::is_resident() {
-                                    std::process::exit(0);
-                                }
-                            });
+                    .map(|r| r.userText().to_string()),
+            };
+            if let Err(error) = self.ivars().input.try_send(input) {
+                let input = error.into_inner();
+                if let Some(session) = self
+                    .ivars()
+                    .monitor
+                    .snapshot()
+                    .sessions
+                    .iter()
+                    .find(|s| s.approval_key().as_deref() == Some(input.key.as_str()))
+                    .cloned()
+                {
+                    let form = !session.interaction().questions.is_empty();
+                    let _ = self
+                        .ivars()
+                        .ui
+                        .try_send(crate::macos::bridge::Event::ShowRequest {
+                            session: Box::new(session),
+                            form,
+                            draft: None,
                         });
-                    } else {
-                        DispatchQueue::main().exec_async(move || {
-                            match button.map(|button| button.kind) {
-                                Some(Kind::Form) => crate::macos::menu::show_notification_request(
-                                    binding.session,
-                                    true,
-                                    None,
-                                ),
-                                Some(Kind::More) => {
-                                    let form = !binding.session.interaction().questions.is_empty();
-                                    crate::macos::menu::show_notification_request(
-                                        binding.session,
-                                        form,
-                                        None,
-                                    );
-                                }
-                                Some(Kind::Text) => crate::macos::menu::show_notification_request(
-                                    binding.session,
-                                    true,
-                                    None,
-                                ),
-                                _ => {
-                                    open_target(&target);
-                                }
-                            }
-                        });
-                    }
-                } else {
-                    DispatchQueue::main().exec_async(move || {
-                        remove_notification(&identifier);
-                        open_target(&target);
-                        if !crate::macos::menu::is_resident() {
-                            std::process::exit(0);
-                        }
-                    });
                 }
-                return;
             }
-            // Old notifications may outlive an upgrade. They cannot bypass the
-            // monitor's current request store; take the user to the agent instead.
-            let hook_key = info_string(&info, ns_string!("requestKey"));
             completion.call(());
-            DispatchQueue::main().exec_async(move || {
-                if is_default {
-                    crate::app::monitor::defer_hook(&hook_key);
-                }
-                if is_default || action == "ALLOW_ONCE" {
-                    open_target(&target);
-                }
-                if !crate::macos::menu::is_resident() {
-                    std::process::exit(0);
-                }
-            });
         }
-
         #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
         fn present(
             &self,
@@ -220,6 +165,7 @@ define_class!(
             completion: &DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
         ) {
             completion.call((UNNotificationPresentationOptions::Banner
+                | UNNotificationPresentationOptions::List
                 | UNNotificationPresentationOptions::Sound,));
         }
     }
@@ -241,10 +187,9 @@ fn remove_stale_notifications() {
             let request = notifications.objectAtIndex(index).request();
             let content = request.content();
             let category = content.categoryIdentifier().to_string();
-            let key = info_string(&content.userInfo(), ns_string!("requestKey"));
             if category == "CODEX_APPROVAL"
                 || (category.starts_with("AGENT_DYNAMIC_")
-                    && crate::macos::notification_actions::lookup(&key, &category).is_none())
+                    && !category.starts_with(&format!("AGENT_DYNAMIC_{}_", std::process::id())))
             {
                 remove_notification(&request.identifier().to_string());
             }
@@ -254,63 +199,12 @@ fn remove_stale_notifications() {
         .getDeliveredNotificationsWithCompletionHandler(&callback);
 }
 
-/// Live requests get a request-specific action set, registered before delivery.
-pub fn notify_session(session: &crate::agents::sessions::Session) {
-    if !crate::macos::menu::is_resident() {
-        return;
-    }
-    if !crate::app::monitor::hook_pending(session) {
-        return;
-    }
-    super::telegram::observe(session);
-    let Some(approval) = session.approval.as_ref() else {
-        return;
-    };
-    let Some(key) = session.approval_key() else {
-        return;
-    };
-    if crate::macos::notification_actions::active(&key) {
-        return;
-    }
-    let Some(plan) = crate::macos::notification_actions::bind(session) else {
-        return;
-    };
-    let mut body = approval.body.clone();
-    let mut shown = std::collections::HashSet::new();
-    for action in session.interaction().actions {
-        if !action.detail.is_empty()
-            && !body.contains(&action.detail)
-            && shown.insert(action.detail.clone())
-        {
-            body.push_str(&format!("\n\n{}\n{}", action.label, action.detail));
-        }
-    }
-    crate::macos::notification_categories::deliver(
-        plan,
-        crate::macos::notification_categories::Notice {
-            key,
-            title: session.title.clone(),
-            body,
-            target: session.open_target().unwrap_or_default(),
-            token: approval.id.clone(),
-        },
-    );
-}
-
 pub fn remove_session_notification(key: &str) {
-    super::telegram::resolved(key);
-    let bound = crate::macos::notification_actions::remove(key);
     remove_notification(&format!("session-{key}"));
-    if bound && crate::macos::menu::is_resident() {
-        crate::macos::notification_categories::prune();
-    }
 }
 
 /// Only the resident calls this; passive messages have no approval side channel.
 pub fn notify_passive(message: &core::Notification) {
-    if !crate::macos::menu::is_resident() {
-        return;
-    }
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(&message.title));
     content.setBody(&NSString::from_str(&message.body));
@@ -347,7 +241,7 @@ pub fn run(command: NativeCommand) -> Result<()> {
     let mtm = MainThreadMarker::new().expect("native UI must start on main thread");
     // SAFETY: Create the application singleton as our public NSApplication subclass
     // before any other code requests it. No change to key-window or activation behavior.
-    let app: Retained<NSApplication> =
+    let app: Retained<MonitorApplication> =
         unsafe { msg_send![MonitorApplication::class(), sharedApplication] };
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     if let NativeCommand::OpenTarget(target) = &command {
@@ -361,24 +255,25 @@ pub fn run(command: NativeCommand) -> Result<()> {
     {
         return Ok(());
     }
-    if matches!(command, NativeCommand::Listen | NativeCommand::Sessions)
-        && !crate::macos::menu::start(mtm, matches!(command, NativeCommand::Sessions))?
-    {
+    let Some(resident) =
+        crate::macos::menu::start(mtm, matches!(command, NativeCommand::Sessions))?
+    else {
         return Ok(());
-    }
+    };
     let center = UNUserNotificationCenter::currentNotificationCenter();
-    // SAFETY: This NSObject subclass has no custom initialization or ivars.
-    let delegate: Retained<NotificationDelegate> =
-        unsafe { msg_send![NotificationDelegate::class(), new] };
+    let allocated = NotificationDelegate::alloc().set_ivars(NotificationDelegateState {
+        input: resident.notifications.clone(),
+        monitor: resident.monitor.clone(),
+        ui: resident.ui.clone(),
+    });
+    let delegate: Retained<NotificationDelegate> = unsafe { msg_send![super(allocated), init] };
     center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    if crate::macos::menu::is_resident() {
-        crate::macos::notification_categories::legacy();
-        remove_stale_notifications();
-    }
-    crate::macos::onboarding::begin(mtm, false);
+    remove_stale_notifications();
+    app.ivars().controller.set(resident.controller.clone()).ok();
     app.run();
     // Keep the weak delegate alive for the entire run loop.
     drop(delegate);
+    drop(resident);
     Ok(())
 }
 /// Queried inside the resident so diagnostics cannot register a competing notification client.
@@ -476,4 +371,12 @@ pub fn setup_notifications() -> Result<bool> {
         .recv_timeout(std::time::Duration::from_secs(60))
         .context("Notification permission timed out")?
         .map_err(anyhow::Error::msg)
+}
+
+/// Stop the native loop even when shutdown arrived from a timer rather than an input event.
+pub fn stop_application(mtm: MainThreadMarker) {
+    let app = NSApplication::sharedApplication(mtm);
+    app.stop(None);
+    if let Some(event)=NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+        NSEventType::ApplicationDefined,objc2_foundation::NSPoint::new(0.0,0.0),objc2_app_kit::NSEventModifierFlags::empty(),0.0,0,None,0,0,0){app.postEvent_atStart(&event,false);}
 }

@@ -3,12 +3,7 @@ pub(crate) mod claude;
 pub(crate) mod cline;
 pub(crate) mod codex;
 pub(crate) mod history;
-pub(crate) mod interaction;
+pub(crate) use crate::domain::interaction;
 pub(crate) mod pending;
 pub(crate) mod sessions;
 pub(crate) mod tracking;
-use crate::agents::sessions::SessionProvider;
-
-pub fn providers() -> &'static [&'static dyn SessionProvider] {
-    &[&codex::Codex, &claude::Claude, &cline::Cline]
-}

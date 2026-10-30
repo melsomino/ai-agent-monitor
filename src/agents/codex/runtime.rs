@@ -6,6 +6,7 @@ use crate::agents::sessions::{Activity, Approval};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{Read, Write},
@@ -13,7 +14,7 @@ use std::{
         fs::{FileTypeExt, MetadataExt},
         net::UnixStream,
     },
-    sync::{Condvar, Mutex, OnceLock},
+    sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -24,7 +25,7 @@ const MAX_FRAME: usize = 32 * 1024 * 1024;
 struct Live {
     owner: String,
     revision: u64,
-    state: Value,
+    state: Arc<Value>,
 }
 #[derive(Clone)]
 struct Ticket {
@@ -34,44 +35,44 @@ struct Ticket {
 }
 #[derive(Default)]
 struct State {
-    wanted: HashSet<String>,
-    live: HashMap<String, Live>,
     tickets: HashMap<String, Ticket>,
     next_ticket: u64,
 }
-struct Observer {
-    state: Mutex<State>,
-    ready: Condvar,
+pub struct Runtime {
+    wanted: tokio::sync::watch::Sender<HashSet<String>>,
+    observed: tokio::sync::watch::Receiver<Arc<HashMap<String, Live>>>,
+    state: RefCell<State>,
     epoch: u128,
 }
-static OBSERVER: OnceLock<Observer> = OnceLock::new();
-fn observer() -> &'static Observer {
-    OBSERVER.get_or_init(|| {
-        thread::spawn(|| {
-            // OnceLock is published before the worker reads it.
-            loop {
-                if let Some(observer) = OBSERVER.get() {
-                    if watch(observer).is_err() {
-                        let mut state = observer.state.lock().unwrap();
-                        state.live.clear();
-                        state.tickets.clear();
-                        observer.ready.notify_all();
-                    }
-                    thread::sleep(Duration::from_secs(2));
-                } else {
-                    thread::yield_now();
+impl Default for Runtime {
+    fn default() -> Self {
+        let (wanted, mut requests) = tokio::sync::watch::channel(HashSet::new());
+        let (published, observed) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
+        thread::spawn(move || {
+            while requests.has_changed().is_ok() {
+                if requests.borrow().is_empty() {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
                 }
+                if watch(&mut requests, &published).is_err() {
+                    published.send_replace(Arc::new(HashMap::new()));
+                }
+                if requests.has_changed().is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(2));
             }
         });
-        Observer {
-            state: Mutex::new(State::default()),
-            ready: Condvar::new(),
+        Self {
+            wanted,
+            observed,
+            state: RefCell::new(State::default()),
             epoch: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos(),
         }
-    })
+    }
 }
 #[derive(Clone)]
 pub struct View {
@@ -79,139 +80,109 @@ pub struct View {
     pub approval: Option<Approval>,
 }
 
-pub fn views(ids: &HashSet<String>) -> HashMap<String, View> {
-    if ids.is_empty() && OBSERVER.get().is_none() {
-        return HashMap::new();
-    }
-    let observer = observer();
-    let mut state = observer.state.lock().unwrap();
-    state.wanted = ids.clone();
-    state.live.retain(|id, _| ids.contains(id));
-    if ids.is_empty() {
-        state.tickets.clear();
-        return HashMap::new();
-    }
-    if !ids.iter().any(|id| state.live.contains_key(id)) {
-        state = observer
-            .ready
-            .wait_timeout_while(state, Duration::from_millis(500), |state| {
-                ids.iter().any(|id| !state.live.contains_key(id))
+impl Runtime {
+    pub fn views(&self, ids: &HashSet<String>) -> HashMap<String, View> {
+        if *self.wanted.borrow() != *ids {
+            self.wanted.send_replace(ids.clone());
+        }
+        let current = self.observed.borrow().clone();
+        let mut state = self.state.borrow_mut();
+        state.tickets.retain(|_, t| {
+            current.get(&t.session).is_some_and(|s| {
+                s.owner == t.owner
+                    && s.state["requests"]
+                        .as_array()
+                        .is_some_and(|requests| requests.contains(&t.request))
+                    || (s.owner == t.owner
+                        && async_questions::pending(&s.state).as_ref() == Some(&t.request))
             })
-            .unwrap()
-            .0;
-    }
-    // A token is only an opaque reference to an exact request in this process.
-    let current = state.live.clone();
-    state.tickets.retain(|_, t| {
-        current.get(&t.session).is_some_and(|s| {
-            s.owner == t.owner
-                && s.state["requests"]
-                    .as_array()
-                    .is_some_and(|requests| requests.contains(&t.request))
-                || (s.owner == t.owner
-                    && async_questions::pending(&s.state).as_ref() == Some(&t.request))
-        })
-    });
-    let mut result = HashMap::new();
-    for id in ids {
-        let Some(live) = current.get(id) else {
-            continue;
-        };
-        let Some(activity) = activity(&live.state["threadRuntimeStatus"]) else {
-            continue;
-        };
-        let async_request = async_questions::pending(&live.state);
-        let request = live.state["requests"]
-            .as_array()
-            .and_then(|requests| {
-                requests.iter().find(|r| {
-                    matches!(
-                        r["method"].as_str(),
-                        Some(
-                            "item/commandExecution/requestApproval"
-                                | "item/fileChange/requestApproval"
-                                | "item/permissions/requestApproval"
-                                | "item/tool/requestUserInput"
-                                | "item/tool/requestOptionPicker"
-                                | "mcpServer/elicitation/request"
+        });
+        let mut result = HashMap::new();
+        for id in ids {
+            let Some(live) = current.get(id) else {
+                continue;
+            };
+            let Some(activity) = activity(&live.state["threadRuntimeStatus"]) else {
+                continue;
+            };
+            let async_request = async_questions::pending(&live.state);
+            let request = live.state["requests"]
+                .as_array()
+                .and_then(|requests| {
+                    requests.iter().find(|r| {
+                        matches!(
+                            r["method"].as_str(),
+                            Some(
+                                "item/commandExecution/requestApproval"
+                                    | "item/fileChange/requestApproval"
+                                    | "item/permissions/requestApproval"
+                                    | "item/tool/requestUserInput"
+                                    | "item/tool/requestOptionPicker"
+                                    | "mcpServer/elicitation/request"
+                            )
                         )
-                    )
+                    })
                 })
-            })
-            .or(async_request.as_ref());
-        let approval = if let Some(request) = request {
-            let token = state
-                .tickets
-                .iter()
-                .find(|(_, t)| t.session == *id && t.owner == live.owner && t.request == *request)
-                .map(|(token, _)| token.clone())
-                .unwrap_or_else(|| {
-                    state.next_ticket += 1;
-                    let token = format!(
-                        "ipc:{}:{}:{}",
-                        std::process::id(),
-                        observer.epoch,
-                        state.next_ticket
-                    );
-                    state.tickets.insert(
-                        token.clone(),
-                        Ticket {
-                            session: id.clone(),
-                            owner: live.owner.clone(),
-                            request: request.clone(),
-                        },
-                    );
-                    token
-                });
-            Some(Approval {
-                id: token,
-                body: body(request),
-                expires: u64::MAX,
-                can_allow: requests::interaction(request)
-                    .actions
+                .or(async_request.as_ref());
+            let approval = if let Some(request) = request {
+                let token = state
+                    .tickets
                     .iter()
-                    .any(|action| action.id == "allow"),
-            })
-        } else if activity == Activity::Confirmation {
-            Some(Approval {
-                id: format!("ipc-view:{id}"),
-                body: "Codex is waiting for your confirmation or input.".into(),
-                expires: u64::MAX,
-                can_allow: false,
-            })
-        } else {
-            None
-        };
-        result.insert(
-            id.clone(),
-            View {
-                activity: if approval.is_some() {
-                    Activity::Confirmation
-                } else {
-                    activity
+                    .find(|(_, t)| {
+                        t.session == *id && t.owner == live.owner && t.request == *request
+                    })
+                    .map(|(token, _)| token.clone())
+                    .unwrap_or_else(|| {
+                        state.next_ticket += 1;
+                        let token = format!(
+                            "ipc:{}:{}:{}",
+                            std::process::id(),
+                            self.epoch,
+                            state.next_ticket
+                        );
+                        state.tickets.insert(
+                            token.clone(),
+                            Ticket {
+                                session: id.clone(),
+                                owner: live.owner.clone(),
+                                request: request.clone(),
+                            },
+                        );
+                        token
+                    });
+                Some(Approval {
+                    id: token,
+                    body: body(request),
+                    expires: u64::MAX,
+                    can_allow: requests::interaction(request)
+                        .actions
+                        .iter()
+                        .any(|action| action.id == "allow"),
+                })
+            } else if activity == Activity::Confirmation {
+                Some(Approval {
+                    id: format!("ipc-view:{id}"),
+                    body: "Codex is waiting for your confirmation or input.".into(),
+                    expires: u64::MAX,
+                    can_allow: false,
+                })
+            } else {
+                None
+            };
+            result.insert(
+                id.clone(),
+                View {
+                    activity: if approval.is_some() {
+                        Activity::Confirmation
+                    } else {
+                        activity
+                    },
+                    approval,
                 },
-                approval,
-            },
-        );
+            );
+        }
+        result
     }
-    result
-}
-pub fn pending_count(exclude: &HashSet<String>) -> usize {
-    let Some(observer) = OBSERVER.get() else {
-        return 0;
-    };
-    observer
-        .state
-        .lock()
-        .unwrap()
-        .live
-        .iter()
-        .filter(|(id, s)| {
-            !exclude.contains(*id)
-                && (activity(&s.state["threadRuntimeStatus"]) == Some(Activity::Confirmation)
-                    || async_questions::pending(&s.state).is_some())
-        })
-        .count()
 }
 fn activity(status: &Value) -> Option<Activity> {
     match status["type"].as_str()? {
@@ -302,145 +273,109 @@ fn exact_request(state: &Value, ticket: &Ticket) -> bool {
         && ticket.request["params"]["threadId"] == ticket.session
 }
 /// Only called by an explicit Allow click. Re-read from the same owner first.
-pub fn allow(token: &str) -> bool {
-    respond_inner(token, &Response::Action("allow".into())).unwrap_or(false)
-}
-pub fn allow_for(session: &crate::agents::sessions::Session) -> bool {
-    let Some(approval) = &session.approval else {
-        return false;
-    };
-    let Some(observer) = OBSERVER.get() else {
-        return false;
-    };
-    let valid = observer
-        .state
-        .lock()
-        .unwrap()
-        .tickets
-        .get(&approval.id)
-        .is_some_and(|ticket| {
-            ticket.session == session.id
-                && body(&ticket.request) == approval.body
-                && approval.can_allow
-        });
-    valid && allow(&approval.id)
-}
-pub fn interaction_for(session: &crate::agents::sessions::Session) -> Interaction {
-    let Some(approval) = &session.approval else {
-        return Interaction::default();
-    };
-    let Some(observer) = OBSERVER.get() else {
-        return Interaction::default();
-    };
-    observer
-        .state
-        .lock()
-        .unwrap()
-        .tickets
-        .get(&approval.id)
-        .filter(|ticket| ticket.session == session.id && body(&ticket.request) == approval.body)
-        .map(|ticket| requests::interaction(&ticket.request))
-        .unwrap_or_default()
-}
-pub fn respond_for(session: &crate::agents::sessions::Session, response: &Response) -> bool {
-    let Some(approval) = &session.approval else {
-        return false;
-    };
-    let Some(observer) = OBSERVER.get() else {
-        return false;
-    };
-    let valid = observer
-        .state
-        .lock()
-        .unwrap()
-        .tickets
-        .get(&approval.id)
-        .is_some_and(|ticket| {
-            ticket.session == session.id && body(&ticket.request) == approval.body
-        });
-    valid && respond_inner(&approval.id, response).unwrap_or(false)
-}
-fn respond_inner(token: &str, response: &Response) -> Result<bool> {
-    let Some(observer) = OBSERVER.get() else {
-        return Ok(false);
-    };
-    let Some(ticket) = observer.state.lock().unwrap().tickets.get(token).cloned() else {
-        return Ok(false);
-    };
-    let asynchronous = ticket.request["method"] == async_questions::METHOD;
-    let wire = requests::follower_response(&ticket.request, &ticket.session, response);
-    let async_text = if asynchronous {
-        async_questions::reply_text(&ticket.request, response)
-    } else {
-        None
-    };
-    if wire.is_none() && async_text.is_none() {
-        return Ok(false);
+impl Runtime {
+    pub fn allow(&self, token: &str) -> bool {
+        self.respond_inner(token, &Response::Action("allow".into()), &mut false)
+            .unwrap_or(false)
     }
-    let mut connection = Connection::connect()?;
-    let owner = connection.owner(&ticket.session)?;
-    if owner != ticket.owner {
-        return Ok(false);
-    }
-    connection.follow(&ticket.session, &owner, true)?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        let Some(message) = connection.next()? else {
-            continue;
+    pub fn allow_for(&self, session: &crate::agents::sessions::Session) -> bool {
+        let Some(approval) = &session.approval else {
+            return false;
         };
-        if message["method"] != "thread-stream-state-changed"
-            || message["sourceClientId"] != owner
-            || message["version"] != STREAM_VERSION
-            || message["params"]["conversationId"] != ticket.session
-            || message["params"]["hostId"] != "local"
+        let valid = self
+            .state
+            .borrow()
+            .tickets
+            .get(&approval.id)
+            .is_some_and(|ticket| {
+                ticket.session == session.id
+                    && body(&ticket.request) == approval.body
+                    && approval.can_allow
+            });
+        valid && self.allow(&approval.id)
+    }
+    pub fn interaction_for(&self, session: &crate::agents::sessions::Session) -> Interaction {
+        let Some(approval) = &session.approval else {
+            return Interaction::default();
+        };
+        self.state
+            .borrow()
+            .tickets
+            .get(&approval.id)
+            .filter(|ticket| ticket.session == session.id && body(&ticket.request) == approval.body)
+            .map(|ticket| requests::interaction(&ticket.request))
+            .unwrap_or_default()
+    }
+    pub fn respond_for(
+        &self,
+        session: &crate::agents::sessions::Session,
+        response: &Response,
+    ) -> bool {
+        let Some(approval) = &session.approval else {
+            return false;
+        };
+        let valid = self
+            .state
+            .borrow()
+            .tickets
+            .get(&approval.id)
+            .is_some_and(|ticket| {
+                ticket.session == session.id && body(&ticket.request) == approval.body
+            });
+        valid
+            && self
+                .respond_inner(&approval.id, response, &mut false)
+                .unwrap_or(false)
+    }
+    pub fn deliver_for(
+        &self,
+        session: &crate::agents::sessions::Session,
+        response: &Response,
+    ) -> crate::agents::interaction::Delivery {
+        use crate::agents::interaction::Delivery;
+        let Some(approval) = &session.approval else {
+            return Delivery::NotSent;
+        };
+        if !self
+            .state
+            .borrow()
+            .tickets
+            .get(&approval.id)
+            .is_some_and(|t| t.session == session.id && body(&t.request) == approval.body)
         {
-            continue;
+            return Delivery::NotSent;
         }
-        let change = &message["params"]["change"];
-        if change["type"] != "snapshot" {
-            continue;
+        let mut attempted = false;
+        match self.respond_inner(&approval.id, response, &mut attempted) {
+            Ok(true) => Delivery::Confirmed,
+            _ if attempted => Delivery::Uncertain,
+            _ => Delivery::NotSent,
         }
-        if !exact_request(&change["conversationState"], &ticket) {
-            return Ok(false);
-        }
-        if let Some(text) = async_text {
-            let mut random = [0u8; 16];
-            fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-            random[6] = (random[6] & 0x0f) | 0x40;
-            random[8] = (random[8] & 0x3f) | 0x80;
-            let hex = random
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            let client_id = format!(
-                "{}-{}-{}-{}-{}",
-                &hex[..8],
-                &hex[8..12],
-                &hex[12..16],
-                &hex[16..20],
-                &hex[20..]
-            );
-            let Some((method, version, params)) =
-                async_questions::reply_envelope(&change["conversationState"], &text, &client_id)
-            else {
-                return Ok(false);
-            };
-            let result = connection.request(method, params, version, Some(&owner))?;
-            return Ok(result["resultType"] == "success");
-        }
-        let Some((method, params)) = wire else {
+    }
+    fn respond_inner(
+        &self,
+        token: &str,
+        response: &Response,
+        attempted: &mut bool,
+    ) -> Result<bool> {
+        let Some(ticket) = self.state.borrow().tickets.get(token).cloned() else {
             return Ok(false);
         };
-        let mut confirmed = HashMap::new();
-        if !apply_change(&mut confirmed, &ticket.session, &owner, change) {
+        let asynchronous = ticket.request["method"] == async_questions::METHOD;
+        let wire = requests::follower_response(&ticket.request, &ticket.session, response);
+        let async_text = if asynchronous {
+            async_questions::reply_text(&ticket.request, response)
+        } else {
+            None
+        };
+        if wire.is_none() && async_text.is_none() {
             return Ok(false);
         }
-        let result = connection.request(method, params, 1, Some(&owner))?;
-        if result["resultType"] != "success" || result["result"]["ok"] != true {
+        let mut connection = Connection::connect()?;
+        let owner = connection.owner(&ticket.session)?;
+        if owner != ticket.owner {
             return Ok(false);
         }
-        // The owner returns ok even when its strict request lookup finds nothing.
-        // A transport acknowledgement alone must not make the UI report Sent.
         connection.follow(&ticket.session, &owner, true)?;
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -455,34 +390,98 @@ fn respond_inner(token: &str, response: &Response) -> Result<bool> {
             {
                 continue;
             }
-            if !apply_change(
-                &mut confirmed,
-                &ticket.session,
-                &owner,
-                &message["params"]["change"],
-            ) {
-                connection.follow(&ticket.session, &owner, true)?;
+            let change = &message["params"]["change"];
+            if change["type"] != "snapshot" {
                 continue;
             }
-            if request_resolved(&confirmed, &ticket) {
-                return Ok(true);
+            if !exact_request(&change["conversationState"], &ticket) {
+                return Ok(false);
             }
+            if let Some(text) = async_text {
+                let mut random = [0u8; 16];
+                fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+                random[6] = (random[6] & 0x0f) | 0x40;
+                random[8] = (random[8] & 0x3f) | 0x80;
+                let hex = random
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let client_id = format!(
+                    "{}-{}-{}-{}-{}",
+                    &hex[..8],
+                    &hex[8..12],
+                    &hex[12..16],
+                    &hex[16..20],
+                    &hex[20..]
+                );
+                let Some((method, version, params)) = async_questions::reply_envelope(
+                    &change["conversationState"],
+                    &text,
+                    &client_id,
+                ) else {
+                    return Ok(false);
+                };
+                *attempted = true;
+                let result = connection.request(method, params, version, Some(&owner))?;
+                return Ok(result["resultType"] == "success");
+            }
+            let Some((method, params)) = wire else {
+                return Ok(false);
+            };
+            let mut confirmed = HashMap::new();
+            if !apply_change(&mut confirmed, &ticket.session, &owner, change) {
+                return Ok(false);
+            }
+            *attempted = true;
+            let result = connection.request(method, params, 1, Some(&owner))?;
+            if result["resultType"] != "success" || result["result"]["ok"] != true {
+                return Ok(false);
+            }
+            // The owner returns ok even when its strict request lookup finds nothing.
+            // A transport acknowledgement alone must not make the UI report Sent.
+            connection.follow(&ticket.session, &owner, true)?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let Some(message) = connection.next()? else {
+                    continue;
+                };
+                if message["method"] != "thread-stream-state-changed"
+                    || message["sourceClientId"] != owner
+                    || message["version"] != STREAM_VERSION
+                    || message["params"]["conversationId"] != ticket.session
+                    || message["params"]["hostId"] != "local"
+                {
+                    continue;
+                }
+                if !apply_change(
+                    &mut confirmed,
+                    &ticket.session,
+                    &owner,
+                    &message["params"]["change"],
+                ) {
+                    connection.follow(&ticket.session, &owner, true)?;
+                    continue;
+                }
+                if Self::request_resolved(&confirmed, &ticket) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
         }
-        return Ok(false);
+        Ok(false)
     }
-    Ok(false)
-}
 
-fn request_resolved(live: &HashMap<String, Live>, ticket: &Ticket) -> bool {
-    live.get(&ticket.session)
-        .filter(|current| current.owner == ticket.owner)
-        .and_then(|current| current.state["requests"].as_array())
-        .is_some_and(|requests| {
-            !requests.iter().any(|request| {
-                request["id"] == ticket.request["id"]
-                    && request["method"] == ticket.request["method"]
+    fn request_resolved(live: &HashMap<String, Live>, ticket: &Ticket) -> bool {
+        live.get(&ticket.session)
+            .filter(|current| current.owner == ticket.owner)
+            .and_then(|current| current.state["requests"].as_array())
+            .is_some_and(|requests| {
+                !requests.iter().any(|request| {
+                    request["id"] == ticket.request["id"]
+                        && request["method"] == ticket.request["method"]
+                })
             })
-        })
+    }
 }
 
 struct Connection {
@@ -653,13 +652,23 @@ impl Drop for Connection {
         }
     }
 }
-fn watch(observer: &Observer) -> Result<()> {
+fn watch(
+    wanted_receiver: &mut tokio::sync::watch::Receiver<HashSet<String>>,
+    published: &tokio::sync::watch::Sender<Arc<HashMap<String, Live>>>,
+) -> Result<()> {
     let mut connection = Connection::connect()?;
+    let mut live = HashMap::<String, Live>::new();
     let mut owners: HashMap<String, String> = HashMap::new();
     let mut checked = Instant::now() - Duration::from_secs(6);
     let mut last_wanted = HashSet::new();
     loop {
-        let wanted = observer.state.lock().unwrap().wanted.clone();
+        if wanted_receiver.has_changed().is_err() {
+            return Ok(());
+        }
+        let wanted = wanted_receiver.borrow_and_update().clone();
+        if wanted.is_empty() {
+            return Ok(());
+        }
         if checked.elapsed() >= Duration::from_secs(5) || wanted != last_wanted {
             last_wanted = wanted.clone();
             for session in owners
@@ -671,7 +680,7 @@ fn watch(observer: &Observer) -> Result<()> {
                 if let Some(owner) = owners.remove(&session) {
                     connection.follow(&session, &owner, false)?;
                 }
-                observer.state.lock().unwrap().live.remove(&session);
+                live.remove(&session);
             }
             for session in wanted {
                 if let Ok(owner) = connection.owner(&session) {
@@ -679,7 +688,7 @@ fn watch(observer: &Observer) -> Result<()> {
                         if let Some(old) = owners.insert(session.clone(), owner.clone()) {
                             connection.follow(&session, &old, false)?;
                         }
-                        observer.state.lock().unwrap().live.remove(&session);
+                        live.remove(&session);
                     }
                     // Reaffirming a subscription also requests a fresh snapshot.
                     // A missed patch or an owner-side subscription reset must not
@@ -687,20 +696,18 @@ fn watch(observer: &Observer) -> Result<()> {
                     connection.follow(&session, &owner, true)?;
                 } else {
                     owners.remove(&session);
-                    observer.state.lock().unwrap().live.remove(&session);
+                    live.remove(&session);
                 }
             }
             checked = Instant::now();
         }
+        published.send_replace(Arc::new(live.clone()));
         let Some(message) = connection.next()? else {
             continue;
         };
         if message["method"] == "ipc-connection-reset" {
             owners.clear();
-            let mut state = observer.state.lock().unwrap();
-            state.live.clear();
-            state.tickets.clear();
-            observer.ready.notify_all();
+            live.clear();
             checked = Instant::now() - Duration::from_secs(6);
         } else if message["method"] == "thread-stream-following-status-requested" {
             if let Some(session) = message["params"]["conversationId"].as_str()
@@ -715,12 +722,7 @@ fn watch(observer: &Observer) -> Result<()> {
         {
             if let Some(client) = message["params"]["clientId"].as_str() {
                 owners.retain(|_, owner| owner != client);
-                observer
-                    .state
-                    .lock()
-                    .unwrap()
-                    .live
-                    .retain(|_, s| s.owner != client);
+                live.retain(|_, s| s.owner != client);
                 checked = Instant::now() - Duration::from_secs(6);
             }
         } else if message["method"] == "thread-stream-state-changed"
@@ -735,19 +737,13 @@ fn watch(observer: &Observer) -> Result<()> {
             if message["sourceClientId"] != *owner || message["params"]["hostId"] != "local" {
                 continue;
             }
-            let mut state = observer.state.lock().unwrap();
-            if !state.wanted.contains(session) {
+            if !wanted_receiver.borrow().contains(session) {
                 continue;
             }
-            if !apply_change(
-                &mut state.live,
-                session,
-                owner,
-                &message["params"]["change"],
-            ) {
+            if !apply_change(&mut live, session, owner, &message["params"]["change"]) {
                 checked = Instant::now() - Duration::from_secs(6);
             }
-            observer.ready.notify_all();
+            published.send_replace(Arc::new(live.clone()));
         }
     }
 }
@@ -772,7 +768,7 @@ fn apply_change(
             Live {
                 owner: owner.into(),
                 revision,
-                state: async_questions::project(state),
+                state: Arc::new(async_questions::project(state)),
             },
         );
         return true;
@@ -807,7 +803,7 @@ fn apply_change(
             continue;
         };
         if !apply_patch(
-            &mut current.state,
+            Arc::make_mut(&mut current.state),
             path,
             patch["op"].as_str().unwrap_or(""),
             &value,
@@ -1031,14 +1027,14 @@ mod tests {
             request: request.clone(),
         };
         let mut live = HashMap::new();
-        assert!(!request_resolved(&live, &ticket));
+        assert!(!Runtime::request_resolved(&live, &ticket));
         let pending = json!({"type":"snapshot","revision":1,"conversationState":{"id":"chat","requests":[request],"threadRuntimeStatus":{"type":"active"}}});
         assert!(apply_change(&mut live, "chat", "owner", &pending));
-        assert!(!request_resolved(&live, &ticket));
+        assert!(!Runtime::request_resolved(&live, &ticket));
         let removed = json!({"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"remove","path":["requests",0]}]});
         assert!(apply_change(&mut live, "chat", "owner", &removed));
-        assert!(request_resolved(&live, &ticket));
+        assert!(Runtime::request_resolved(&live, &ticket));
         live.get_mut("chat").unwrap().owner = "other owner".into();
-        assert!(!request_resolved(&live, &ticket));
+        assert!(!Runtime::request_resolved(&live, &ticket));
     }
 }

@@ -1,5 +1,6 @@
 //! Persistent preferences and macOS login-item registration.
-use crate::agents::sessions::Client;
+#[cfg(test)]
+use crate::domain::session::Client;
 use anyhow::{Context, Result, bail};
 use objc2::{
     msg_send,
@@ -7,89 +8,8 @@ use objc2::{
     runtime::{AnyClass, AnyObject, Bool},
 };
 use objc2_foundation::{NSError, NSUserDefaults, ns_string};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct KnownApplication {
-    pub id: String,
-    pub name: String,
-    pub icon_path: Option<String>,
-    pub enabled: bool,
-}
-#[derive(Default, Debug, Serialize, Deserialize)]
-pub struct Applications {
-    apps: BTreeMap<String, KnownApplication>,
-}
-impl Applications {
-    /// Keep previously seen applications, including disabled and currently closed ones.
-    pub fn observe(&mut self, clients: impl IntoIterator<Item = Client>) -> bool {
-        let mut changed = false;
-        for client in clients {
-            let id = client.application_id();
-            let name = if client == Client::Unknown {
-                "Other apps"
-            } else {
-                client.label()
-            }
-            .to_owned();
-            let icon_path = match client {
-                Client::VSCode => Some("/Applications/Visual Studio Code.app"),
-                Client::Terminal => Some("/System/Applications/Utilities/Terminal.app"),
-                Client::Desktop { app_path, .. } => Some(app_path),
-                Client::Unknown => None,
-            }
-            .map(str::to_owned);
-            if let Some(app) = self.apps.get_mut(&id) {
-                if app.name != name || app.icon_path != icon_path {
-                    app.name = name;
-                    app.icon_path = icon_path;
-                    changed = true;
-                }
-            } else {
-                self.apps.insert(
-                    id.clone(),
-                    KnownApplication {
-                        id,
-                        name,
-                        icon_path,
-                        enabled: true,
-                    },
-                );
-                changed = true;
-            }
-        }
-        changed
-    }
-    pub fn enabled(&self, client: Client) -> bool {
-        self.apps
-            .get(&client.application_id())
-            .is_none_or(|app| app.enabled)
-    }
-    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> bool {
-        let Some(app) = self.apps.get_mut(id) else {
-            return false;
-        };
-        if app.enabled == enabled {
-            return false;
-        }
-        app.enabled = enabled;
-        true
-    }
-    pub fn list(&self) -> Vec<&KnownApplication> {
-        let mut apps: Vec<_> = self.apps.values().collect();
-        apps.sort_by(|a, b| {
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        apps
-    }
-    fn decode(value: &str) -> Self {
-        serde_json::from_str(value).unwrap_or_default()
-    }
-}
+pub use crate::domain::preferences::{Applications, LoginStatus, Preferences};
 pub fn applications() -> Applications {
     NSUserDefaults::standardUserDefaults()
         .stringForKey(ns_string!("KnownApplications"))
@@ -109,14 +29,6 @@ pub fn save_applications(applications: &Applications) {
 
 #[link(name = "ServiceManagement", kind = "framework")]
 unsafe extern "C" {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LoginStatus {
-    Disabled,
-    Enabled,
-    RequiresApproval,
-    Unavailable,
-}
 
 fn login_service() -> Result<Retained<AnyObject>> {
     let class = AnyClass::get(c"SMAppService").context("macOS login items are unavailable")?;
@@ -202,6 +114,16 @@ pub fn set_menu_shortcut(shortcut: Option<&crate::macos::hotkey::Shortcut>) {
         }
     } else {
         defaults.removeObjectForKey(key);
+    }
+}
+
+pub fn snapshot() -> Preferences {
+    Preferences {
+        applications: applications(),
+        login: login_status(),
+        animation: menu_animation(),
+        shortcut: menu_shortcut(),
+        error: None,
     }
 }
 

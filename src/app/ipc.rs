@@ -1,10 +1,9 @@
 //! Local hook transport. Only the resident process executes integrations or posts notifications.
-use crate::app::{core, monitor};
+use crate::{actors::monitor, app::core};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
-    cell::RefCell,
     fs,
     io::{Read, Write},
     os::{
@@ -16,10 +15,6 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
     time::{Duration, Instant},
 };
 
@@ -56,32 +51,6 @@ struct Reply {
     result: Option<Value>,
     error: Option<String>,
 }
-thread_local! { static CONNECTION: RefCell<Option<UnixStream>> = const { RefCell::new(None) }; }
-
-pub fn peer() -> Option<UnixStream> {
-    CONNECTION.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .and_then(|stream| stream.try_clone().ok())
-    })
-}
-pub fn peer_alive(stream: &UnixStream) -> bool {
-    let mut byte = 0u8;
-    // SAFETY: One-byte buffer and a live owned descriptor; peeking consumes no input.
-    let n = unsafe {
-        libc::recv(
-            stream.as_raw_fd(),
-            (&mut byte as *mut u8).cast(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    n > 0 || (n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock)
-}
-pub fn connected() -> bool {
-    CONNECTION.with(|slot| slot.borrow().as_ref().is_none_or(peer_alive))
-}
-
 fn path() -> PathBuf {
     std::env::var_os("AI_AGENT_MONITOR_SOCKET")
         .map(PathBuf::from)
@@ -187,122 +156,295 @@ fn exchange(mut stream: UnixStream, request: &Request) -> Result<Value> {
 }
 
 /// Called only after the resident-process lock has been acquired.
-pub fn start() -> Result<()> {
-    let path = path();
-    if let Ok(metadata) = fs::symlink_metadata(&path) {
+pub fn start(
+    handle: monitor::Handle,
+    runtime: &tokio::runtime::Handle,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let socket_path = path();
+    if let Ok(metadata) = fs::symlink_metadata(&socket_path) {
         anyhow::ensure!(
             metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() },
-            "Refusing to replace an untrusted monitor socket"
+            "Untrusted monitor socket"
         );
-        fs::remove_file(&path)?;
+        fs::remove_file(&socket_path)?;
     }
-    let listener = UnixListener::bind(&path).context("Create monitor socket")?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    monitor::set_host();
-    let active = Arc::new(AtomicUsize::new(0));
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            if active.fetch_add(1, Ordering::Relaxed) >= 64 {
-                active.fetch_sub(1, Ordering::Relaxed);
+    let listener = UnixListener::bind(path())?;
+    fs::set_permissions(path(), fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    let _entered = runtime.enter();
+    let listener = tokio::net::UnixListener::from_std(listener)?;
+    Ok(runtime.spawn(async move {
+        let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+        while let Ok((stream, _)) = listener.accept().await {
+            let Ok(permit) = capacity.clone().try_acquire_owned() else {
                 continue;
-            }
-            let active = active.clone();
-            std::thread::spawn(move || {
-                let _ = serve(stream);
-                active.fetch_sub(1, Ordering::Relaxed);
+            };
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _ = serve(stream, handle).await;
             });
         }
-    });
-    Ok(())
+    }))
 }
-fn serve(mut stream: UnixStream) -> Result<()> {
-    trusted_peer(&stream)?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-    let request: Request = read_frame(&mut stream)?;
-    CONNECTION.with(|slot| *slot.borrow_mut() = stream.try_clone().ok());
-    let result = monitor::handle(request);
-    CONNECTION.with(|slot| slot.borrow_mut().take());
+async fn serve(mut stream: tokio::net::UnixStream, monitor: monitor::Handle) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut uid = 0;
+    let mut gid = 0;
+    anyhow::ensure!(
+        unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0
+            && uid == unsafe { libc::geteuid() },
+        "Untrusted monitor peer"
+    );
+    let request = tokio::time::timeout(Duration::from_secs(3), async {
+        let length = stream.read_u32_le().await? as usize;
+        anyhow::ensure!(length <= MAX_FRAME, "Oversized monitor request");
+        let mut data = vec![0; length];
+        stream.read_exact(&mut data).await?;
+        Ok::<Request, anyhow::Error>(serde_json::from_slice(&data)?)
+    })
+    .await??;
+    let mut hook = None;
+    let result = handle_request(request, &monitor, &mut stream, &mut hook).await;
     let reply = match result {
-        Ok(result) => Reply {
-            result: Some(result),
+        Ok(value) => Reply {
+            result: Some(value),
             error: None,
         },
-        Err(error) => Reply {
+        Err(e) => Reply {
             result: None,
-            error: Some(format!("{error:#}")),
+            error: Some(e.to_string()),
         },
     };
-    write_frame(&mut stream, &reply)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn framed_hook_round_trip_and_disconnect_detection() {
-        let (client, mut server) = UnixStream::pair().unwrap();
-        let task = std::thread::spawn(move || {
-            let request: Request = read_frame(&mut server).unwrap();
-            assert!(matches!(request, Request::Hook { .. }));
-            write_frame(
-                &mut server,
-                &Reply {
-                    result: Some(serde_json::json!({"decision":"allow"})),
-                    error: None,
-                },
-            )
-            .unwrap();
-        });
-        assert_eq!(
-            exchange(
-                client,
-                &Request::Hook {
-                    event: serde_json::json!({"session_id":"one"}),
-                    owner: None
-                }
-            )
-            .unwrap()["decision"],
-            "allow"
-        );
-        task.join().unwrap();
-        let (client, server) = UnixStream::pair().unwrap();
-        CONNECTION.with(|slot| *slot.borrow_mut() = Some(server));
-        assert!(connected());
-        drop(client);
-        assert!(!connected());
-        CONNECTION.with(|slot| slot.borrow_mut().take());
+    let data = serde_json::to_vec(&reply)?;
+    let written = tokio::time::timeout(Duration::from_secs(3), async {
+        stream.write_u32_le(data.len() as u32).await?;
+        stream.write_all(&data).await
+    })
+    .await;
+    if let Some(key) = hook {
+        let _ = monitor.enqueue(monitor::Command::HookGone(key)).await;
     }
-    #[test]
-    fn oversized_frames_and_error_replies_are_rejected() {
-        let (mut client, mut server) = UnixStream::pair().unwrap();
-        client
-            .write_all(&((MAX_FRAME + 1) as u32).to_le_bytes())
-            .unwrap();
-        assert!(read_frame::<Request>(&mut server).is_err());
-        let (client, mut server) = UnixStream::pair().unwrap();
-        let task = std::thread::spawn(move || {
-            let _: Request = read_frame(&mut server).unwrap();
-            write_frame(
-                &mut server,
-                &Reply {
-                    result: None,
-                    error: Some("request expired".into()),
-                },
+    written??;
+    Ok(())
+}
+async fn ask(
+    content: core::Notification,
+    event: Value,
+    owner: Option<Owner>,
+    approval: bool,
+    monitor: &monitor::Handle,
+    stream: &mut tokio::net::UnixStream,
+    hook: &mut Option<String>,
+) -> Result<Option<core::Action>> {
+    use tokio::io::AsyncReadExt;
+    if !approval {
+        monitor
+            .enqueue(monitor::Command::Passive(content))
+            .await
+            .map_err(anyhow::Error::msg)?;
+        return Ok(None);
+    }
+    let key = format!("hook:{}:{}", std::process::id(), crate::app::ids::nonce());
+    let session = monitor::hook_session(&content, &event, owner.as_ref(), &key);
+    let mut state = monitor.subscribe();
+    monitor
+        .enqueue(monitor::Command::Hook {
+            key: key.clone(),
+            session: Box::new(session),
+            target: content.target,
+        })
+        .await
+        .map_err(anyhow::Error::msg)?;
+    *hook = Some(key.clone());
+    let mut registered = false;
+    let timeout = tokio::time::sleep(core::WAIT);
+    tokio::pin!(timeout);
+    loop {
+        let snapshot = state.borrow_and_update().clone();
+        if let Some(h) = snapshot.hooks.get(&key) {
+            registered = true;
+            if let Some(answer) = &h.decision {
+                return Ok(match answer {
+                    crate::agents::interaction::Response::Action(id) if id == "allow" => {
+                        Some(core::Action::Allow)
+                    }
+                    _ => None,
+                });
+            }
+        } else if registered || snapshot.stopping {
+            return Ok(None);
+        }
+        let mut byte = [0];
+        tokio::select! {
+            changed=state.changed()=>if changed.is_err(){return Ok(None);},
+            _=&mut timeout=>return Ok(None),
+            _=stream.read(&mut byte)=>return Ok(None),
+        }
+    }
+}
+async fn handle_request(
+    request: Request,
+    monitor: &monitor::Handle,
+    stream: &mut tokio::net::UnixStream,
+    hook: &mut Option<String>,
+) -> Result<Value> {
+    use serde_json::json;
+    match request {
+        Request::Sessions => {
+            let state = monitor.snapshot();
+            #[cfg(target_os = "macos")]
+            let telegram = crate::actors::human::telegram::diagnostics(&state.telegram);
+            #[cfg(not(target_os = "macos"))]
+            let telegram = Value::Null;
+            Ok(
+                json!({"monitor":{"pid":std::process::id(),"version":core::VERSION},"telegram":telegram,"sessions":state.sessions.iter().map(|s|json!({"agent":s.agent,"id":s.id,"title":s.title,"cwd":s.cwd,"workspace":s.workspace,"gitBranch":s.git_branch,"client":s.client.label(),"status":s.activity.label(),"lastMessage":s.last_message,"updatedAt":s.updated_at,"approval":s.approval.as_ref().map(|a|json!({"id":a.id,"body":a.body,"expiresAt":a.expires,"canAllow":a.can_allow}))})).collect::<Vec<_>>()}),
             )
-            .unwrap();
-        });
-        assert!(
-            exchange(
-                client,
-                &Request::Notice {
-                    title: "Test".into(),
-                    body: String::new(),
-                    target: String::new()
+        }
+        Request::Hook { mut event, owner } => {
+            event["_agent"] = "codex".into();
+            let Some(content) = core::notification(&event) else {
+                return Ok(Value::Null);
+            };
+            Ok(core::decision(
+                ask(content, event, owner, true, monitor, stream, hook).await?,
+                false,
+            )
+            .unwrap_or(Value::Null))
+        }
+        Request::Test {
+            approval,
+            session_id,
+        } => {
+            let mut event = serde_json::json!({"cwd":core::home(),"_agent":"codex"});
+            if let Some(id) = session_id {
+                event["session_id"] = id.into();
+            }
+            let title = if event["session_id"].is_string() {
+                core::chat_title(&event, &core::codex_home())
+            } else {
+                "AI Agent Monitor · Test".into()
+            };
+            let content = core::Notification {
+                title,
+                body: "Click Allow to test the response path. No agent command will be approved."
+                    .into(),
+                target: String::new(),
+            };
+            Ok(
+                json!({"test":true,"allowed":ask(content,event,None,approval,monitor,stream,hook).await?==Some(core::Action::Allow)}),
+            )
+        }
+        Request::Notice {
+            title,
+            body,
+            target,
+        } => {
+            monitor
+                .enqueue(monitor::Command::Passive(core::Notification {
+                    title,
+                    body,
+                    target,
+                }))
+                .await
+                .map_err(anyhow::Error::msg)?;
+            Ok(Value::Null)
+        }
+        Request::AgentHook {
+            agent,
+            event,
+            input,
+            owner,
+        } => {
+            let root = crate::agents::tracking::root();
+            let data = input.clone();
+            let agent_kind = agent.clone();
+            let source = owner.clone();
+            let result = tokio::task::spawn_blocking(move || match agent_kind.as_str() {
+                "claude" => crate::agents::claude::hook(&data, &root, source, false)
+                    .map(|v| v.unwrap_or(Value::Null)),
+                "cline" => crate::agents::cline::hook(&data, event.as_deref(), &root, source),
+                _ => anyhow::bail!("Unknown agent"),
+            })
+            .await??;
+            if agent == "claude" {
+                if let Some(id) = input["session_id"].as_str()
+                    && matches!(
+                        input["hook_event_name"].as_str(),
+                        Some(
+                            "SessionEnd"
+                                | "Stop"
+                                | "StopFailure"
+                                | "PostToolUse"
+                                | "PostToolUseFailure"
+                                | "UserPromptSubmit"
+                        )
+                    )
+                {
+                    let _ = monitor
+                        .enqueue(monitor::Command::CancelSession {
+                            agent: agent.clone(),
+                            id: id.into(),
+                        })
+                        .await;
                 }
-            )
-            .is_err()
-        );
-        task.join().unwrap();
+                if input["hook_event_name"] == "PermissionRequest" {
+                    let mut input = input;
+                    input["_agent"] = "claude".into();
+                    let id = input["session_id"].as_str().unwrap_or_default();
+                    let record = crate::agents::tracking::load(
+                        &crate::agents::tracking::root(),
+                        "claude",
+                        id,
+                    );
+                    let title = record
+                        .as_ref()
+                        .map(|r| r.title.clone())
+                        .unwrap_or_else(|| "Claude Code".into());
+                    let body = input["tool_input"]["description"]
+                        .as_str()
+                        .map(|s| core::shorten(s, 1000))
+                        .unwrap_or_else(|| {
+                            format!("Allow {}?", input["tool_name"].as_str().unwrap_or("tool"))
+                        });
+                    let content = core::Notification {
+                        title,
+                        body,
+                        target: record
+                            .map(|r| core::vscode_file_target(&r.cwd))
+                            .unwrap_or_default(),
+                    };
+                    return Ok(core::decision(
+                        ask(content, input, Some(owner), true, monitor, stream, hook).await?,
+                        false,
+                    )
+                    .unwrap_or(Value::Null));
+                }
+            }
+            let _ = monitor.send(monitor::Command::Refresh);
+            Ok(result)
+        }
+        Request::Setup => {
+            #[cfg(target_os = "macos")]
+            {
+                Ok(
+                    json!({"allowed":tokio::task::spawn_blocking(crate::macos::native::setup_notifications).await??}),
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                anyhow::bail!("Notifications require macOS")
+            }
+        }
+        Request::NotificationSettings => {
+            #[cfg(target_os = "macos")]
+            {
+                tokio::task::spawn_blocking(crate::macos::native::notification_settings).await?
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                anyhow::bail!("Notifications require macOS")
+            }
+        }
     }
 }

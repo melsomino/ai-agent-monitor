@@ -5,54 +5,27 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Window {
-    pub minutes: u64,
-    pub used_percent: f64,
-    pub resets_at: Option<i64>,
+pub use crate::domain::usage::{Usage, Window};
+#[derive(Default)]
+pub struct Reader {
+    cache: Option<(PathBuf, Instant, Option<Usage>)>,
 }
-impl Window {
-    pub fn label(&self) -> String {
-        match self.minutes {
-            10080 => "Weekly".into(),
-            1440 => "Daily".into(),
-            n if n % 60 == 0 => format!("{}-hour", n / 60),
-            n => format!("{n}-minute"),
+impl Reader {
+    pub fn latest(&mut self, home: &Path) -> Option<Usage> {
+        if let Some((root, at, value)) = &self.cache
+            && root == home
+            && at.elapsed() < Duration::from_secs(10)
+        {
+            return value.clone();
         }
-    }
-    pub fn remaining(&self, now: i64) -> Option<u32> {
-        // An expired observation cannot tell us the balance in the new window.
-        if self.resets_at.is_some_and(|reset| reset <= now) {
-            return None;
-        }
-        Some((100.0 - self.used_percent).clamp(0.0, 100.0).round() as u32)
+        let value = read_latest(home);
+        self.cache = Some((home.to_owned(), Instant::now(), value.clone()));
+        value
     }
 }
-#[derive(Clone, Debug, PartialEq)]
-pub struct Usage {
-    pub observed_at: String,
-    pub windows: Vec<Window>,
-}
-type Cache = Option<(PathBuf, Instant, Option<Usage>)>;
-static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-
-pub fn latest(home: &Path) -> Option<Usage> {
-    let mut cache = CACHE.get_or_init(|| Mutex::new(None)).lock().unwrap();
-    if let Some((root, checked, value)) = cache.as_ref()
-        && root == home
-        && checked.elapsed() < Duration::from_secs(10)
-    {
-        return value.clone();
-    }
-    let value = read_latest(home);
-    *cache = Some((home.into(), Instant::now(), value.clone()));
-    value
-}
-
 fn read_latest(home: &Path) -> Option<Usage> {
     let mut databases: Vec<_> = fs::read_dir(home)
         .ok()?

@@ -1,5 +1,7 @@
+mod actors;
 mod agents;
 mod app;
+mod domain;
 #[cfg(target_os = "macos")]
 mod macos;
 

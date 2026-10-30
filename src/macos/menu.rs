@@ -3,7 +3,7 @@ use crate::{
     agents::{
         codex::usage,
         interaction::{Action, Response},
-        sessions::{self, Activity, Client, Session},
+        sessions::{Activity, Client, Session},
     },
     app::core,
     macos::{answers, hotkey, motion, native, pointer, search, settings},
@@ -22,8 +22,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
-    sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 const SESSION_HEADER_HEIGHT: f64 = 24.0;
@@ -37,110 +36,6 @@ const MESSAGE_TOP_GAP: f64 = 4.0;
 const BUTTON_HOVER_PADDING: f64 = 3.0;
 const QUESTION_CARD_WIDTH: f64 = 348.0;
 
-static RESIDENT: AtomicBool = AtomicBool::new(false);
-thread_local! { static CONTROLLER: RefCell<Option<Retained<MenuController>>> = const { RefCell::new(None) }; }
-
-pub fn toggle_from_hotkey() {
-    CONTROLLER.with(|slot| {
-        if let Some(controller) = slot.borrow().as_ref() {
-            // Return from Carbon's callback before opening a nested menu loop
-            // or suspending the registration that delivered this callback.
-            // SAFETY: This retained controller implements toggleMenuFromHotkey:;
-            // common run-loop modes also run during native menu tracking.
-            unsafe {
-                let timer = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
-                    0.0,
-                    controller,
-                    sel!(toggleMenuFromHotkey:),
-                    None,
-                    false,
-                );
-                NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
-            }
-        }
-    });
-}
-
-/// Shared by the native menu dispatcher and AppKit's event-fetching loop.
-/// Return false for everything outside our open sessions menu.
-pub fn handle_menu_key(event: &NSEvent) -> bool {
-    CONTROLLER.with(|slot| {
-        slot.try_borrow()
-            .ok()
-            .and_then(|slot| {
-                slot.as_ref()
-                    .map(|controller| controller.handle_session_key(event))
-            })
-            .unwrap_or(false)
-    })
-}
-
-pub fn is_resident() -> bool {
-    RESIDENT.load(Ordering::Relaxed)
-}
-
-pub fn show_notification_request(
-    session: Session,
-    form: bool,
-    draft: Option<std::collections::BTreeMap<String, Vec<String>>>,
-) {
-    if form {
-        CONTROLLER.with(|slot| {
-            if let Some(controller) = slot.borrow().as_ref() {
-                controller.dismiss_menu();
-            }
-        });
-        answers::show_with_draft(session, draft);
-    } else {
-        CONTROLLER.with(|slot| {
-            if let Some(controller) = slot.borrow().as_ref() {
-                let state = controller.ivars();
-                if !state.applications.borrow().enabled(session.client) {
-                    if let Some(target) = session.open_target() {
-                        native::open_target(&target);
-                    }
-                    return;
-                }
-                state.filter_query.borrow_mut().clear();
-                state.filter_dirty.set(true);
-                *state.keyboard_focus.borrow_mut() = Some(session.key());
-                state.expanded.borrow_mut().insert(session.key());
-                state.reveal.borrow_mut().insert(session.key(), 1.0);
-                controller.filter();
-                // Defer entering NSMenu's nested tracking loop until this notification callback returns.
-                // SAFETY: showSessions: exists on the retained main-thread controller.
-                unsafe {
-                    let timer = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
-                        0.0,
-                        controller,
-                        sel!(showSessions:),
-                        None,
-                        false,
-                    );
-                    NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
-                }
-            } else if let Some(target) = session.open_target() {
-                native::open_target(&target);
-            }
-        });
-    }
-}
-
-pub fn refresh_integrations() {
-    CONTROLLER.with(|slot| {
-        if let Some(controller) = slot.borrow().as_ref() {
-            controller.refresh_integration_settings();
-        }
-    });
-}
-
-pub fn refresh_after_response() {
-    CONTROLLER.with(|slot| {
-        if let Some(controller) = slot.borrow().as_ref() {
-            controller.refresh();
-        }
-    });
-}
 #[derive(Clone, Default)]
 struct MessageHistory {
     messages: Vec<crate::agents::history::Message>,
@@ -225,13 +120,15 @@ fn request_controls(session: &Session) -> Vec<RequestControl> {
     controls
 }
 
-struct Discovery {
-    sessions: Result<Vec<Session>>,
-    usage: Option<usage::Usage>,
-}
-
 #[derive(Default)]
-struct State {
+pub struct State {
+    monitor: OnceCell<crate::actors::monitor::Handle>,
+    revision: Cell<u64>,
+    ui_sender: OnceCell<crate::macos::bridge::Sender>,
+    ui_incoming: OnceCell<RefCell<tokio::sync::mpsc::Receiver<crate::macos::bridge::Event>>>,
+    forms: RefCell<Vec<Retained<answers::AnswerForm>>>,
+    platform: OnceCell<RefCell<crate::macos::bridge::Platform>>,
+    snapshot_timer: OnceCell<Retained<NSTimer>>,
     status: OnceCell<Retained<NSStatusItem>>,
     status_content: OnceCell<Retained<StatusContentView>>,
     status_badge: OnceCell<Retained<NSBox>>,
@@ -268,8 +165,6 @@ struct State {
     menu_item: OnceCell<Retained<NSMenuItem>>,
     menu_close_shortcut: OnceCell<Retained<NSMenuItem>>,
     menu_open: Cell<bool>,
-    incoming: RefCell<Option<std::sync::mpsc::Receiver<Discovery>>>,
-    last_refresh: Cell<Option<Instant>>,
     list: OnceCell<Retained<SessionListView>>,
     root: OnceCell<Retained<PanelView>>,
     toolbar: OnceCell<Retained<NSView>>,
@@ -288,14 +183,12 @@ struct State {
     working_epoch: OnceCell<Instant>,
     layout: RefCell<Vec<LayoutRow>>,
     caption: OnceCell<Retained<NSTextField>>,
-    session_notifications: RefCell<HashSet<String>>,
     all: RefCell<Vec<Session>>,
     visible: RefCell<Vec<Session>>,
     filter_query: RefCell<String>,
     filter_dirty: Cell<bool>,
     usage: RefCell<Option<usage::Usage>>,
     lock: OnceCell<File>,
-    refreshing: Cell<bool>,
     routing_scroll: Cell<bool>,
     buttons: RefCell<Vec<ButtonHover>>,
     request_controls: RefCell<HashMap<String, RequestControl>>,
@@ -369,7 +262,7 @@ define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[ivars = State]
-    struct MenuController;
+    pub struct MenuController;
 
     unsafe impl NSObjectProtocol for MenuController {}
     // SAFETY: The retained controller handles the window's main-thread delegate callback.
@@ -425,6 +318,8 @@ define_class!(
             self.paint_status_eyes();
         }
 
+        #[unsafe(method(pollState:))]
+        fn poll_state(&self,_timer:&NSTimer){self.drain_ui();self.receive_sessions();}
         #[unsafe(method(pollPointer:))]
         fn poll_pointer(&self, _timer: &NSTimer) {
             self.sync_footer_extension();
@@ -432,7 +327,6 @@ define_class!(
             self.receive_sessions();
             self.advance_disclosure();
             self.advance_working_icons();
-            if self.ivars().last_refresh.get().is_none_or(|last| last.elapsed() >= Duration::from_secs(2)) { self.refresh(); }
             self.sample_pointer();
         }
 
@@ -465,25 +359,7 @@ define_class!(
                 history.cursor.clone()
             };
             self.render_rows(&state.filtered_sessions());
-            std::thread::spawn(move || {
-                let result = session.previous_message(before.as_deref());
-                dispatch2::DispatchQueue::main().exec_async(move || {
-                    CONTROLLER.with(|slot| {
-                        let Some(controller) = slot.borrow().as_ref().cloned() else { return; };
-                        {
-                            let mut histories = controller.ivars().message_history.borrow_mut();
-                            let Some(history) = histories.get_mut(&key).filter(|history| history.ticket == ticket) else { return; };
-                            history.loading = false;
-                            match result {
-                                Ok(Some(message)) => { history.cursor = Some(message.cursor.clone()); history.messages.insert(0, message); }
-                                Ok(None) => history.exhausted = true,
-                                Err(error) => { history.error = Some(format!("{error:#}")); history.cursor = None; history.messages.clear(); }
-                            }
-                        }
-                        controller.render_rows(&controller.ivars().filtered_sessions());
-                    });
-                });
-            });
+            let _ = self.monitor().send(crate::actors::monitor::Command::History{session:key,cursor:before,generation:ticket});
         }
 
         #[unsafe(method(respondToRequest:))]
@@ -492,38 +368,13 @@ define_class!(
             let control = self.ivars().request_controls.borrow().get(&id).cloned();
             let Some(control) = control else { return; };
             match control.kind {
-                ControlKind::Form => { self.dismiss_menu(); answers::show(control.session); }
+                ControlKind::Form => { self.dismiss_menu(); self.show_form(control.session,None); }
                 ControlKind::Open => {
-                    if let Some(target) = control.session.open_target() { self.dismiss_menu(); native::open_target(&target); }
+                    self.dismiss_menu(); self.monitor().open(&control.session);
                 }
                 ControlKind::Reply(response) => {
-                    let Some(key) = control.session.approval_key() else { return; };
-                    if !self.ivars().responding.borrow_mut().insert(key.clone()) { return; }
-                    for item in self.ivars().buttons.borrow().iter() {
-                        if item.button.identifier().is_some_and(|id| id.to_string().starts_with(&format!("response:{key}:"))) { item.button.setEnabled(false); }
-                    }
-                    if let Some(button) = sender { button.setTitle(ns_string!("Sending…")); }
-                    std::thread::spawn(move || {
-                        let sent = control.session.respond(&response);
-                        dispatch2::DispatchQueue::main().exec_async(move || {
-                            CONTROLLER.with(|slot| {
-                                if let Some(controller) = slot.borrow().as_ref() {
-                                    controller.ivars().responding.borrow_mut().remove(&key);
-                                    for item in controller.ivars().buttons.borrow().iter() {
-                                        if let Some(button_id) = item.button.identifier().map(|id| id.to_string())
-                                            && button_id.starts_with(&format!("response:{key}:")) {
-                                            item.button.setEnabled(!sent);
-                                            if button_id == id {
-                                                item.button.setTitle(&NSString::from_str(&if sent { "Sent".into() } else { format!("Retry — {}", control.label) }));
-                                                if !sent { item.button.setToolTip(Some(ns_string!("Could not send. The request may have changed."))); }
-                                            }
-                                        }
-                                    }
-                                    controller.refresh();
-                                }
-                            });
-                        });
-                    });
+                    if let Err(error)=self.monitor().submit(&control.session,response) && let Some(button)=sender {button.setToolTip(Some(&NSString::from_str(&error)));}
+
                 }
             }
         }
@@ -533,9 +384,8 @@ define_class!(
             let Some(id) = sender.and_then(|button| button.identifier()) else { return; };
             let data = self.ivars().all.borrow();
             if let Some(session) = data.iter().find(|session| session.key() == id.to_string()) {
-                let Some(target) = session.open_target() else { return; };
                 self.dismiss_menu();
-                native::open_target(&target);
+                self.monitor().open(session);
             }
         }
 
@@ -547,7 +397,7 @@ define_class!(
 
         #[unsafe(method(setupIntegrations:))]
         fn setup_integrations(&self, _sender: Option<&AnyObject>) {
-            crate::macos::onboarding::begin(self.mtm(), true);
+            let _=self.monitor().send(crate::actors::monitor::Command::Platform(crate::macos::bridge::PlatformCommand::Setup(true)));
             self.refresh_integration_settings();
         }
 
@@ -556,63 +406,52 @@ define_class!(
             if let Some(field) = self.ivars().telegram_token.get() {
                 let token = field.stringValue().to_string();
                 field.setStringValue(ns_string!(""));
-                crate::macos::telegram::connect(token);
+                let _=self.monitor().send(crate::actors::monitor::Command::Telegram(crate::actors::human::telegram::Event::Connect(token)));
                 self.refresh_telegram_settings();
             }
         }
         #[unsafe(method(disconnectTelegram:))]
         fn disconnect_telegram(&self, _sender: Option<&AnyObject>) {
-            crate::macos::telegram::disconnect();
+            let _=self.monitor().send(crate::actors::monitor::Command::Telegram(crate::actors::human::telegram::Event::Disconnect));
         }
         #[unsafe(method(toggleTelegram:))]
         fn toggle_telegram(&self, sender: &NSButton) {
-            crate::macos::telegram::enable(sender.state() == NSControlStateValueOn);
+            let _=self.monitor().send(crate::actors::monitor::Command::Telegram(crate::actors::human::telegram::Event::Enable(sender.state() == NSControlStateValueOn)));
         }
         #[unsafe(method(pairTelegram:))]
         fn pair_telegram(&self, _sender: Option<&AnyObject>) {
-            if let Some(link) = crate::macos::telegram::status().link
+            if let Some(link) = self.monitor().snapshot().telegram.clone().link
                 && let Some(url) = NSURL::URLWithString(&NSString::from_str(&link)) {
                 NSWorkspace::sharedWorkspace().openURL(&url);
             }
         }
         #[unsafe(method(testTelegram:))]
         fn test_telegram(&self, _sender: Option<&AnyObject>) {
-            crate::macos::telegram::test();
+            let _=self.monitor().send(crate::actors::monitor::Command::Telegram(crate::actors::human::telegram::Event::Test));
         }
 
         #[unsafe(method(toggleLogin:))]
         fn toggle_login(&self, sender: &NSButton) {
-            let result = settings::set_launch_at_login(sender.state() == NSControlStateValueOn);
-            self.refresh_settings();
-            if let Err(error) = result && let Some(note) = self.ivars().login_note.get() {
-                let message = NSString::from_str(&format!("Could not change launch at login: {error}"));
-                note.setStringValue(&message);
-                note.setToolTip(Some(&message));
-                note.setTextColor(Some(&NSColor::systemRedColor()));
-            }
+            let _=self.monitor().send(crate::actors::monitor::Command::Platform(crate::macos::bridge::PlatformCommand::Login(sender.state()==NSControlStateValueOn)));
         }
 
         #[unsafe(method(toggleApplication:))]
         fn toggle_application(&self, sender: &NSSwitch) {
             let Some(id) = sender.identifier() else { return; };
             let state = self.ivars();
-            let changed = state.applications.borrow_mut().set_enabled(&id.to_string(), sender.state() == NSControlStateValueOn);
-            if changed {
-                settings::save_applications(&state.applications.borrow());
-                state.filter_dirty.set(true);
-                self.filter();
-            }
+            let mut apps=state.applications.borrow().clone();
+            if apps.set_enabled(&id.to_string(),sender.state()==NSControlStateValueOn){let _=self.monitor().send(crate::actors::monitor::Command::Platform(crate::macos::bridge::PlatformCommand::Applications(apps)));}
         }
 
         #[unsafe(method(toggleMenuAnimation:))]
         fn toggle_menu_animation(&self, sender: &NSButton) {
-            settings::set_menu_animation(sender.state() == NSControlStateValueOn);
-            self.update_badge(sessions::pending_count());
+            let _=self.monitor().send(crate::actors::monitor::Command::Platform(crate::macos::bridge::PlatformCommand::Animation(sender.state()==NSControlStateValueOn)));
+            self.update_badge(self.monitor().snapshot().pending_count());
         }
 
         #[unsafe(method(openLoginSettings:))]
         fn open_login_settings(&self, _sender: Option<&AnyObject>) {
-            settings::open_login_settings();
+            let _=self.monitor().send(crate::actors::monitor::Command::Platform(crate::macos::bridge::PlatformCommand::LoginSettings));
         }
 
         #[unsafe(method(recordShortcut:))]
@@ -626,7 +465,7 @@ define_class!(
         }
 
         #[unsafe(method(quit:))]
-        fn quit(&self, _sender: Option<&AnyObject>) { NSApplication::sharedApplication(self.mtm()).terminate(None); }
+        fn quit(&self, _sender: Option<&AnyObject>) {let _=self.monitor().send(crate::actors::monitor::Command::Shutdown);}
     }
 
 );
@@ -690,23 +529,35 @@ define_class!(
     }
 );
 
-fn pointer_changed() {
-    CONTROLLER.with(|slot| {
-        if let Ok(slot) = slot.try_borrow()
-            && let Some(controller) = slot.as_ref()
-        {
-            controller.update_hover();
+fn owner(view: &NSView) -> Option<Retained<MenuController>> {
+    let mut current = Some(unsafe { Retained::retain(view as *const NSView as *mut NSView) }?);
+    while let Some(view) = current {
+        if let Some(root) = view.downcast_ref::<PanelView>() {
+            return root.ivars().owner.get().and_then(|weak| weak.load());
         }
-    });
+        current = unsafe { view.superview() };
+    }
+    None
 }
-fn route_wheel(event: &NSEvent) {
-    CONTROLLER.with(|slot| {
-        if let Ok(slot) = slot.try_borrow()
-            && let Some(controller) = slot.as_ref()
-        {
-            controller.route_scroll(event);
-        }
-    });
+fn pointer_changed(view: &NSView) {
+    if let Some(controller) = owner(view) {
+        controller.update_hover();
+    }
+}
+fn route_wheel(view: &NSView, event: &NSEvent) {
+    if let Some(controller) = owner(view) {
+        controller.route_scroll(event);
+    }
+}
+#[derive(Default)]
+struct PanelState {
+    owner: OnceCell<objc2::rc::Weak<MenuController>>,
+}
+
+impl std::fmt::Debug for PanelState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PanelState")
+    }
 }
 
 define_class!(
@@ -714,11 +565,12 @@ define_class!(
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
     #[derive(Debug)]
+    #[ivars=PanelState]
     struct PanelView;
     unsafe impl NSObjectProtocol for PanelView {}
     impl PanelView {
         #[unsafe(method(scrollWheel:))]
-        fn wheel(&self, event: &NSEvent) { route_wheel(event); }
+        fn wheel(&self, event: &NSEvent) { route_wheel(self,event); }
     }
 );
 define_class!(
@@ -733,7 +585,7 @@ define_class!(
         fn reflected(&self, clip: &NSClipView) {
             // SAFETY: Forward AppKit's standard scroll notification.
             unsafe { let _: () = msg_send![super(self), reflectScrolledClipView: clip]; }
-            pointer_changed();
+            pointer_changed(self);
         }
     }
 );
@@ -746,7 +598,7 @@ define_class!(
     unsafe impl NSObjectProtocol for RevealClipView {}
     impl RevealClipView {
         #[unsafe(method(scrollWheel:))]
-        fn wheel(&self, event: &NSEvent) { route_wheel(event); }
+        fn wheel(&self, event: &NSEvent) { route_wheel(self,event); }
     }
 );
 define_class!(
@@ -1077,10 +929,99 @@ fn center_label(label: &NSTextField, center_y: f64) {
 }
 
 impl MenuController {
+    pub fn shutdown(&self) {
+        if let Some(timer) = self.ivars().snapshot_timer.get() {
+            timer.invalidate();
+        }
+        if let Some(timer) = self.ivars().status_timer.borrow_mut().take() {
+            timer.invalidate();
+        }
+        self.ivars().shortcut_registration.borrow_mut().take();
+        self.stop_keyboard_tracking();
+        // SAFETY: Both registrations belong to this retained main-thread controller.
+        unsafe {
+            NSNotificationCenter::defaultCenter().removeObserver(self);
+            NSDistributedNotificationCenter::defaultCenter().removeObserver(self);
+        }
+    }
+    fn monitor(&self) -> &crate::actors::monitor::Handle {
+        self.ivars().monitor.get().expect("monitor injected")
+    }
+    fn show_form(
+        &self,
+        session: Session,
+        draft: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    ) {
+        if let Some(form) = answers::show_with_draft(
+            session,
+            draft,
+            self.monitor().clone(),
+            self.ivars().ui_sender.get().unwrap().clone(),
+            &self.ivars().forms.borrow(),
+        ) {
+            form.reconcile(&self.monitor().snapshot());
+            self.ivars().forms.borrow_mut().push(form);
+        }
+    }
+    fn drain_ui(&self) {
+        use crate::macos::bridge::Event;
+        let Some(receiver) = self.ivars().ui_incoming.get() else {
+            return;
+        };
+        loop {
+            let event = receiver.borrow_mut().try_recv();
+            let Ok(event) = event else {
+                break;
+            };
+            match event {
+                Event::Stop => crate::macos::native::stop_application(self.mtm()),
+                Event::Toggle => {
+                    if self.ivars().menu_open.get() {
+                        self.dismiss_menu();
+                    } else {
+                        self.show();
+                    }
+                }
+                Event::FormClosed(key) => self
+                    .ivars()
+                    .forms
+                    .borrow_mut()
+                    .retain(|form| form.key() != Some(key.clone())),
+                Event::Platform(command) => self
+                    .ivars()
+                    .platform
+                    .get()
+                    .unwrap()
+                    .borrow_mut()
+                    .apply(command),
+                Event::ShowRequest {
+                    session,
+                    form,
+                    draft,
+                } => {
+                    self.dismiss_menu();
+                    if form {
+                        self.show_form(*session, draft);
+                    } else {
+                        let key = session.key();
+                        self.ivars().expanded.borrow_mut().insert(key.clone());
+                        *self.ivars().keyboard_focus.borrow_mut() = Some(key);
+                        self.filter();
+                        self.show();
+                    }
+                }
+            }
+        }
+    }
+
     fn clear_menu_shortcut(&self) {
         self.end_shortcut_recording(false);
         self.ivars().shortcut_registration.borrow_mut().take();
-        settings::set_menu_shortcut(None);
+        let _ = self
+            .monitor()
+            .send(crate::actors::monitor::Command::Platform(
+                crate::macos::bridge::PlatformCommand::Shortcut(None),
+            ));
         self.ivars().shortcut_error.borrow_mut().take();
         self.refresh_settings();
     }
@@ -1090,11 +1031,15 @@ impl MenuController {
         drop(old);
         self.ivars().shortcut_error.borrow_mut().take();
         self.configure_menu_shortcut();
-        if let Some(shortcut) = settings::menu_shortcut() {
+        if let Some(shortcut) = self.monitor().snapshot().preferences.shortcut.clone() {
             if self.ivars().menu_open.get() {
                 return;
             }
-            match hotkey::Registration::new(&shortcut, self.mtm()) {
+            match hotkey::Registration::new(
+                &shortcut,
+                self.mtm(),
+                self.ivars().ui_sender.get().unwrap().clone(),
+            ) {
                 Ok(registration) => {
                     *self.ivars().shortcut_registration.borrow_mut() = Some(registration)
                 }
@@ -1105,7 +1050,7 @@ impl MenuController {
 
     fn configure_menu_shortcut(&self) {
         if let Some(item) = self.ivars().menu_close_shortcut.get() {
-            if let Some(shortcut) = settings::menu_shortcut() {
+            if let Some(shortcut) = self.monitor().snapshot().preferences.shortcut.clone() {
                 item.setKeyEquivalent(&NSString::from_str(&shortcut.menu_key_equivalent()));
                 item.setKeyEquivalentModifierMask(shortcut.cocoa_modifiers());
                 item.setEnabled(true);
@@ -1125,12 +1070,10 @@ impl MenuController {
         let old = self.ivars().shortcut_registration.borrow_mut().take();
         drop(old);
         self.ivars().shortcut_error.borrow_mut().take();
-        let callback = block2::RcBlock::new(|event: std::ptr::NonNull<NSEvent>| {
-            let handled = CONTROLLER.with(|slot| {
-                slot.borrow().as_ref().is_some_and(|controller| {
-                    // SAFETY: The local monitor supplies a live event for this callback.
-                    controller.record_shortcut_key(unsafe { event.as_ref() })
-                })
+        let weak = objc2::rc::Weak::new(self);
+        let callback = block2::RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| {
+            let handled = weak.load().is_some_and(|controller| {
+                controller.record_shortcut_key(unsafe { event.as_ref() })
             });
             if handled {
                 std::ptr::null_mut()
@@ -1205,10 +1148,18 @@ impl MenuController {
             self.refresh_settings();
             return true;
         };
-        match hotkey::Registration::new(&shortcut, self.mtm()) {
+        match hotkey::Registration::new(
+            &shortcut,
+            self.mtm(),
+            self.ivars().ui_sender.get().unwrap().clone(),
+        ) {
             Ok(registration) => {
                 *self.ivars().shortcut_registration.borrow_mut() = Some(registration);
-                settings::set_menu_shortcut(Some(&shortcut));
+                let _ = self
+                    .monitor()
+                    .send(crate::actors::monitor::Command::Platform(
+                        crate::macos::bridge::PlatformCommand::Shortcut(Some(shortcut)),
+                    ));
                 self.ivars().shortcut_error.borrow_mut().take();
                 self.end_shortcut_recording(false);
             }
@@ -1248,12 +1199,42 @@ impl MenuController {
         }
     }
 
-    fn create(mtm: MainThreadMarker, lock: File) -> Retained<Self> {
+    fn create(
+        mtm: MainThreadMarker,
+        lock: File,
+        monitor: crate::actors::monitor::Handle,
+        ui: crate::macos::bridge::Sender,
+        incoming: tokio::sync::mpsc::Receiver<crate::macos::bridge::Event>,
+    ) -> Retained<Self> {
         let allocated = Self::alloc(mtm).set_ivars(State::default());
         // SAFETY: NSObject's initializer is valid for this subclass and its ivars.
         let this: Retained<Self> = unsafe { msg_send![super(allocated), init] };
         this.ivars().lock.set(lock).expect("lock initialized once");
-        *this.ivars().applications.borrow_mut() = settings::applications();
+        this.ivars()
+            .platform
+            .set(RefCell::new(crate::macos::bridge::Platform::new(
+                monitor.clone(),
+                ui.clone(),
+            )))
+            .ok();
+        this.ivars().monitor.set(monitor).ok();
+        this.ivars().ui_sender.set(ui).ok();
+        this.ivars().ui_incoming.set(RefCell::new(incoming)).ok();
+        let timer = unsafe {
+            NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                0.1,
+                &this,
+                sel!(pollState:),
+                None,
+                true,
+            )
+        };
+        unsafe {
+            NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
+        }
+        this.ivars().snapshot_timer.set(timer).ok();
+        *this.ivars().applications.borrow_mut() =
+            this.monitor().snapshot().preferences.applications.clone();
         this.build_menu();
         this.build_status_item();
         this.install_shortcut();
@@ -1503,7 +1484,7 @@ impl MenuController {
     }
 
     fn refresh_telegram_settings(&self) {
-        let status = crate::macos::telegram::status();
+        let status = self.monitor().snapshot().telegram.clone();
         let state = self.ivars();
         if let Some(label) = state.telegram_status.get() {
             label.setStringValue(&NSString::from_str(&status.text));
@@ -1528,21 +1509,21 @@ impl MenuController {
     }
 
     fn refresh_integration_settings(&self) {
-        use crate::macos::onboarding::{self, Phase};
+        use crate::macos::onboarding::Phase;
         let state = self.ivars();
         let Some(list) = state.integrations_list.get() else {
             return;
         };
         if let Some(button) = state.integrations_button.get() {
-            button.setEnabled(!onboarding::busy());
-            button.setTitle(if onboarding::busy() {
+            button.setEnabled(!self.monitor().snapshot().integration_busy);
+            button.setTitle(if self.monitor().snapshot().integration_busy {
                 ns_string!("Setting up…")
             } else {
                 ns_string!("Check & set up")
             });
         }
         if let Some(note) = state.integrations_note.get() {
-            let text = onboarding::notification_note();
+            let text = self.monitor().snapshot().integration_note.clone();
             note.setStringValue(&NSString::from_str(&text));
             note.setToolTip(
                 (!text.is_empty())
@@ -1550,7 +1531,7 @@ impl MenuController {
                     .as_deref(),
             );
         }
-        let rows = onboarding::rows();
+        let rows = self.monitor().snapshot().integrations.clone();
         if state.integrations_snapshot.borrow().as_ref() == Some(&rows) {
             return;
         }
@@ -1718,7 +1699,7 @@ impl MenuController {
     fn refresh_settings(&self) {
         self.configure_menu_shortcut();
         let state = self.ivars();
-        let status = settings::login_status();
+        let status = self.monitor().snapshot().preferences.login;
         if let Some(toggle) = state.login_switch.get() {
             toggle.setState(
                 if matches!(
@@ -1732,7 +1713,7 @@ impl MenuController {
             );
         }
         if let Some(toggle) = state.animation_switch.get() {
-            toggle.setState(if settings::menu_animation() {
+            toggle.setState(if self.monitor().snapshot().preferences.animation {
                 NSControlStateValueOn
             } else {
                 NSControlStateValueOff
@@ -1751,7 +1732,13 @@ impl MenuController {
         if let Some(button) = state.login_settings_button.get() {
             button.setHidden(status != settings::LoginStatus::RequiresApproval);
         }
-        let shortcut = settings::menu_shortcut();
+        if let Some(error) = self.monitor().snapshot().preferences.error.as_ref()
+            && let Some(note) = state.login_note.get()
+        {
+            note.setStringValue(&NSString::from_str(error));
+            note.setTextColor(Some(&NSColor::systemRedColor()));
+        }
+        let shortcut = self.monitor().snapshot().preferences.shortcut.clone();
         let recording = state.shortcut_monitor.borrow().is_some();
         if let Some(button) = state.shortcut_button.get() {
             let title = if recording {
@@ -1891,7 +1878,7 @@ impl MenuController {
             .status
             .set(item)
             .expect("status initialized once");
-        self.update_badge(sessions::pending_count());
+        self.update_badge(self.monitor().snapshot().pending_count());
     }
 
     fn paint_status_eyes(&self) {
@@ -1924,7 +1911,7 @@ impl MenuController {
                 .iter()
                 .any(|session| session.activity == Activity::Working);
         let animate = working
-            && settings::menu_animation()
+            && self.monitor().snapshot().preferences.animation
             && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
         let Some(item) = state.status.get() else {
             return;
@@ -2052,9 +2039,13 @@ impl MenuController {
         let mtm = self.mtm();
         // NSMenu supplies the system background and owns presentation/dismissal.
         // SAFETY: NSView's initializer is valid for this ivar-free subclass.
-        let view: Retained<PanelView> = unsafe {
-            msg_send![PanelView::alloc(mtm), initWithFrame: rect(0.0, 0.0, 392.0, 476.0)]
-        };
+        let allocated = PanelView::alloc(mtm).set_ivars(PanelState::default());
+        let view: Retained<PanelView> =
+            unsafe { msg_send![super(allocated),initWithFrame:rect(0.0,0.0,392.0,476.0)] };
+        view.ivars()
+            .owner
+            .set(objc2::rc::Weak::new(self))
+            .expect("root owner initialized once");
         view.setWantsLayer(true);
         // SAFETY: OverlayView has no ivars or custom initialization.
         let toolbar: Retained<OverlayView> = unsafe {
@@ -2339,7 +2330,7 @@ impl MenuController {
             && state.keyboard_handler.borrow().is_none()
             && state.root.get().and_then(|root| root.window()).is_some()
         {
-            match hotkey::MenuKeyboard::new(self.mtm()) {
+            match hotkey::MenuKeyboard::new(self.mtm(), objc2::rc::Weak::new(self)) {
                 Ok(handler) => *state.keyboard_handler.borrow_mut() = Some(handler),
                 Err(error) => eprintln!("ai-agent-monitor: {error:#}"),
             }
@@ -2350,7 +2341,7 @@ impl MenuController {
         self.ivars().keyboard_handler.borrow_mut().take();
     }
 
-    fn handle_session_key(&self, event: &NSEvent) -> bool {
+    pub fn handle_session_key(&self, event: &NSEvent) -> bool {
         let state = self.ivars();
         if !state.menu_open.get()
             || event.modifierFlags().intersects(
@@ -2412,17 +2403,11 @@ impl MenuController {
             if !event.isARepeat() && expanded != (key == 124) {
                 self.begin_disclosure(&id);
             }
-        } else if !event.isARepeat() {
-            let target = state
-                .all
-                .borrow()
-                .iter()
-                .find(|session| session.key() == id)
-                .and_then(Session::open_target);
-            if let Some(target) = target {
-                self.dismiss_menu();
-                native::open_target(&target);
-            }
+        } else if !event.isARepeat()
+            && let Some(session) = state.all.borrow().iter().find(|s| s.key() == id).cloned()
+        {
+            self.dismiss_menu();
+            self.monitor().open(&session);
         }
         true
     }
@@ -3366,6 +3351,16 @@ impl MenuController {
                             ),
                             false,
                         );
+                        button.setEnabled(
+                            session.authoritative
+                                && !matches!(
+                                    self.monitor().snapshot().submissions.get(&key),
+                                    Some(
+                                        crate::actors::monitor::Submission::Sending
+                                            | crate::actors::monitor::Submission::Reconciling
+                                    )
+                                ),
+                        );
                         button.setBezelStyle(NSBezelStyle::Push);
                         button.setFont(Some(&NSFont::systemFontOfSize(12.0)));
                         if let Some(cell) = button.cell() {
@@ -3380,7 +3375,10 @@ impl MenuController {
                                 format!("{}\n{}", control.label, control.detail)
                             },
                         )));
-                        button.setEnabled(!self.ivars().responding.borrow().contains(&key));
+                        button.setEnabled(
+                            session.authoritative
+                                && !self.ivars().responding.borrow().contains(&key),
+                        );
                         self.ivars()
                             .request_controls
                             .borrow_mut()
@@ -3721,92 +3719,74 @@ impl MenuController {
     }
 
     fn refresh(&self) {
-        let state = self.ivars();
-        if state.refreshing.replace(true) {
-            return;
-        }
-        state.last_refresh.set(Some(Instant::now()));
-        let (sender, receiver) = std::sync::mpsc::channel();
-        *state.incoming.borrow_mut() = Some(receiver);
-        std::thread::spawn(move || {
-            let usage = usage::latest(&core::codex_home());
-            let _ = sender.send(Discovery {
-                sessions: sessions::open(),
-                usage,
-            });
-        });
+        let _ = self
+            .monitor()
+            .send(crate::actors::monitor::Command::Refresh);
     }
-
     fn receive_sessions(&self) {
         let state = self.ivars();
-        let result =
-            state
-                .incoming
-                .borrow()
-                .as_ref()
-                .and_then(|receiver| match receiver.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Discovery {
-                        sessions: Err(anyhow::anyhow!("session worker disconnected")),
-                        usage: None,
-                    }),
-                });
-        let Some(result) = result else {
+        let snapshot = self.monitor().snapshot();
+        if state.revision.replace(snapshot.revision) == snapshot.revision {
             return;
-        };
-        state.incoming.borrow_mut().take();
-        state.refreshing.set(false);
-        *state.usage.borrow_mut() = result.usage;
+        }
+        *state.usage.borrow_mut() = snapshot.usage.clone();
         self.render_footer();
-        match result.sessions {
-            Ok(sessions) => {
-                crate::macos::telegram::sync(&sessions);
-                let learned = {
-                    let mut applications = state.applications.borrow_mut();
-                    let changed =
-                        applications.observe(sessions.iter().map(|session| session.client));
-                    if changed {
-                        settings::save_applications(&applications);
-                    }
-                    changed
-                };
-                if learned {
-                    self.refresh_application_settings();
-                }
-                let requests: HashSet<_> = sessions
-                    .iter()
-                    .filter(|session| session.approval.is_some())
-                    .filter_map(Session::approval_key)
-                    .collect();
-                let mut previous = state.session_notifications.borrow_mut();
-                for old in previous.difference(&requests) {
-                    native::remove_session_notification(old);
-                }
-                for session in &sessions {
-                    if let Some(key) = session.approval_key()
-                        && requests.contains(&key)
-                        && !previous.contains(&key)
-                    {
-                        native::notify_session(session);
-                    }
-                }
-                *previous = requests;
-                drop(previous);
-                *state.all.borrow_mut() = sessions;
-                self.filter();
-            }
-            Err(error) => {
-                eprintln!("ai-agent-monitor: cannot read sessions: {error:#}");
-                state.all.borrow_mut().clear();
-                self.filter();
-                if let Some(caption) = state.caption.get() {
-                    caption.setStringValue(ns_string!("Could not refresh sessions"));
-                    caption.setHidden(false);
+        for form in state.forms.borrow().iter() {
+            form.reconcile(&snapshot);
+        }
+        {
+            let mut histories = state.message_history.borrow_mut();
+            for (key, history) in histories.iter_mut() {
+                if let Some(value) = snapshot.history.get(key)
+                    && value.generation == history.ticket
+                {
+                    history.messages = value.messages.clone();
+                    history.cursor = value.cursor.clone();
+                    history.loading = value.loading;
+                    history.exhausted = value.exhausted;
+                    history.error = value.error.clone();
                 }
             }
         }
-        self.update_badge(sessions::pending_count());
+        state.responding.borrow_mut().retain(|key| {
+            matches!(
+                snapshot.submissions.get(key),
+                Some(
+                    crate::actors::monitor::Submission::Sending
+                        | crate::actors::monitor::Submission::Reconciling
+                )
+            )
+        });
+        state.filter_dirty.set(true);
+        state.responding.borrow_mut().extend(
+            snapshot
+                .submissions
+                .iter()
+                .filter(|(_, phase)| {
+                    matches!(
+                        phase,
+                        crate::actors::monitor::Submission::Sending
+                            | crate::actors::monitor::Submission::Reconciling
+                    )
+                })
+                .map(|(key, _)| key.clone()),
+        );
+        let sessions = snapshot.sessions.clone();
+        let preferences = &snapshot.preferences;
+        let applications_changed = *state.applications.borrow() != preferences.applications;
+        *state.applications.borrow_mut() = preferences.applications.clone();
+        if applications_changed {
+            self.refresh_application_settings();
+        }
+        self.refresh_settings();
+        self.refresh_telegram_settings();
+        self.refresh_integration_settings();
+        *state.all.borrow_mut() = sessions;
+        self.filter();
+        if snapshot.stopping {
+            crate::macos::native::stop_application(self.mtm());
+        }
+        self.update_badge(snapshot.pending_count());
     }
 
     fn filter(&self) {
@@ -3858,7 +3838,21 @@ impl MenuController {
     }
 }
 
-pub fn start(mtm: MainThreadMarker, show: bool) -> Result<bool> {
+pub struct Resident {
+    pub monitor: crate::actors::monitor::Handle,
+    pub ui: crate::macos::bridge::Sender,
+    pub controller: Retained<MenuController>,
+    pub notifications: tokio::sync::mpsc::Sender<native::NotificationInput>,
+    _actors: crate::app::actor_system::ActorSystem,
+    _ipc: tokio::task::JoinHandle<()>,
+}
+impl Drop for Resident {
+    fn drop(&mut self) {
+        self.controller.shutdown();
+        self._ipc.abort();
+    }
+}
+pub fn start(mtm: MainThreadMarker, show: bool) -> Result<Option<Resident>> {
     let directory = core::home().join("Library/Application Support/AI Agent Monitor");
     fs::create_dir_all(&directory)?;
     let lock = OpenOptions::new()
@@ -3888,11 +3882,14 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<bool> {
                     );
             }
         }
-        return Ok(false);
+        return Ok(None);
     }
-    crate::app::ipc::start()?;
-    RESIDENT.store(true, Ordering::Relaxed);
-    let controller = MenuController::create(mtm, lock);
+    let (ui, incoming) = tokio::sync::mpsc::channel(128);
+    let actors = crate::app::actor_system::ActorSystem::start(ui.clone())?;
+    let notifications = actors.start_notifications(ui.clone());
+    let ipc = actors.start_ipc()?;
+    let controller =
+        MenuController::create(mtm, lock, actors.monitor.clone(), ui.clone(), incoming);
     // Wait for launch completion before an explicit CLI request opens the menu.
     // The regular app launch keeps only its status icon, with no popup window.
     if show {
@@ -3906,39 +3903,19 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<bool> {
             );
         }
     }
-    CONTROLLER.with(|slot| *slot.borrow_mut() = Some(controller));
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(Duration::from_secs(2));
-            let pending_count = sessions::pending_count();
-            dispatch2::DispatchQueue::main().exec_async(move || {
-                CONTROLLER.with(|slot| {
-                    if let Some(controller) = slot.borrow().as_ref() {
-                        controller.update_badge(pending_count);
-                        controller.receive_sessions();
-                        if controller
-                            .ivars()
-                            .settings_window
-                            .get()
-                            .is_some_and(|window| window.isVisible())
-                        {
-                            controller.refresh_integration_settings();
-                            controller.refresh_telegram_settings();
-                        }
-                        if controller
-                            .ivars()
-                            .last_refresh
-                            .get()
-                            .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
-                        {
-                            controller.refresh();
-                        }
-                    }
-                })
-            });
-        }
-    });
-    Ok(true)
+    let _ = actors
+        .monitor
+        .send(crate::actors::monitor::Command::Platform(
+            crate::macos::bridge::PlatformCommand::Setup(false),
+        ));
+    Ok(Some(Resident {
+        monitor: actors.monitor.clone(),
+        ui,
+        controller,
+        notifications,
+        _actors: actors,
+        _ipc: ipc,
+    }))
 }
 
 #[cfg(test)]
@@ -4053,6 +4030,9 @@ mod close_tests {
 
     fn session(id: &str, approval: Option<&str>) -> Session {
         Session {
+            authoritative: true,
+            interaction_data: Default::default(),
+            target: None,
             agent: "codex",
             id: id.into(),
             title: id.into(),
@@ -4067,7 +4047,7 @@ mod close_tests {
                 Activity::Idle
             },
             last_message: String::new(),
-            approval: approval.map(|path| sessions::Approval {
+            approval: approval.map(|path| crate::agents::sessions::Approval {
                 id: path.into(),
                 body: "Подтверждение".into(),
                 expires: u64::MAX,

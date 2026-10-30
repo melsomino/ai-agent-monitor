@@ -50,6 +50,8 @@ Use your own Telegram bot to receive agent questions and answer them away from t
 3. Click **Open pairing link**, then press **Start** in your bot. The one-time pairing link expires after 10 minutes.
 4. Click **Send test** to verify delivery. **Send questions to Telegram** pauses or resumes the integration; **Disconnect** removes the saved token and pairing.
 
+The bot's **Menu** button lists `/sessions`, `/status`, and `/help`. `/sessions` reads the currently open sessions (including idle ones), grouped by application with their status; `/status` shows the monitor version and notification state. Command replies also include a button keyboard. These read-only commands remain available while Telegram question notifications are paused.
+
 Approval messages use the agent's offered answer buttons. For a question that accepts a custom answer, reply to its bot message. Multiple questions are presented one at a time and submitted together. Questions marked as secret must be answered in the agent app.
 
 Only the paired private Telegram account can reply. The monitor rechecks the live request before forwarding an answer, and removes answer buttons when a request is resolved elsewhere. Your Mac must be awake and the monitor running to deliver notifications or process replies. Session titles and question text are sent through Telegram; this integration is opt-in. Use a separate bot for each monitor instance: Telegram polling cannot be shared with another bot client or an active webhook.
@@ -294,8 +296,10 @@ cargo clippy --locked --all-targets -- -D warnings
 
 ```text
 src/
-├── app/         CLI, shared utilities, app bundling, and hook installation
-├── agents/      Common session/interaction models and agent providers
+├── domain/      Pure session, interaction, preference, and status models
+├── actors/      Monitor state owner, agent adapters, and human interactors
+├── app/         Runtime bootstrap, IPC, CLI, bundling, and hook installation
+├── agents/      Provider protocols, discovery, and owned caches
 │   ├── codex/   Local session discovery, live requests, questions, and usage
 │   ├── claude/  Claude Code lifecycle and permission hooks
 │   └── cline/   Cline hooks and current-task state
@@ -309,5 +313,7 @@ cargo run --release --locked -- dmg
 ```
 
 This packages the signed app and an Applications shortcut into `build/release/AI-Agent-Monitor-apple-silicon.dmg` (or `AI-Agent-Monitor-intel.dmg` for an Intel build), alongside `SHA256SUMS`. DMG packaging does not grant a Developer ID signature or notarization.
+
+The resident uses Tokio actors with one-way commands and state subscriptions. Window controllers, macOS notifications, and Telegram share the Monitor state; no application state is stored in global variables. See the [actor architecture](docs/actor-architecture.md) for the design.
 
 See [Integration notes](docs/integrations.md) for discovery, response validation, local storage, and provider extension details.

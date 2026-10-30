@@ -87,3 +87,11 @@ mod tests {
         assert!(!interaction.valid_answers(&BTreeMap::from([("one".into(), vec![" ".into()])])));
     }
 }
+
+/// Evidence reported by an agent adapter, never a reply channel to the human actor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Confirmed,
+    NotSent,
+    Uncertain,
+}
