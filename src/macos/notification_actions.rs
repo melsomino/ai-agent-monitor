@@ -140,9 +140,6 @@ impl Bindings {
             .filter(|b| b.plan.category() == category)
             .cloned()
     }
-    pub fn active(&self, key: &str) -> bool {
-        self.values.contains_key(key)
-    }
     pub fn remove(&mut self, key: &str) -> bool {
         self.values.remove(key).is_some()
     }

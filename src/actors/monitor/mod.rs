@@ -22,11 +22,13 @@ mod command;
 pub(crate) async fn run(
     mut rx: mpsc::Receiver<Command>,
     published: watch::Sender<Arc<State>>,
-    agents: HashMap<&'static str, mpsc::Sender<AgentCommand>>,
+    mut agents: HashMap<&'static str, mpsc::Sender<AgentCommand>>,
     telegram: mpsc::Sender<crate::actors::human::telegram::Event>,
     ui: crate::macos::bridge::Sender,
 ) {
     let mut state = State::default();
+    let mut preferences_loaded = false;
+    let mut stopped = HashSet::new();
     let mut discovered = Vec::new();
     let mut sources = HashMap::<&'static str, Vec<Session>>::new();
     let mut resolved = HashMap::<String, Approval>::new();
@@ -37,6 +39,9 @@ pub(crate) async fn run(
                 sessions,
                 usage,
             } => {
+                if stopped.contains(source) {
+                    continue;
+                }
                 let usage_changed = source == "codex" && state.usage != usage;
                 if source == "codex" {
                     state.usage = usage.clone();
@@ -85,6 +90,48 @@ pub(crate) async fn run(
                         .collect::<Vec<_>>()
                         .join("; ")
                 });
+            }
+            Command::AgentStopped { source, error } => {
+                stopped.insert(source);
+                agents.remove(source);
+                if let Some(sessions) = sources.get_mut(source) {
+                    for session in sessions {
+                        session.authoritative = false;
+                        session.activity = Activity::Unknown;
+                        if let Some(key) = session.approval_key() {
+                            state
+                                .submissions
+                                .insert(key, Submission::Failed(error.clone()));
+                        }
+                    }
+                }
+                for (key, history) in &mut state.history {
+                    if key.starts_with(&format!("{source}:")) {
+                        let history = Arc::make_mut(history);
+                        history.loading = false;
+                        history.error = Some(error.clone());
+                    }
+                }
+                discovered = sources.values().flatten().cloned().collect();
+                discovered.sort_by_key(Session::key);
+                state.agent_errors.insert(source.into(), error);
+                state.discovery_error = Some(
+                    state
+                        .agent_errors
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                );
+            }
+            Command::SetApplicationEnabled { id, enabled } => {
+                if state.preferences.applications.set_enabled(&id, enabled) {
+                    let _ = ui.try_send(crate::macos::bridge::Event::Platform(
+                        crate::macos::bridge::PlatformCommand::Applications(
+                            state.preferences.applications.clone(),
+                        ),
+                    ));
+                }
             }
             Command::Hook {
                 key,
@@ -279,16 +326,24 @@ pub(crate) async fn run(
                 state.integration_busy = busy;
                 state.integration_note = note;
             }
-            Command::PreferencesObserved(preferences) => state.preferences = preferences,
+            Command::PreferencesObserved(mut preferences) => {
+                // Persistence acknowledgements must not overwrite newer application commands.
+                if preferences_loaded {
+                    preferences.applications = state.preferences.applications.clone();
+                }
+                preferences_loaded = true;
+                state.preferences = preferences;
+            }
             Command::Shutdown => {
                 state.stopping = true;
                 state.hooks.clear();
             }
         }
-        if state
-            .preferences
-            .applications
-            .observe(discovered.iter().map(|s| s.client))
+        if preferences_loaded
+            && state
+                .preferences
+                .applications
+                .observe(discovered.iter().map(|s| s.client))
         {
             let _ = ui.try_send(crate::macos::bridge::Event::Platform(
                 crate::macos::bridge::PlatformCommand::Applications(

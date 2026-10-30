@@ -171,6 +171,19 @@ struct ParentProcess {
     birth: String,
     command: String,
 }
+pub(crate) fn is_agent_process(agent: &str, command: &str) -> bool {
+    let path = Path::new(command);
+    path.file_name().is_some_and(|name| name == agent)
+        || (agent == "claude"
+            && path.parent().is_some_and(|parent| {
+                parent.file_name().is_some_and(|name| name == "versions")
+                    && parent
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == "claude")
+            }))
+}
+
 fn owner_from(
     agent: &str,
     mut pid: u32,
@@ -191,11 +204,7 @@ fn owner_from(
             let (pid, birth) = candidate.unwrap_or((pid, process.birth));
             return Ok((pid, birth, "vscode".into()));
         }
-        if candidate.is_none()
-            && (name == agent
-                || (agent == "claude" && process.command.contains("/claude/"))
-                || name == "node")
-        {
+        if candidate.is_none() && (is_agent_process(agent, &process.command) || name == "node") {
             candidate = Some((pid, process.birth));
         }
         pid = process.parent;

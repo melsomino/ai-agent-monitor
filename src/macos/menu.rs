@@ -47,6 +47,15 @@ struct MessageHistory {
     ticket: u64,
 }
 
+impl MessageHistory {
+    fn enqueued(&mut self, result: Result<(), String>) {
+        if let Err(error) = result {
+            self.loading = false;
+            self.error = Some(error);
+        }
+    }
+}
+
 #[derive(Clone)]
 enum ControlKind {
     Reply(Response),
@@ -133,6 +142,7 @@ pub struct State {
     status_content: OnceCell<Retained<StatusContentView>>,
     status_badge: OnceCell<Retained<NSBox>>,
     status_count: OnceCell<Retained<NSTextField>>,
+    status_working_count: OnceCell<Retained<NSTextField>>,
     status_icon: OnceCell<Retained<NSImageView>>,
     status_base_images: OnceCell<[Retained<NSImage>; 2]>,
     status_eyes: OnceCell<[Retained<NSImageView>; 2]>,
@@ -161,6 +171,7 @@ pub struct State {
     shortcut_error: RefCell<Option<String>>,
     shortcut_monitor: RefCell<Option<Retained<AnyObject>>>,
     shortcut_registration: RefCell<Option<hotkey::Registration>>,
+    shortcut_applied: RefCell<Option<hotkey::Shortcut>>,
     menu: OnceCell<Retained<NSMenu>>,
     menu_item: OnceCell<Retained<NSMenuItem>>,
     menu_close_shortcut: OnceCell<Retained<NSMenuItem>>,
@@ -359,7 +370,13 @@ define_class!(
                 history.cursor.clone()
             };
             self.render_rows(&state.filtered_sessions());
-            let _ = self.monitor().send(crate::actors::monitor::Command::History{session:key,cursor:before,generation:ticket});
+            let result = self.monitor().send(crate::actors::monitor::Command::History{session:key.clone(),cursor:before,generation:ticket});
+            if let Err(error) = result {
+                if let Some(history) = state.message_history.borrow_mut().get_mut(&key) {
+                    history.enqueued(Err(error));
+                }
+                self.render_rows(&state.filtered_sessions());
+            }
         }
 
         #[unsafe(method(respondToRequest:))]
@@ -438,9 +455,9 @@ define_class!(
         #[unsafe(method(toggleApplication:))]
         fn toggle_application(&self, sender: &NSSwitch) {
             let Some(id) = sender.identifier() else { return; };
-            let state = self.ivars();
-            let mut apps=state.applications.borrow().clone();
-            if apps.set_enabled(&id.to_string(),sender.state()==NSControlStateValueOn){let _=self.monitor().send(crate::actors::monitor::Command::Platform(crate::macos::bridge::PlatformCommand::Applications(apps)));}
+            let _ = self.monitor().send(crate::actors::monitor::Command::SetApplicationEnabled {
+                id: id.to_string(), enabled: sender.state() == NSControlStateValueOn,
+            });
         }
 
         #[unsafe(method(toggleMenuAnimation:))]
@@ -827,6 +844,15 @@ fn answer_button_layout(sizes: &[NSSize], available: f64) -> (Vec<NSRect>, f64) 
     }
 }
 
+fn shortcut_needs_sync(
+    applied: &Option<hotkey::Shortcut>,
+    desired: &Option<hotkey::Shortcut>,
+    menu_open: bool,
+    recording: bool,
+) -> bool {
+    !menu_open && !recording && applied != desired
+}
+
 fn adjacent_session(current: Option<usize>, count: usize, forward: bool) -> Option<usize> {
     if count == 0 {
         return None;
@@ -1031,7 +1057,9 @@ impl MenuController {
         drop(old);
         self.ivars().shortcut_error.borrow_mut().take();
         self.configure_menu_shortcut();
-        if let Some(shortcut) = self.monitor().snapshot().preferences.shortcut.clone() {
+        let shortcut = self.monitor().snapshot().preferences.shortcut.clone();
+        *self.ivars().shortcut_applied.borrow_mut() = shortcut.clone();
+        if let Some(shortcut) = shortcut {
             if self.ivars().menu_open.get() {
                 return;
             }
@@ -1154,6 +1182,7 @@ impl MenuController {
             self.ivars().ui_sender.get().unwrap().clone(),
         ) {
             Ok(registration) => {
+                *self.ivars().shortcut_applied.borrow_mut() = Some(shortcut.clone());
                 *self.ivars().shortcut_registration.borrow_mut() = Some(registration);
                 let _ = self
                     .monitor()
@@ -1859,6 +1888,15 @@ impl MenuController {
             count.setAlignment(NSTextAlignment::Center);
             count.setTextColor(Some(&NSColor::whiteColor()));
             center_label(&count, height / 2.0);
+            let working_count =
+                self.label(&content, "", rect(28.0, 0.0, 14.0, 18.0), 12.0, 0.23, false);
+            working_count.setTextColor(Some(&NSColor::systemGreenColor()));
+            working_count.setHidden(true);
+            center_label(&working_count, height / 2.0);
+            self.ivars()
+                .status_working_count
+                .set(working_count)
+                .expect("working count initialized once");
             button.addSubview(&content);
             self.ivars()
                 .status_content
@@ -1904,12 +1942,38 @@ impl MenuController {
 
     fn update_badge(&self, count: usize) {
         let state = self.ivars();
-        let working = count == 0
-            && state
-                .all
-                .borrow()
-                .iter()
-                .any(|session| session.activity == Activity::Working);
+        let working_count = state
+            .all
+            .borrow()
+            .iter()
+            .filter(|session| session.activity == Activity::Working)
+            .count();
+        let working = count == 0 && working_count > 0;
+        let number_width = if let Some(label) = state.status_working_count.get() {
+            label.setHidden(working_count == 0);
+            label.setStringValue(&NSString::from_str(&working_count.to_string()));
+            if working_count == 0 {
+                0.0
+            } else {
+                label
+                    .cell()
+                    .map(|cell| {
+                        cell.cellSizeForBounds(rect(0.0, 0.0, 1000.0, 24.0))
+                            .width
+                            .ceil()
+                            + 1.0
+                    })
+                    .unwrap_or(14.0)
+            }
+        } else {
+            0.0
+        };
+        let extra_width = if working_count > 0 {
+            2.0 + number_width
+        } else {
+            0.0
+        };
+        let canvas_width = 26.0 + extra_width;
         let animate = working
             && self.monitor().snapshot().preferences.animation
             && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
@@ -1932,7 +1996,7 @@ impl MenuController {
             .window()
             .map(|window| (window.frame().size.width - button.frame().size.width).max(0.0))
             .unwrap_or(16.0);
-        let width = (36.0 - margins).max(1.0);
+        let width = (36.0 + extra_width - margins).max(1.0);
         if item.length() != width {
             item.setLength(width);
         }
@@ -1942,12 +2006,16 @@ impl MenuController {
         let height = button.bounds().size.height;
         if let Some(content) = state.status_content.get() {
             content.setFrame(rect(
-                (button.bounds().size.width - 26.0) / 2.0,
+                (button.bounds().size.width - canvas_width) / 2.0,
                 0.0,
-                26.0,
+                canvas_width,
                 height,
             ));
             allow_status_overflow(content);
+        }
+        if let Some(label) = state.status_working_count.get() {
+            label.setFrame(rect(28.0, 0.0, number_width, 18.0));
+            center_label(label, height / 2.0);
         }
         let badge_x = 26.0 - badge_width;
         let badge_y = (height / 2.0 - 10.0).max(1.0);
@@ -1992,13 +2060,13 @@ impl MenuController {
             label.setFrame(rect(badge_x, badge_y, badge_width, 12.0));
             center_label(label, badge_y + 6.0);
         }
-        let tooltip = if working {
-            "Agent Sessions · Working".to_owned()
-        } else if count == 0 {
-            "Agent Sessions".to_owned()
-        } else {
-            format!("Agent Sessions · Pending requests: {count}")
-        };
+        let mut tooltip = "Agent Sessions".to_owned();
+        if working_count > 0 {
+            tooltip.push_str(&format!(" · Working: {working_count}"));
+        }
+        if count > 0 {
+            tooltip.push_str(&format!(" · Pending requests: {count}"));
+        }
         button.setToolTip(Some(&NSString::from_str(&tooltip)));
     }
 
@@ -3778,6 +3846,14 @@ impl MenuController {
         if applications_changed {
             self.refresh_application_settings();
         }
+        if shortcut_needs_sync(
+            &state.shortcut_applied.borrow(),
+            &preferences.shortcut,
+            state.menu_open.get(),
+            state.shortcut_monitor.borrow().is_some(),
+        ) {
+            self.install_shortcut();
+        }
         self.refresh_settings();
         self.refresh_telegram_settings();
         self.refresh_integration_settings();
@@ -3920,6 +3996,47 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<Option<Resident>> {
 
 #[cfg(test)]
 mod close_tests {
+    #[test]
+    fn delayed_preferences_install_shortcut_and_recording_defers_changes() {
+        let desired = Some(crate::domain::shortcut::Shortcut {
+            key_code: 1,
+            modifiers: 256,
+            key_name: "S".into(),
+        });
+        assert!(super::shortcut_needs_sync(&None, &desired, false, false));
+        assert!(!super::shortcut_needs_sync(&None, &desired, true, false));
+        assert!(!super::shortcut_needs_sync(&None, &desired, false, true));
+        assert!(!super::shortcut_needs_sync(
+            &desired, &desired, false, false
+        ));
+    }
+    #[test]
+    fn full_monitor_queue_does_not_leave_history_loading() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let monitor = crate::actors::monitor::Handle {
+            tx,
+            state: tokio::sync::watch::channel(std::sync::Arc::new(
+                crate::actors::monitor::State::default(),
+            ))
+            .1,
+        };
+        monitor
+            .send(crate::actors::monitor::Command::Refresh)
+            .unwrap();
+        let mut history = super::MessageHistory {
+            loading: true,
+            ..Default::default()
+        };
+        history.enqueued(monitor.send(crate::actors::monitor::Command::History {
+            session: "one".into(),
+            cursor: None,
+            generation: 1,
+        }));
+        assert!(!history.loading);
+        assert!(history.error.is_some());
+        assert!(!history.exhausted);
+    }
+
     use super::*;
 
     #[test]

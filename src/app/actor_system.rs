@@ -45,7 +45,11 @@ impl ActorSystem {
             let source = provider.id();
             let (tx, rx) = mpsc::channel(64);
             agent_ports.insert(source, tx);
-            runtime.spawn(crate::actors::agents::run(provider, rx, handle.clone()));
+            runtime.spawn(crate::actors::agents::supervise(
+                provider,
+                rx,
+                handle.clone(),
+            ));
         }
         let (telegram_tx, telegram_rx) = mpsc::channel(128);
         let monitor_task = runtime.spawn(crate::actors::monitor::run(

@@ -28,6 +28,7 @@ pub enum Event {
     Connect(String),
     Disconnect,
     Enable(bool),
+    #[cfg(test)]
     Sync(Vec<Session>),
     Observe(Box<Session>),
     Test,
@@ -41,7 +42,6 @@ pub async fn run(
     let _ = tokio::task::spawn_blocking(move || {
         let mut snapshots = monitor.subscribe();
         let mut worker = Worker::load(monitor, tx);
-        let mut previous = Vec::new();
         loop {
             if snapshots.has_changed().is_err() {
                 break;
@@ -49,11 +49,8 @@ pub async fn run(
             let snapshot = snapshots.borrow_and_update().clone();
             if snapshot.stopping {
                 worker.retire_all("Monitor stopped. Answer in the agent app.");
+                worker.cleanup_before_disconnect();
                 break;
-            }
-            if snapshot.sessions != previous {
-                previous = snapshot.sessions.clone();
-                worker.event(Event::Sync(previous.clone()));
             }
             for event in rx
                 .try_recv()
@@ -63,6 +60,7 @@ pub async fn run(
             {
                 worker.event(event);
             }
+            worker.sync_sessions(&snapshot.sessions);
             worker.reconcile_phases(&snapshot);
             worker.flush();
             worker.update_counts();
@@ -181,6 +179,19 @@ fn api(token: &str, method: &str, payload: Value) -> Result<Value> {
     );
     let value: Value =
         serde_json::from_slice(&output.stdout).context("Invalid response from Telegram")?;
+    api_result(method, value)
+}
+fn api_result(method: &str, value: Value) -> Result<Value> {
+    if value["ok"] != true && value["error_code"] == 400 {
+        let description = value["description"].as_str().unwrap_or_default();
+        if (method == "deleteMessage" && description == "Bad Request: message to delete not found")
+            || (method == "editMessageText"
+                && (description == "Bad Request: message to edit not found"
+                    || description.starts_with("Bad Request: message is not modified")))
+        {
+            return Ok(json!(true));
+        }
+    }
     if value["ok"] != true {
         bail!(
             "{}",
@@ -196,6 +207,30 @@ fn api(token: &str, method: &str, payload: Value) -> Result<Value> {
     }
     Ok(value["result"].clone())
 }
+// Returns successful cleanup only after deletion or removal of answer controls.
+fn retire_message(
+    chat: Option<i64>,
+    message: i64,
+    text: &str,
+    mut send: impl FnMut(&str, Value) -> Result<Value>,
+) -> Result<()> {
+    send("deleteMessage", json!({"chat_id":chat,"message_id":message}))
+        .or_else(|_| send("editMessageText", json!({"chat_id":chat,"message_id":message,"text":text,"reply_markup":{"inline_keyboard":[]}})))?;
+    Ok(())
+}
+fn cleanup_once(
+    queue: &mut super::retry::Queue<(i64, String)>,
+    now: Instant,
+    mut send: impl FnMut(i64, &str) -> Result<()>,
+) -> Option<(i64, bool)> {
+    let (message, text) = queue.pop_ready(now)?;
+    let success = send(message, &text).is_ok();
+    if !success {
+        queue.push((message, text), now + Duration::from_secs(15));
+    }
+    Some((message, success))
+}
+
 #[derive(Clone)]
 struct Pending {
     session: Session,
@@ -317,6 +352,15 @@ impl Pending {
         }
     }
 }
+fn edit_pending(token: &str, chat: Option<i64>, pending: &Pending) -> Result<()> {
+    let (text, keyboard) = pending.content();
+    api(
+        token,
+        "editMessageText",
+        json!({"chat_id":chat,"message_id":pending.message,"text":text,"reply_markup":keyboard}),
+    )?;
+    Ok(())
+}
 struct Worker {
     monitor: monitor::Handle,
     tx: tokio::sync::mpsc::Sender<Event>,
@@ -325,6 +369,8 @@ struct Worker {
     token: String,
     config: Config,
     pending: HashMap<String, Pending>,
+    cleanup: super::retry::Queue<(i64, String)>,
+    edits: super::retry::Queue<String>,
     pair: Option<(String, Instant)>,
     retry: Instant,
     generation: u64,
@@ -353,6 +399,8 @@ impl Worker {
                 .unwrap_or_default(),
             config,
             pending: HashMap::new(),
+            cleanup: Default::default(),
+            edits: Default::default(),
             pair: None,
             retry: Instant::now(),
             generation: 0,
@@ -476,9 +524,7 @@ impl Worker {
         }
     }
     fn edit(&self, pending: &Pending) -> Result<()> {
-        let (text, keyboard) = pending.content();
-        self.api("editMessageText", json!({"chat_id":self.config.chat,"message_id":pending.message,"text":text,"reply_markup":keyboard}))?;
-        Ok(())
+        edit_pending(&self.token, self.config.chat, pending)
     }
     fn forget(&mut self, key: &str, text: &str) {
         if let Some(pending) = self.pending.remove(key)
@@ -488,26 +534,83 @@ impl Worker {
         }
     }
     fn finish(&mut self, message: i64, text: &str) {
-        let removed = self
-            .api(
-                "deleteMessage",
-                json!({"chat_id":self.config.chat,"message_id":message}),
-            )
-            .or_else(|_| {
-                // Telegram cannot delete messages older than 48 hours. Retire
-                // their answer buttons even when deletion is unavailable.
-                self.api(
-                    "editMessageText",
-                    json!({"chat_id":self.config.chat,"message_id":message,"text":text,"reply_markup":{"inline_keyboard":[]}}),
-                )
-            });
-        if removed.is_ok() {
+        self.cleanup.retain(|(id, _)| *id != message);
+        self.cleanup.push((message, text.into()), Instant::now());
+    }
+    fn flush_cleanup(&mut self) -> bool {
+        let token = &self.token;
+        let chat = self.config.chat;
+        let outcome = cleanup_once(&mut self.cleanup, Instant::now(), |message, text| {
+            retire_message(chat, message, text, |method, payload| {
+                api(token, method, payload)
+            })
+        });
+        if let Some((message, true)) = outcome {
             self.config.messages.retain(|id| *id != message);
             self.save();
         }
+        outcome.is_some()
+    }
+    fn cleanup_before_disconnect(&mut self) {
+        // One best-effort pass before this bot's credentials are discarded.
+        // Failed IDs remain persisted on ordinary shutdown for the next launch.
+        for _ in 0..self.config.messages.len() {
+            if !self.flush_cleanup() {
+                break;
+            }
+        }
+    }
+    fn sync_sessions(&mut self, sessions: &[Session]) {
+        let live: HashSet<_> = sessions.iter().filter_map(Session::approval_key).collect();
+        {
+            let mut status = self.status.borrow_mut();
+            status.snapshot_pending = live.len();
+            status.suppressed = 0;
+        }
+        let stale: Vec<_> = self
+            .pending
+            .keys()
+            .filter(|key| !live.contains(*key))
+            .cloned()
+            .collect();
+        for key in stale {
+            self.forget(
+                &key,
+                "No longer pending. If it returns, use the latest request message.",
+            );
+        }
+        for session in sessions {
+            if self.config.enabled
+                && session
+                    .approval_key()
+                    .is_some_and(|key| !self.pending.contains_key(&key))
+            {
+                self.event(Event::Observe(Box::new(session.clone())));
+            }
+        }
+    }
+    fn flush_edits_with(
+        &mut self,
+        now: Instant,
+        mut send: impl FnMut(&Pending) -> Result<()>,
+    ) -> bool {
+        let Some(key) = self.edits.pop_ready(now) else {
+            return false;
+        };
+        if let Some(pending) = self
+            .pending
+            .get(&key)
+            .filter(|pending| pending.message.is_some())
+            && send(pending).is_err()
+        {
+            self.edits
+                .push(key, Instant::now().max(now) + Duration::from_secs(15));
+        }
+        true
     }
     fn retire_all(&mut self, text: &str) {
         self.pending.clear();
+        self.edits = Default::default();
         for message in self.config.messages.clone() {
             self.finish(message, text);
         }
@@ -553,10 +656,12 @@ impl Worker {
                 self.retire_all(
                     "Telegram disconnected. This request can no longer be answered here.",
                 );
+                self.cleanup_before_disconnect();
                 match crate::macos::keychain::delete() {
                     Ok(()) => {
                         self.outbox.clear();
                         self.token.clear();
+                        self.cleanup = Default::default();
                         self.config = Config::default();
                         self.pair = None;
                         self.save();
@@ -596,32 +701,8 @@ impl Worker {
                     }
                 }
             }
-            Event::Sync(sessions) => {
-                let live: HashSet<_> = sessions.iter().filter_map(Session::approval_key).collect();
-                {
-                    let mut status = self.status.borrow_mut();
-                    status.snapshot_pending = live.len();
-                    status.suppressed = 0;
-                }
-                let stale: Vec<_> = self
-                    .pending
-                    .keys()
-                    .filter(|key| !live.contains(*key))
-                    .cloned()
-                    .collect();
-                for key in stale {
-                    // A discovery gap is not an authoritative resolution.
-                    self.forget(
-                        &key,
-                        "No longer pending. If it returns, use the latest request message.",
-                    );
-                }
-                for session in sessions {
-                    if session.approval.is_some() {
-                        self.event(Event::Observe(Box::new(session)));
-                    }
-                }
-            }
+            #[cfg(test)]
+            Event::Sync(sessions) => self.sync_sessions(&sessions),
             Event::Test => {
                 if self.config.enabled && self.config.chat.is_some() {
                     match self.api("sendMessage",json!({"chat_id":self.config.chat,"text":"AI Agent Monitor is connected. Agent questions will appear here with answer buttons."})) {
@@ -650,6 +731,8 @@ impl Worker {
         let code = nonce()?;
         crate::macos::keychain::save(token)?;
         self.retire_all("Bot reconnected. Use the latest request message.");
+        self.cleanup_before_disconnect();
+        self.cleanup = Default::default();
         self.generation += 1;
         self.token = token.to_owned();
         self.outbox.clear();
@@ -680,9 +763,11 @@ impl Worker {
                 }
             })
             .collect();
+        self.edits.retain(|key| self.pending.contains_key(key));
         for key in changed {
             if self.pending[&key].message.is_some() {
-                let _ = self.edit(&self.pending[&key]);
+                self.edits.retain(|queued| *queued != key);
+                self.edits.push(key, Instant::now());
             }
         }
     }
@@ -725,6 +810,18 @@ impl Worker {
                     self.retry = Instant::now() + Duration::from_secs(15);
                 }
             }
+            return;
+        }
+        let token = self.token.clone();
+        let chat = self.config.chat;
+        if self.flush_edits_with(Instant::now(), |pending| {
+            edit_pending(&token, chat, pending)
+        }) {
+            self.retry = Instant::now() + Duration::from_secs(1);
+            return;
+        }
+        if self.flush_cleanup() {
+            self.retry = Instant::now() + Duration::from_secs(1);
             return;
         }
         if let Some(text) = self.outbox.front() {
@@ -1069,6 +1166,8 @@ mod tests {
                 ..Config::default()
             },
             pending: HashMap::new(),
+            cleanup: Default::default(),
+            edits: Default::default(),
             pair: None,
             retry: Instant::now(),
             generation: 0,
@@ -1096,6 +1195,142 @@ mod tests {
             freeform,
             secret: false,
         }
+    }
+    #[test]
+    fn already_removed_messages_and_unchanged_edits_complete_successfully() {
+        for (method, description) in [
+            ("deleteMessage", "Bad Request: message to delete not found"),
+            ("editMessageText", "Bad Request: message to edit not found"),
+            (
+                "editMessageText",
+                "Bad Request: message is not modified: same contents",
+            ),
+        ] {
+            assert!(
+                api_result(
+                    method,
+                    json!({"ok":false,"error_code":400,"description":description})
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            api_result(
+                "deleteMessage",
+                json!({"ok":false,"error_code":429,"description":"retry later"})
+            )
+            .is_err()
+        );
+        assert!(
+            api_result(
+                "deleteMessage",
+                json!({"ok":false,"error_code":400,"description":"Bad Request: chat not found"})
+            )
+            .is_err()
+        );
+        assert!(api_result("sendMessage", json!({"ok":false,"error_code":400,"description":"Bad Request: message to delete not found"})).is_err());
+    }
+    #[test]
+    fn failed_phase_edits_retry_the_latest_state_without_new_monitor_changes() {
+        let mut worker = worker();
+        let pending = pending(Interaction::allow());
+        let key = pending.session.approval_key().unwrap();
+        worker.pending.insert(key.clone(), pending);
+        let mut snapshot = monitor::State::default();
+        snapshot
+            .submissions
+            .insert(key.clone(), monitor::Submission::Sending);
+        worker.reconcile_phases(&snapshot);
+        let now = Instant::now();
+        assert!(worker.flush_edits_with(now, |pending| {
+            assert_eq!(pending.phase, Some(monitor::Submission::Sending));
+            bail!("offline")
+        }));
+        assert!(!worker.flush_edits_with(now + Duration::from_secs(14), |_| panic!("early retry")));
+        assert!(worker.flush_edits_with(now + Duration::from_secs(16), |_| Ok(())));
+        assert!(worker.edits.next_due().is_none());
+        // A failed answer must restore controls, even when the first edit fails.
+        snapshot
+            .submissions
+            .insert(key, monitor::Submission::Failed("Not sent".into()));
+        worker.reconcile_phases(&snapshot);
+        assert!(worker.flush_edits_with(Instant::now(), |pending| {
+            let (_, keyboard) = pending.content();
+            assert!(!keyboard["inline_keyboard"].as_array().unwrap().is_empty());
+            Ok(())
+        }));
+    }
+    #[test]
+    fn unchanged_questions_are_restored_after_resume_and_pairing() {
+        let sessions = vec![session()];
+        let key = sessions[0].approval_key().unwrap();
+        let mut worker = worker();
+        worker.sync_sessions(&sessions);
+        let nonce = worker.pending[&key].nonce.clone();
+        worker.sync_sessions(&sessions);
+        assert_eq!(worker.pending[&key].nonce, nonce);
+        worker.config.enabled = false;
+        worker.retire_all("Paused");
+        worker.sync_sessions(&sessions);
+        assert!(worker.pending.is_empty());
+        worker.config.enabled = true;
+        worker.sync_sessions(&sessions);
+        assert!(worker.pending.contains_key(&key));
+        // First pairing enables delivery without changing the Monitor snapshot.
+        let mut unpaired = self::worker();
+        unpaired.config.enabled = false;
+        unpaired.config.chat = None;
+        unpaired.sync_sessions(&sessions);
+        assert!(unpaired.pending.is_empty());
+        unpaired.config.chat = Some(42);
+        unpaired.config.enabled = true;
+        unpaired.sync_sessions(&sessions);
+        assert!(unpaired.pending.contains_key(&key));
+    }
+    #[test]
+    fn failed_cleanup_retries_without_restart_and_falls_back_to_editing() {
+        let now = Instant::now();
+        let mut queue = super::super::retry::Queue::default();
+        queue.push((50, "Resolved".to_owned()), now);
+        let mut calls = Vec::new();
+        let outcome = cleanup_once(&mut queue, now, |message, text| {
+            retire_message(Some(42), message, text, |method, _| {
+                calls.push(method.to_owned());
+                bail!("offline")
+            })
+        });
+        assert_eq!(outcome, Some((50, false)));
+        assert_eq!(calls, ["deleteMessage", "editMessageText"]);
+        assert_eq!(
+            cleanup_once(&mut queue, now + Duration::from_secs(14), |_, _| panic!(
+                "too early"
+            )),
+            None
+        );
+        calls.clear();
+        let outcome = cleanup_once(
+            &mut queue,
+            now + Duration::from_secs(15),
+            |message, text| {
+                retire_message(Some(42), message, text, |method, payload| {
+                    calls.push(method.to_owned());
+                    assert_eq!(payload["message_id"], 50);
+                    if method == "deleteMessage" {
+                        bail!("message is too old");
+                    }
+                    assert_eq!(payload["reply_markup"]["inline_keyboard"], json!([]));
+                    Ok(json!(true))
+                })
+            },
+        );
+        assert_eq!(outcome, Some((50, true)));
+        assert_eq!(calls, ["deleteMessage", "editMessageText"]);
+        assert!(queue.next_due().is_none());
+        retire_message(Some(42), 51, "Resolved", |method, _| {
+            assert_eq!(method, "deleteMessage");
+            Ok(json!(true))
+        })
+        .unwrap();
     }
     #[test]
     fn pairing_requires_private_account_exact_unexpired_nonce() {

@@ -39,6 +39,7 @@ struct State {
     next_ticket: u64,
 }
 pub struct Runtime {
+    socket: std::path::PathBuf,
     wanted: tokio::sync::watch::Sender<HashSet<String>>,
     observed: tokio::sync::watch::Receiver<Arc<HashMap<String, Live>>>,
     state: RefCell<State>,
@@ -46,6 +47,8 @@ pub struct Runtime {
 }
 impl Default for Runtime {
     fn default() -> Self {
+        let socket = socket_path(&crate::app::core::codex_home());
+        let watched_socket = socket.clone();
         let (wanted, mut requests) = tokio::sync::watch::channel(HashSet::new());
         let (published, observed) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
         thread::spawn(move || {
@@ -54,7 +57,7 @@ impl Default for Runtime {
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
-                if watch(&mut requests, &published).is_err() {
+                if watch(&mut requests, &published, &watched_socket).is_err() {
                     published.send_replace(Arc::new(HashMap::new()));
                 }
                 if requests.has_changed().is_err() {
@@ -64,6 +67,7 @@ impl Default for Runtime {
             }
         });
         Self {
+            socket,
             wanted,
             observed,
             state: RefCell::new(State::default()),
@@ -371,7 +375,7 @@ impl Runtime {
         if wire.is_none() && async_text.is_none() {
             return Ok(false);
         }
-        let mut connection = Connection::connect()?;
+        let mut connection = Connection::connect(&self.socket)?;
         let owner = connection.owner(&ticket.session)?;
         if owner != ticket.owner {
             return Ok(false);
@@ -423,7 +427,7 @@ impl Runtime {
                 };
                 *attempted = true;
                 let result = connection.request(method, params, version, Some(&owner))?;
-                return Ok(result["resultType"] == "success");
+                return Ok(admission(&result, false, attempted));
             }
             let Some((method, params)) = wire else {
                 return Ok(false);
@@ -434,7 +438,7 @@ impl Runtime {
             }
             *attempted = true;
             let result = connection.request(method, params, 1, Some(&owner))?;
-            if result["resultType"] != "success" || result["result"]["ok"] != true {
+            if !admission(&result, true, attempted) {
                 return Ok(false);
             }
             // The owner returns ok even when its strict request lookup finds nothing.
@@ -484,6 +488,22 @@ impl Runtime {
     }
 }
 
+fn socket_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("ipc/ipc.sock")
+}
+
+// A received rejection proves non-admission. A missing/malformed response does not.
+fn admission(result: &Value, approval: bool, attempted: &mut bool) -> bool {
+    let accepted =
+        result["resultType"] == "success" && (!approval || result["result"]["ok"] == true);
+    if result["resultType"] == "error"
+        || (approval && result["resultType"] == "success" && result["result"]["ok"] == false)
+    {
+        *attempted = false;
+    }
+    accepted
+}
+
 struct Connection {
     socket: UnixStream,
     bytes: Vec<u8>,
@@ -493,9 +513,8 @@ struct Connection {
     follows: HashMap<String, String>,
 }
 impl Connection {
-    fn connect() -> Result<Self> {
-        let path = crate::app::core::home().join(".codex/ipc/ipc.sock");
-        let meta = fs::symlink_metadata(&path)?;
+    fn connect(path: &std::path::Path) -> Result<Self> {
+        let meta = fs::symlink_metadata(path)?;
         // SAFETY: geteuid has no preconditions.
         anyhow::ensure!(
             meta.file_type().is_socket()
@@ -655,8 +674,9 @@ impl Drop for Connection {
 fn watch(
     wanted_receiver: &mut tokio::sync::watch::Receiver<HashSet<String>>,
     published: &tokio::sync::watch::Sender<Arc<HashMap<String, Live>>>,
+    socket: &std::path::Path,
 ) -> Result<()> {
-    let mut connection = Connection::connect()?;
+    let mut connection = Connection::connect(socket)?;
     let mut live = HashMap::<String, Live>::new();
     let mut owners: HashMap<String, String> = HashMap::new();
     let mut checked = Instant::now() - Duration::from_secs(6);
@@ -871,6 +891,41 @@ fn apply_patch(value: &mut Value, path: &[Value], op: &str, replacement: &Value)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_rejections_are_not_confused_with_unknown_delivery() {
+        for (value, approval) in [
+            (serde_json::json!({"resultType":"error"}), false),
+            (serde_json::json!({"resultType":"error"}), true),
+            (
+                serde_json::json!({"resultType":"success","result":{"ok":false}}),
+                true,
+            ),
+        ] {
+            let mut attempted = true;
+            assert!(!super::admission(&value, approval, &mut attempted));
+            assert!(!attempted);
+        }
+        let mut attempted = true;
+        assert!(!super::admission(
+            &serde_json::json!({}),
+            true,
+            &mut attempted
+        ));
+        assert!(attempted);
+        assert!(super::admission(
+            &serde_json::json!({"resultType":"success","result":{"ok":true}}),
+            true,
+            &mut attempted
+        ));
+    }
+    #[test]
+    fn socket_follows_the_injected_codex_home() {
+        assert_eq!(
+            super::socket_path(std::path::Path::new("/custom/codex")),
+            std::path::Path::new("/custom/codex/ipc/ipc.sock")
+        );
+    }
+
     use super::*;
     fn request() -> Value {
         json!({"method":"item/commandExecution/requestApproval","id":82,"params":{"threadId":"chat","turnId":"turn","reason":"Allow file update?","command":"original"}})

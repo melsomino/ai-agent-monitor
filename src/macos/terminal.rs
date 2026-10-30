@@ -61,9 +61,7 @@ fn choose<'a>(
         .filter(|p| {
             p.tty != "??"
                 && directories.contains_key(&p.pid)
-                && Path::new(&p.command)
-                    .file_name()
-                    .is_some_and(|name| name == agent)
+                && crate::agents::tracking::is_agent_process(agent, &p.command)
         })
         .collect();
     let exact: Vec<_> = candidates
@@ -359,6 +357,38 @@ end run"#;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn versioned_claude_binary_routes_to_its_terminal() {
+        let processes = super::process_lines(
+            "10 2 ttys001 /Users/test/.local/share/claude/versions/2.1.3\n2 1 ?? /Applications/iTerm.app/Contents/MacOS/iTerm2",
+        );
+        let directories =
+            std::collections::HashMap::from([(10, std::path::PathBuf::from("/work"))]);
+        let process = super::choose(
+            &processes,
+            "claude",
+            "chat",
+            &directories,
+            std::path::Path::new("/work"),
+        )
+        .unwrap();
+        assert_eq!(process.pid, 10);
+        assert_eq!(
+            super::host(&processes, process.pid).unwrap(),
+            std::path::Path::new("/Applications/iTerm.app")
+        );
+        assert!(
+            super::choose(
+                &processes,
+                "codex",
+                "chat",
+                &directories,
+                std::path::Path::new("/work")
+            )
+            .is_none()
+        );
+    }
+
     use super::*;
     #[test]
     fn resume_identity_wins_over_directory_and_ambiguous_directories_are_not_guessed() {

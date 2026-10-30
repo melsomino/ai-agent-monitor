@@ -1,4 +1,4 @@
-//! Serialized read/modify/write registration shared by resident and hook senders.
+//! Native delivery transport; the notification actor owns retries and bindings.
 use super::notification_actions::{Kind, Plan};
 use block2::RcBlock;
 use objc2::{msg_send, rc::Retained};
@@ -54,11 +54,16 @@ fn category(plan: Option<&Plan>) -> Retained<UNNotificationCategory> {
         UNNotificationCategoryOptions::CustomDismissAction,
     )
 }
+pub struct Receipt {
+    pub key: String,
+    pub result: Result<(), String>,
+}
+
 pub fn deliver(
     plan: Plan,
     notice: Notice,
     plans: Vec<Plan>,
-    receipts: tokio::sync::mpsc::Sender<String>,
+    receipts: tokio::sync::mpsc::Sender<Receipt>,
 ) {
     let center = UNUserNotificationCenter::currentNotificationCenter();
     let categories: Vec<_> = plans.iter().map(|p| category(Some(p))).collect();
@@ -73,11 +78,18 @@ pub fn deliver(
         let name = plan.category();
         let found = (0..registered.count())
             .any(|i| registered.objectAtIndex(i).identifier().to_string() == name);
-        post(&notice, found.then_some(name.as_str()), receipts.clone());
+        if found {
+            post(&notice, Some(&name), receipts.clone());
+        } else {
+            let _ = receipts.try_send(Receipt {
+                key: notice.key.clone(),
+                result: Err("Notification actions were not registered".into()),
+            });
+        }
     });
     center.getNotificationCategoriesWithCompletionHandler(&callback);
 }
-fn post(notice: &Notice, category: Option<&str>, receipts: tokio::sync::mpsc::Sender<String>) {
+fn post(notice: &Notice, category: Option<&str>, receipts: tokio::sync::mpsc::Sender<Receipt>) {
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(&notice.title));
     content.setBody(&NSString::from_str(&notice.body));
@@ -108,10 +120,16 @@ fn post(notice: &Notice, category: Option<&str>, receipts: tokio::sync::mpsc::Se
     let key = notice.key.clone();
     let callback = RcBlock::new(move |error: *mut NSError| {
         // SAFETY: Valid NSError or null supplied by UserNotifications.
-        if let Some(error) = unsafe { error.as_ref() } {
-            eprintln!("ai-agent-monitor: {}", error.localizedDescription());
-        }
-        if receipts.try_send(key.clone()).is_err() {
+        let result = unsafe { error.as_ref() }
+            .map(|error| Err(error.localizedDescription().to_string()))
+            .unwrap_or(Ok(()));
+        if receipts
+            .try_send(Receipt {
+                key: key.clone(),
+                result,
+            })
+            .is_err()
+        {
             super::native::remove_session_notification(&key);
         }
     });

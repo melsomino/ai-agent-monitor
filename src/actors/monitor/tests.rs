@@ -432,3 +432,70 @@ async fn failed_delivery_stays_visible_and_requires_an_explicit_retry() {
         Some(AgentCommand::Respond { .. })
     ));
 }
+
+#[tokio::test]
+async fn stopped_adapter_marks_sessions_and_pending_operations_unavailable() {
+    let h = Harness::new();
+    let s = session("one", "request");
+    let key = s.approval_key().unwrap();
+    h.observe(vec![s.clone()]).await;
+    h.wait(|s| s.pending_count() == 1).await;
+    h.handle
+        .submit(&s, Response::Action("allow".into()))
+        .unwrap();
+    h.wait(|s| s.submissions.get(&key) == Some(&Submission::Sending))
+        .await;
+    h.handle
+        .enqueue(Command::AgentStopped {
+            source: "codex",
+            error: "Adapter stopped".into(),
+        })
+        .await
+        .unwrap();
+    let state = h.wait(|s| s.agent_errors.contains_key("codex")).await;
+    assert!(!state.sessions[0].authoritative);
+    assert_eq!(state.sessions[0].activity, Activity::Unknown);
+    assert!(matches!(
+        state.submissions.get(&key),
+        Some(Submission::Failed(_))
+    ));
+    h.observe(vec![s]).await;
+    h.handle.enqueue(Command::Refresh).await.unwrap();
+    let updated = h.wait(|s| s.revision > state.revision).await;
+    assert!(!updated.sessions[0].authoritative);
+}
+
+#[tokio::test]
+async fn rapid_application_changes_survive_stale_persistence_acknowledgements() {
+    let h = Harness::new();
+    let mut preferences = crate::domain::preferences::Preferences::default();
+    preferences
+        .applications
+        .observe([Client::VSCode, Client::Terminal]);
+    h.handle
+        .enqueue(Command::PreferencesObserved(preferences.clone()))
+        .await
+        .unwrap();
+    for client in [Client::VSCode, Client::Terminal] {
+        h.handle
+            .enqueue(Command::SetApplicationEnabled {
+                id: client.application_id(),
+                enabled: false,
+            })
+            .await
+            .unwrap();
+    }
+    let state = h
+        .wait(|s| {
+            !s.preferences.applications.enabled(Client::VSCode)
+                && !s.preferences.applications.enabled(Client::Terminal)
+        })
+        .await;
+    h.handle
+        .enqueue(Command::PreferencesObserved(preferences))
+        .await
+        .unwrap();
+    let updated = h.wait(|s| s.revision > state.revision).await;
+    assert!(!updated.preferences.applications.enabled(Client::VSCode));
+    assert!(!updated.preferences.applications.enabled(Client::Terminal));
+}

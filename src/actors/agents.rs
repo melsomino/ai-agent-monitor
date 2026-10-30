@@ -3,6 +3,23 @@ use super::monitor::{AgentCommand, Command, Handle};
 use crate::app::core;
 use std::time::Duration;
 use tokio::sync::mpsc;
+pub(crate) async fn supervise(
+    provider: Box<dyn crate::agents::sessions::SessionProvider>,
+    rx: mpsc::Receiver<AgentCommand>,
+    monitor: Handle,
+) {
+    let source = provider.id();
+    let result = tokio::spawn(run(provider, rx, monitor.clone())).await;
+    if !monitor.snapshot().stopping {
+        let error = match result {
+            Ok(()) => format!("{source} adapter stopped. Restart the monitor to reconnect."),
+            Err(error) => format!("{source} adapter failed: {error}"),
+        };
+        let _ = monitor
+            .enqueue(Command::AgentStopped { source, error })
+            .await;
+    }
+}
 pub(crate) async fn run(
     mut provider: Box<dyn crate::agents::sessions::SessionProvider>,
     mut rx: mpsc::Receiver<AgentCommand>,
@@ -67,5 +84,54 @@ pub(crate) async fn run(
         if monitor.snapshot().stopping {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::sessions::{Session, SessionProvider};
+    struct Broken;
+    impl SessionProvider for Broken {
+        fn id(&self) -> &'static str {
+            "broken"
+        }
+        fn sessions(&self) -> anyhow::Result<Vec<Session>> {
+            panic!("test adapter failure")
+        }
+        fn pending_count(&self) -> usize {
+            0
+        }
+        fn open_target(&self, _: &Session) -> String {
+            String::new()
+        }
+        fn allow(&self, _: &Session) -> bool {
+            false
+        }
+    }
+    #[tokio::test]
+    async fn adapter_panic_is_reported_to_monitor() {
+        let (tx, mut events) = mpsc::channel(8);
+        let handle = Handle {
+            tx,
+            state: tokio::sync::watch::channel(std::sync::Arc::new(
+                crate::actors::monitor::State::default(),
+            ))
+            .1,
+        };
+        let (_port, rx) = mpsc::channel(8);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            supervise(Box::new(Broken), rx, handle),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(Command::AgentStopped {
+                source: "broken",
+                ..
+            })
+        ));
     }
 }

@@ -5,6 +5,14 @@ pub enum Command {
         sessions: Result<Vec<Session>, String>,
         usage: Option<crate::agents::codex::usage::Usage>,
     },
+    AgentStopped {
+        source: &'static str,
+        error: String,
+    },
+    SetApplicationEnabled {
+        id: String,
+        enabled: bool,
+    },
     Submit {
         session: Box<Session>,
         response: Response,
