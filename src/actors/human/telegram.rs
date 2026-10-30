@@ -488,8 +488,22 @@ impl Worker {
         }
     }
     fn finish(&mut self, message: i64, text: &str) {
-        if self.api("editMessageText",json!({"chat_id":self.config.chat,"message_id":message,"text":text,"reply_markup":{"inline_keyboard":[]}})).is_ok() {
-            self.config.messages.retain(|id| *id != message); self.save();
+        let removed = self
+            .api(
+                "deleteMessage",
+                json!({"chat_id":self.config.chat,"message_id":message}),
+            )
+            .or_else(|_| {
+                // Telegram cannot delete messages older than 48 hours. Retire
+                // their answer buttons even when deletion is unavailable.
+                self.api(
+                    "editMessageText",
+                    json!({"chat_id":self.config.chat,"message_id":message,"text":text,"reply_markup":{"inline_keyboard":[]}}),
+                )
+            });
+        if removed.is_ok() {
+            self.config.messages.retain(|id| *id != message);
+            self.save();
         }
     }
     fn retire_all(&mut self, text: &str) {
