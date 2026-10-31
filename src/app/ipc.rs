@@ -26,10 +26,6 @@ pub enum Request {
     Sessions,
     Setup,
     NotificationSettings,
-    Hook {
-        event: Value,
-        owner: Option<Owner>,
-    },
     AgentHook {
         agent: String,
         event: Option<String>,
@@ -302,17 +298,6 @@ async fn handle_request(
             Ok(
                 json!({"monitor":{"pid":std::process::id(),"version":core::VERSION},"telegram":telegram,"sessions":state.sessions.iter().map(|s|json!({"agent":s.agent,"id":s.id,"title":s.title,"cwd":s.cwd,"workspace":s.workspace,"gitBranch":s.git_branch,"client":s.client.label(),"status":s.activity.label(),"lastMessage":s.last_message,"updatedAt":s.updated_at,"approval":s.approval.as_ref().map(|a|json!({"id":a.id,"body":a.body,"expiresAt":a.expires,"canAllow":a.can_allow}))})).collect::<Vec<_>>()}),
             )
-        }
-        Request::Hook { mut event, owner } => {
-            event["_agent"] = "codex".into();
-            let Some(content) = core::notification(&event) else {
-                return Ok(Value::Null);
-            };
-            Ok(core::decision(
-                ask(content, event, owner, true, monitor, stream, hook).await?,
-                false,
-            )
-            .unwrap_or(Value::Null))
         }
         Request::Test {
             approval,

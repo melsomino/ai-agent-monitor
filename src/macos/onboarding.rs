@@ -141,11 +141,12 @@ impl Setup {
             setup::discover(&core::home(), core::codex_home(), agents::claude::home())
                 .into_iter()
                 .filter(|i| {
-                    force
-                        || defaults
-                            .stringForKey(&key(i.agent))
-                            .is_none_or(|v| v.to_string() != signature(i, &executable))
-                        || !i.installed(&executable).unwrap_or(false)
+                    i.agent != setup::Agent::Codex
+                        && (force
+                            || defaults
+                                .stringForKey(&key(i.agent))
+                                .is_none_or(|v| v.to_string() != signature(i, &executable))
+                            || !i.installed(&executable).unwrap_or(false))
                 })
                 .collect();
         if !first_launch && pending.is_empty() && !force {

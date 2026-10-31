@@ -18,6 +18,7 @@ impl Row {
         match self.phase {
             Phase::Detected => "Needs setup",
             Phase::Installing => "Setting up…",
+            Phase::Installed if self.agent == Agent::Codex => "No setup required",
             Phase::Installed => "Hooks installed",
             Phase::Failed => "Needs attention",
         }

@@ -1,4 +1,4 @@
-//! Codex backend and its hook/VS Code integrations.
+//! Codex backend with direct client and VS Code integrations.
 pub(crate) mod async_questions;
 pub(crate) mod requests;
 pub(crate) mod runtime;
@@ -6,7 +6,7 @@ pub(crate) mod usage;
 pub(crate) mod vscode;
 
 use crate::{
-    agents::sessions::{Activity, Approval, Client, Session, SessionProvider},
+    agents::sessions::{Activity, Client, Session, SessionProvider},
     app::process::output_with_timeout,
 };
 use anyhow::Result;
@@ -21,7 +21,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-/// Codex database, transcript, hook and VS Code integration.
+/// Codex database, transcript, direct client and VS Code integration.
 #[derive(Default)]
 pub struct Codex {
     runtime: runtime::Runtime,
@@ -33,15 +33,6 @@ const DESKTOP: Client = Client::Desktop {
     name: "Codex",
     app_path: "/Applications/ChatGPT.app",
 };
-
-fn approval(request: &crate::agents::pending::Request) -> Approval {
-    Approval {
-        can_allow: true,
-        id: request.response.to_string_lossy().into_owned(),
-        body: request.body.clone(),
-        expires: request.expires,
-    }
-}
 
 impl SessionProvider for Codex {
     fn id(&self) -> &'static str {
@@ -94,73 +85,20 @@ impl SessionProvider for Codex {
         self.runtime.send_message(&session.id, text)
     }
     fn interaction(&self, session: &Session) -> crate::agents::interaction::Interaction {
-        if session
-            .approval
-            .as_ref()
-            .is_some_and(|request| request.id.starts_with("ipc:"))
-        {
-            self.runtime.interaction_for(session)
-        } else if session
-            .approval
-            .as_ref()
-            .is_some_and(|request| request.can_allow)
-        {
-            let mut interaction = crate::agents::interaction::Interaction::allow();
-            interaction.actions[0].label = "Allow once".into();
-            interaction
-        } else {
-            crate::agents::interaction::Interaction::default()
-        }
+        self.runtime.interaction_for(session)
     }
     fn deliver(
         &self,
         session: &Session,
         response: &crate::agents::interaction::Response,
     ) -> crate::agents::interaction::Delivery {
-        if session
-            .approval
-            .as_ref()
-            .is_some_and(|a| a.id.starts_with("ipc:"))
-        {
-            self.runtime.deliver_for(session, response)
-        } else if self.respond(session, response) {
-            crate::agents::interaction::Delivery::Confirmed
-        } else {
-            crate::agents::interaction::Delivery::NotSent
-        }
+        self.runtime.deliver_for(session, response)
     }
     fn respond(&self, session: &Session, response: &crate::agents::interaction::Response) -> bool {
-        if session
-            .approval
-            .as_ref()
-            .is_some_and(|request| request.id.starts_with("ipc:"))
-        {
-            self.runtime.respond_for(session, response)
-        } else {
-            response == &crate::agents::interaction::Response::Action("allow".into())
-                && self.allow(session)
-        }
+        self.runtime.respond_for(session, response)
     }
-
     fn allow(&self, session: &Session) -> bool {
-        let Some(snapshot) = session.approval.as_ref() else {
-            return false;
-        };
-        if snapshot.id.starts_with("ipc:") {
-            return self.runtime.allow_for(session);
-        }
-        // Resolve the opaque token and compare the complete current snapshot.
-        // pending::allow revalidates once more at the write boundary.
-        let Some(request) = crate::agents::pending::list_for("codex")
-            .into_iter()
-            .find(|request| request.session_id == session.id && approval(request) == *snapshot)
-        else {
-            return false;
-        };
-        if !crate::agents::pending::allow(&request) {
-            return false;
-        }
-        true
+        self.runtime.allow_for(session)
     }
 }
 
@@ -210,7 +148,6 @@ fn open(
         }
     }
     let visible_ids = sessions.iter().map(|session| session.id.clone()).collect();
-    let pending = crate::agents::pending::list_for("codex");
     let mut runtime = runtime.views(&visible_ids);
     for session in &mut sessions {
         if let Some(live) = runtime.remove(&session.id) {
@@ -219,14 +156,6 @@ fn open(
             session.authoritative = true;
         } else {
             session.authoritative = false;
-        }
-        let hook_approval = pending
-            .iter()
-            .filter(|request| request.session_id == session.id)
-            .max_by_key(|request| request.expires)
-            .map(approval);
-        if hook_approval.is_some() {
-            session.approval = hook_approval;
         }
         if session.approval.is_some() {
             session.activity = Activity::Confirmation;
@@ -718,7 +647,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn approval_cannot_be_reassigned_to_another_session_or_changed_in_the_ui() {
+    fn legacy_hook_approval_cannot_be_answered_by_codex() {
         let directory = crate::app::core::approval_directory().unwrap();
         crate::agents::pending::publish(
             directory.path(),
@@ -746,10 +675,18 @@ mod tests {
             client: Client::Terminal,
             activity: Activity::Confirmation,
             last_message: String::new(),
-            approval: Some(approval(&request)),
+            approval: Some(crate::agents::sessions::Approval {
+                id: response.to_string_lossy().into_owned(),
+                body: request.body.clone(),
+                expires: request.expires,
+                can_allow: true,
+            }),
         };
         assert!(!Codex::default().allow(&session));
         session.id = "original".into();
+        let codex = Codex::default();
+        assert!(!codex.allow(&session));
+        assert!(codex.interaction(&session).actions.is_empty());
         session.approval.as_mut().unwrap().body = "Changed".into();
         assert!(!Codex::default().allow(&session));
         assert!(!response.exists());

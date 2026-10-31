@@ -1,16 +1,15 @@
-use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     env, fs,
-    io::{self, Write},
+    io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 #[cfg(test)]
-use std::{os::unix::fs::PermissionsExt, thread, time::Instant};
+use std::{io, os::unix::fs::PermissionsExt, thread, time::Instant};
 use url::Url;
 
 pub const WAIT: Duration = Duration::from_secs(60);
@@ -221,26 +220,6 @@ pub struct Notification {
     pub target: String,
 }
 
-pub fn notification(event: &Value) -> Option<Notification> {
-    if event["hook_event_name"] != "PermissionRequest" {
-        return None;
-    }
-    let input = &event["tool_input"];
-    let reason = input["description"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .or_else(|| input["justification"].as_str().filter(|s| !s.is_empty()))
-        .unwrap_or("Open Codex to review the request.");
-    Some(Notification {
-        title: chat_title(event, &codex_home()),
-        body: reason.trim().to_owned(),
-        target: vscode_target(
-            event,
-            &home().join("Library/Application Support/Code/User/workspaceStorage"),
-        ),
-    })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Allow,
@@ -336,102 +315,4 @@ pub fn monitor_hook(command: &str, arguments: &[&str]) -> bool {
         && path
             .parent()
             .is_some_and(|p| p.ends_with("AI Agent Monitor.app/Contents/MacOS"))
-}
-
-pub fn install(home: &Path, executable: &Path, legacy_script: &Path) -> Result<bool> {
-    fs::create_dir_all(home)?;
-    let path = home.join("hooks.json");
-    if path.is_symlink() {
-        bail!("hooks.json is a symlink; refusing to replace it");
-    }
-    let previous = match fs::read(&path) {
-        Ok(data) => Some(data),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
-    let mut config: Value = match &previous {
-        Some(data) => serde_json::from_slice(data).context("invalid hooks.json")?,
-        None => json!({}),
-    };
-    let object = config
-        .as_object_mut()
-        .context("hooks.json must be an object")?;
-    let hooks = object
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .context("hooks must be an object")?;
-    let groups = hooks
-        .entry("PermissionRequest")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .context("PermissionRequest must be an array")?;
-    let legacy_executable = legacy_script
-        .parent()
-        .map(|root| root.join("build/Codex Notify.app/Contents/MacOS/CodexNotify"));
-    let command = format!(
-        "{} hook",
-        shlex::try_quote(executable.to_str().context("non-UTF8 executable path")?)?
-    );
-    let handler = json!({"type": "command", "command": command, "timeout": 70, "statusMessage": "macOS notification"});
-    let mut found = false;
-    let mut changed = false;
-    for group in groups.iter_mut() {
-        let Some(handlers) = group["hooks"].as_array_mut() else {
-            continue;
-        };
-        let mut index = 0;
-        while index < handlers.len() {
-            let ours = handlers[index]["type"] == "command"
-                && (handlers[index]["command"]
-                    .as_str()
-                    .is_some_and(|command| monitor_hook(command, &["hook"]))
-                    || handlers[index]["command"]
-                        .as_str()
-                        .and_then(shlex::split)
-                        .is_some_and(|args| {
-                            args.first().is_some_and(|p| {
-                                let path = Path::new(p);
-                                path == executable || legacy_executable.as_deref() == Some(path)
-                            }) || args.get(1).is_some_and(|p| Path::new(p) == legacy_script)
-                        }));
-            if ours {
-                if found {
-                    handlers.remove(index);
-                    changed = true;
-                    continue;
-                }
-                found = true;
-                if handlers[index] != handler {
-                    handlers[index] = handler.clone();
-                    changed = true;
-                }
-            }
-            index += 1;
-        }
-    }
-    if !found {
-        groups.push(json!({"hooks": [handler]}));
-        changed = true;
-    }
-    if !changed {
-        return Ok(false);
-    }
-    if let Some(previous) = previous {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let backup = home.join(format!("hooks.json.backup-{stamp}"));
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&backup)?
-            .write_all(&previous)?;
-        eprintln!("Backup: {}", backup.display());
-    }
-    let mut temporary = tempfile::NamedTempFile::new_in(home)?;
-    serde_json::to_writer_pretty(temporary.as_file_mut(), &config)?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(&path)?;
-    Ok(true)
 }

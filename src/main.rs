@@ -13,27 +13,10 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::{AgentKind, Cli, Command, NativeCommand};
 use serde_json::Value;
-use std::{
-    io::{self, Read},
-    path::Path,
-};
+use std::io::{self, Read};
 
 fn run(command: Option<Command>) -> Result<()> {
     match command {
-        Some(Command::Hook) => {
-            let event: Value = serde_json::from_reader(io::stdin().take(2 * 1024 * 1024))
-                .context("invalid hook event")?;
-            if event["hook_event_name"] != "PermissionRequest" {
-                return Ok(());
-            }
-            let result = app::ipc::request(&app::ipc::Request::Hook {
-                event,
-                owner: agents::tracking::owner("codex").ok(),
-            })?;
-            if !result.is_null() {
-                println!("{result}");
-            }
-        }
         Some(Command::AgentHook { agent, event }) => {
             let input: Value = serde_json::from_reader(io::stdin().take(2 * 1024 * 1024))
                 .context("invalid agent hook event")?;
@@ -101,28 +84,6 @@ fn run(command: Option<Command>) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Some(Command::Sessions { json: false }) => run_native(NativeCommand::Sessions)?,
-        Some(Command::Install { codex_home }) => {
-            let home = codex_home.unwrap_or_else(core::codex_home);
-            let executable = core::bundle_executable();
-            if !executable.is_file() {
-                bail!("Build the app first: cargo run --release -- bundle");
-            }
-            let legacy = Path::new(env!("CARGO_MANIFEST_DIR")).join("notify.py");
-            let changed = core::install(&home, &executable, &legacy)?;
-            println!(
-                "{}: {}",
-                if changed {
-                    "Installed"
-                } else {
-                    "Already installed"
-                },
-                home.join("hooks.json").display()
-            );
-            if changed {
-                println!("Restart Codex / VS Code and review the updated hook in /hooks.");
-            }
-        }
-        Some(Command::CheckHooks { binary }) => tools::check_hooks(&binary)?,
         Some(Command::Setup) => {
             let result = app::ipc::request(&app::ipc::Request::Setup)?;
             anyhow::ensure!(
@@ -146,7 +107,7 @@ fn run(command: Option<Command>) -> Result<()> {
             })?;
         }
         Some(Command::SendApproval { .. }) => {
-            bail!("Legacy approval senders are no longer supported; use the hook client")
+            bail!("Legacy approval senders are no longer supported; use the resident monitor")
         }
         None => run_native(NativeCommand::Listen)?,
     }
@@ -174,7 +135,7 @@ fn main() {
             ..
         })
     );
-    let is_hook = matches!(cli.command, Some(Command::Hook | Command::AgentHook { .. }));
+    let is_hook = matches!(cli.command, Some(Command::AgentHook { .. }));
     if let Err(error) = run(cli.command) {
         eprintln!("ai-agent-monitor: {error:#}");
         if is_cline_hook {

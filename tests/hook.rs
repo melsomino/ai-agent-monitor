@@ -4,24 +4,14 @@ use std::{
 };
 
 #[test]
-fn malformed_and_unrelated_events_never_emit_permissions() {
-    for event in ["invalid JSON", "{}", "[]", "{\"hook_event_name\":\"Stop\"}"] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_AIAgentMonitor"))
-            .arg("hook")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+fn removed_codex_hook_commands_are_rejected() {
+    for args in [vec!["hook"], vec!["install"], vec!["check-hooks"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_AIAgentMonitor"))
+            .args(args)
+            .output()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(event.as_bytes())
-            .unwrap();
-        let result = child.wait_with_output().unwrap();
-        assert!(result.status.success());
-        assert!(result.stdout.is_empty());
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
     }
 }
 
@@ -73,7 +63,7 @@ fn malformed_new_agent_hooks_never_grant_permissions_or_cancel_cline() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn hook_is_only_an_ipc_client_and_prints_the_monitors_reply() {
+fn claude_hook_is_only_an_ipc_client_and_prints_the_monitors_reply() {
     use std::{
         fs,
         io::Read,
@@ -99,8 +89,9 @@ fn hook_is_only_an_ipc_client_and_prints_the_monitors_reply() {
         let mut data = vec![0; u32::from_le_bytes(header) as usize];
         stream.read_exact(&mut data).unwrap();
         let request: serde_json::Value = serde_json::from_slice(&data).unwrap();
-        assert_eq!(request["type"], "hook");
-        assert_eq!(request["event"]["session_id"], "ipc-test");
+        assert_eq!(request["type"], "agent_hook");
+        assert_eq!(request["agent"], "claude");
+        assert_eq!(request["input"]["session_id"], "ipc-test");
         let reply = serde_json::to_vec(&serde_json::json!({"result":reply,"error":null})).unwrap();
         stream
             .write_all(&(reply.len() as u32).to_le_bytes())
@@ -108,7 +99,7 @@ fn hook_is_only_an_ipc_client_and_prints_the_monitors_reply() {
         stream.write_all(&reply).unwrap();
     });
     let mut hook = Command::new(env!("CARGO_BIN_EXE_AIAgentMonitor"))
-        .arg("hook")
+        .args(["agent-hook", "claude"])
         .env("AI_AGENT_MONITOR_SOCKET", &socket)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

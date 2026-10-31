@@ -20,9 +20,9 @@ The bundle identifier is `com.melsomino.ai-agent-monitor`. On first launch under
 
 ## First-launch setup and disk images
 
-Only the resident app invokes onboarding. Hook clients and diagnostic commands never install integrations. If the resident is not running, a hook can launch the installed app in the background; its normal first-launch setup remains the only automatic installer. Onboarding discovers existing Codex/Claude configuration or known VS Code extensions and Cline storage, then runs the existing idempotent installers off the UI thread. It does not install agent software, enable login items, override Codex trust, or toggle Cline's own hook setting.
+Only the resident app invokes onboarding. Hook clients and diagnostic commands never install integrations. If the resident is not running, a hook can launch the installed app in the background; its normal first-launch setup remains the only automatic installer. Onboarding discovers existing Codex/Claude configuration or known VS Code extensions and Cline storage, then runs the existing idempotent installers off the UI thread. Codex uses direct discovery and client IPC without installing or updating hooks. Setup does not install agent software, enable login items, or toggle Cline's own hook setting.
 
-Successful setup is remembered per agent, configuration directory, and executable path. Failures remain retryable; unrelated agents can still complete setup. New agents can be connected on a later launch or using **Check & set up** in the Integrations settings section. The section shows detected agents, inspects the current hook configuration, reports setup progress and errors, and explains remaining agent-side steps. No separate setup-results window is shown; macOS still handles its own notification authorization prompt.
+Successful setup is remembered per agent, configuration directory, and executable path. Failures remain retryable; unrelated agents can still complete setup. New agents can be connected on a later launch or using **Check & set up** in the Integrations settings section. The section shows detected agents, reports Codex as requiring no setup and inspects Claude Code and Cline hook configuration, reports setup progress and errors, and explains remaining agent-side steps. No separate setup-results window is shown; macOS still handles its own notification authorization prompt.
 
 Hooks from another copy of this app bundle are migrated to the current executable path. Commands outside the named app bundle, extra arguments, and unrelated hooks are preserved. Configuration backups and existing installer validation still apply.
 
@@ -52,7 +52,7 @@ Navigation uses the VS Code URL handler. It opens a project, not a particular ch
 
 The provider observes the local Codex client socket at `$CODEX_HOME/ipc/ipc.sock`. It validates socket ownership and permissions, discovers the owning client, and subscribes as a follower. It does not advertise ownership or accept agent operations.
 
-Snapshots and revisioned patches maintain request state. Periodic resubscription obtains fresh state; invalid revisions and reconnects invalidate cached observations. The protocol is internal and version-dependent. Unsupported versions are ignored, with logs and hooks retained as fallbacks.
+Snapshots and revisioned patches maintain request state. Periodic resubscription obtains fresh state; invalid revisions and reconnects invalidate cached observations. The protocol is internal and version-dependent. Unsupported versions are ignored. Logs remain a fallback for activity and messages, but Codex approvals require the direct connection; no hook fallback is installed or consumed.
 
 Native requests can expose command/file approval choices, proposed policy amendments, scoped permissions, and `item/tool/requestUserInput`. When `availableDecisions` exists, it is authoritative. Approval request payloads contain decision values rather than localized button captions, so the monitor maps supported values to the installed Codex UI wording (for example, Allow once and Deny). The original decision value and JSON request-ID type are preserved on the wire. An IPC acknowledgement is followed by a stream-state check that the exact request disappeared; acknowledgement alone is not treated as a successful answer. Unknown request types and option pickers without an addressed response route open the editor instead.
 
@@ -84,7 +84,7 @@ flowchart LR
     Respond -->|hook reply / provider protocol| Agent
 ```
 
-All Codex, Claude Code, and Cline hook commands are thin IPC clients. They forward their event and originating process identity to the resident over `monitor.sock`, then print its result to the agent. They never post notifications or interpret a permission decision themselves. If the resident is not running, the client starts the installed app in the background and waits for the socket. Failure returns control to the agent without granting permission.
+Claude Code and Cline hook commands are thin IPC clients. They forward their event and originating process identity to the resident over `monitor.sock`, then print its result to the agent. They never post notifications or interpret a permission decision themselves. If the resident is not running, the client starts the installed app in the background and waits for the socket. Failure returns control to the agent without granting permission.
 
 `sessions --json`, `setup`, and `notification-settings` are also IPC clients. Notification authorization and diagnostic queries execute in the resident, so a short-lived diagnostic command cannot register a competing Notification Center client. Only the resident creates the notification delegate.
 

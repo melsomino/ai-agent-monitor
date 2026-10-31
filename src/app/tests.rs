@@ -74,37 +74,6 @@ fn unicode_text_is_shortened_on_word_boundaries() {
     assert_eq!(core::shorten(" a\n b  ", 100), "a b");
 }
 
-#[test]
-fn only_permission_events_produce_notifications_and_commands_are_not_shown() {
-    for event in [
-        json!({}),
-        json!([]),
-        json!({"hook_event_name":"PreToolUse"}),
-    ] {
-        assert!(core::notification(&event).is_none());
-    }
-    let note = core::notification(
-        &json!({"hook_event_name":"PermissionRequest", "tool_input":{"command":"secret-token"}}),
-    )
-    .unwrap();
-    assert!(!note.body.contains("secret-token"));
-    let reason = "\" & do shell script \"touch /tmp/nope\"";
-    let note = core::notification(
-        &json!({"hook_event_name":"PermissionRequest", "tool_input":{"description":reason}}),
-    )
-    .unwrap();
-    assert_eq!(note.body, reason);
-    let long_reason = format!(
-        "{}\n\nВторой абзац: подробное объяснение запроса.",
-        "Длинная причина ".repeat(30)
-    );
-    let note = core::notification(
-        &json!({"hook_event_name":"PermissionRequest", "tool_input":{"description":long_reason}}),
-    )
-    .unwrap();
-    assert_eq!(note.body, long_reason);
-}
-
 fn metadata(storage: &Path, name: &str, data: Value) {
     let parent = storage.join(name);
     fs::create_dir_all(&parent).unwrap();
@@ -255,97 +224,13 @@ fn response_rejects_symlinks_and_public_directories() {
 }
 
 #[test]
-fn install_migrates_python_preserves_other_hooks_and_is_idempotent() {
-    let home = tempfile::tempdir().unwrap();
-    let path = home.path().join("hooks.json");
-    let old = json!({"description":"Existing", "hooks":{
-        "Stop":[{"hooks":[{"type":"command", "command":"true"}]}],
-        "PermissionRequest":[{"hooks":[{"type":"command", "command":"python3 '/old project/notify.py' --approval", "timeout":70}]}]
-    }});
-    let before = old.to_string();
-    fs::write(&path, &before).unwrap();
-    let executable = Path::new("/new project/AIAgentMonitor");
-    assert!(core::install(home.path(), executable, Path::new("/old project/notify.py")).unwrap());
-    let once = fs::read(&path).unwrap();
-    assert!(!core::install(home.path(), executable, Path::new("/old project/notify.py")).unwrap());
-    assert_eq!(fs::read(&path).unwrap(), once);
-    let config: Value = serde_json::from_slice(&once).unwrap();
-    assert_eq!(config["hooks"]["Stop"], old["hooks"]["Stop"]);
-    let groups = config["hooks"]["PermissionRequest"].as_array().unwrap();
-    assert_eq!(groups.len(), 1);
-    let args = shlex::split(groups[0]["hooks"][0]["command"].as_str().unwrap()).unwrap();
-    assert_eq!(args, vec!["/new project/AIAgentMonitor", "hook"]);
-    let backup = fs::read_dir(home.path())
-        .unwrap()
-        .flatten()
-        .find(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("hooks.json.backup-")
-        })
-        .unwrap();
-    assert_eq!(fs::read_to_string(backup.path()).unwrap(), before);
-}
-
-#[test]
-fn install_refuses_invalid_or_symlinked_config() {
-    let home = tempfile::tempdir().unwrap();
-    let path = home.path().join("hooks.json");
-    for invalid in ["invalid JSON", "[]", "{\"hooks\":[]}"] {
-        fs::write(&path, invalid).unwrap();
-        assert!(core::install(home.path(), Path::new("/new"), Path::new("/old")).is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
-    }
-    fs::remove_file(&path).unwrap();
-    symlink(home.path().join("missing"), &path).unwrap();
-    assert!(core::install(home.path(), Path::new("/new"), Path::new("/old")).is_err());
-}
-
-#[test]
-fn install_migrates_the_old_app_path_without_replacing_unrelated_codex_hooks() {
-    let home = tempfile::tempdir().unwrap();
-    let path = home.path().join("hooks.json");
-    let executable = Path::new("/project/build/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor");
-    let unrelated = "'/other/Codex Notify.app/Contents/MacOS/CodexNotify' hook";
-    fs::write(&path, json!({"hooks":{"PermissionRequest":[{"hooks":[
-        {"type":"command","command":"'/project/build/Codex Notify.app/Contents/MacOS/CodexNotify' hook"},
-        {"type":"command","command":unrelated}
-    ]}]}}).to_string()).unwrap();
-    assert!(core::install(home.path(), executable, Path::new("/project/notify.py")).unwrap());
-    let data = fs::read(&path).unwrap();
-    let config: Value = serde_json::from_slice(&data).unwrap();
-    let handlers = config["hooks"]["PermissionRequest"][0]["hooks"]
-        .as_array()
-        .unwrap();
-    assert_eq!(handlers.len(), 2);
-    assert_eq!(
-        shlex::split(handlers[0]["command"].as_str().unwrap()).unwrap(),
-        vec![executable.to_str().unwrap(), "hook"]
-    );
-    assert_eq!(handlers[1]["command"], unrelated);
-    assert!(!core::install(home.path(), executable, Path::new("/project/notify.py")).unwrap());
-    assert_eq!(fs::read(path).unwrap(), data);
-}
-
-#[test]
-fn moved_app_hooks_are_replaced_without_touching_other_commands() {
-    let home = tempfile::tempdir().unwrap();
-    let old = "'/old/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor' hook";
-    let other = "'/other/AIAgentMonitor' hook";
-    fs::write(home.path().join("hooks.json"), serde_json::to_vec(&json!({"hooks":{"PermissionRequest":[{"hooks":[{"type":"command","command":old},{"type":"command","command":other}]}]}})).unwrap()).unwrap();
-    let executable = Path::new("/Applications/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor");
-    assert!(core::install(home.path(), executable, Path::new("/legacy/notify.py")).unwrap());
-    assert!(!core::install(home.path(), executable, Path::new("/legacy/notify.py")).unwrap());
-    let contents = fs::read_to_string(home.path().join("hooks.json")).unwrap();
-    assert!(!contents.contains("/old/"));
-    assert!(contents.contains(other));
+fn own_claude_hook_is_recognized_without_matching_unrelated_commands() {
     assert!(core::monitor_hook(
         "'/Applications/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor' agent-hook claude",
         &["agent-hook", "claude"]
     ));
     assert!(!core::monitor_hook(
-        "'/Applications/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor' hook --extra",
-        &["hook"]
+        "'/other/AIAgentMonitor' agent-hook claude",
+        &["agent-hook", "claude"]
     ));
 }

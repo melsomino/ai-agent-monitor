@@ -33,7 +33,7 @@ One Rust executable, native AppKit controls, and macOS notifications. No Python 
 
 | Agent | Session discovery | Respond from the monitor | Setup |
 | --- | --- | --- | --- |
-| **Codex** | Local CLI, VS Code, and desktop sessions | Approval actions, supported questions, custom answers | Automatic local discovery; optional approval hook for CLI requests |
+| **Codex** | Local CLI, VS Code, and desktop sessions | Approval actions, supported questions, custom answers | Automatic local discovery and direct client connection; no hooks |
 | **Claude Code** *(experimental)* | Lifecycle hooks in terminal and VS Code | One-time **Allow** for permission requests | Install hooks and restart Claude Code |
 | **Cline** *(experimental)* | Lifecycle hooks and the current task's messages | Open the project and respond in Cline | Install hooks and enable them in Cline |
 
@@ -48,7 +48,7 @@ The monitor runs on the Mac that hosts the agents. SSH, containers, and remote d
 1. Download the [latest DMG for Apple Silicon](https://github.com/melsomino/ai-agent-monitor/releases/latest/download/AI-Agent-Monitor-apple-silicon.dmg) from [GitHub Releases](https://github.com/melsomino/ai-agent-monitor/releases/latest).
 2. Open the DMG and drag **AI Agent Monitor** to **Applications**.
 3. Open the app from Applications. It connects detected agents automatically and requests notification permission.
-4. Open **Settings → Integrations** to check status and next steps: restart the connected agents, review Codex's hook in `/hooks`, or enable Cline hooks if needed.
+4. Open **Settings → Integrations** to check status and next steps: restart Claude Code or enable Cline hooks if needed. Codex connects directly without hooks.
 
 Requires **macOS 13+** and **Apple Silicon** for the prebuilt DMG. Agents are installed separately. Rust, Xcode, and terminal commands are not needed to run the downloaded app.
 
@@ -90,7 +90,7 @@ Normal launches keep only the robot icon in the menu bar. Click it to see your s
 ## Privacy & permissions
 
 - **Local session data.** Discovery, message history, Git metadata, and Codex quota are read on your Mac. Passive monitoring does not start model turns. Answers and chat messages are sent to the existing agent only after you explicitly choose or submit them.
-- **Hook configuration.** First-launch setup connects detected agents by updating their hook configuration. Modified Codex and Claude configuration is backed up; unrelated hooks are preserved, and existing third-party Cline hook files are not overwritten. Review the result in **Settings → Integrations**.
+- **Hook configuration.** Codex connects directly without modifying its hook configuration. First-launch setup connects Claude Code and Cline through hooks. Modified Claude configuration is backed up; unrelated hooks are preserved, and existing third-party Cline hook files are not overwritten. Review the result in **Settings → Integrations**.
 - **macOS permissions.** Notification permission enables banners and answer buttons. macOS may request Automation permission to select tabs in Terminal or iTerm. Launch at login is optional and controlled in settings.
 - **Optional Telegram delivery.** The monitor connects directly to your bot; there is no project-hosted relay. Once paired and enabled, session titles, question text, and answer choices are sent to Telegram, and replies return through the bot. The bot token is stored in macOS Keychain. Browsing sessions and opening **Info** also sends the requested message history or folder/branch metadata. Pausing question delivery still allows read-only commands from the paired account.
 
@@ -107,25 +107,9 @@ AI Agent Monitor is **free to download and use**. The source code is available u
 
 ### Codex
 
-Open local Codex sessions are discovered automatically from local state and process activity. The VS Code and desktop integrations can expose live requests and questions through Codex's local client connection.
+Open local Codex sessions are discovered automatically from local state and process activity. Live requests, approval choices, and supported questions are read and answered through Codex's local client connection. No permission hook, installation command, or hook trust prompt is required.
 
-For approval notifications from Codex CLI, install the permission hook:
-
-```sh
-"$monitor_bin" install
-```
-
-Restart Codex CLI and VS Code. In Codex, open `/hooks`, review **macOS notification**, and trust the updated hook. Changing its executable path requires reviewing it again.
-
-The installer preserves unrelated hooks, backs up the configuration, and avoids duplicate entries. It also replaces this project's older notification hooks.
-
-By default, the monitor uses `$CODEX_HOME` or `~/.codex`. To install the hook in a different configuration directory:
-
-```sh
-"$monitor_bin" install --codex-home /path/to/codex-home
-```
-
-Run the monitor with the same `CODEX_HOME` when monitoring that configuration.
+By default, the monitor uses `$CODEX_HOME` or `~/.codex`. To monitor another configuration directory, launch the monitor with the same `CODEX_HOME` as Codex. The client protocol is version-dependent; if a request is unavailable through it, answer in Codex itself.
 
 ### Claude Code (experimental)
 
@@ -237,7 +221,7 @@ Settings use a native preferences toolbar with four sections: **General**, **App
 | **Applications** | Application switches | Show or hide that application's sessions in the menu |
 | **Telegram** | Personal bot | Connect and pair your bot, pause or resume questions, send a test, or disconnect |
 
-The Integrations section shows detected agents with **Needs setup**, **Setting up…**, **Hooks installed**, or **Needs attention**. Status is checked against the current hook configuration; **Hooks installed** does not mean that Codex trust or Cline’s Enable Hooks setting has been confirmed. Required next steps appear beneath each agent. Setup runs in the background without a separate results window.
+The Integrations section shows Codex as **No setup required**. Claude Code and Cline show **Needs setup**, **Setting up…**, **Hooks installed**, or **Needs attention**. Hook status is checked against the current configuration; **Hooks installed** does not confirm Cline’s Enable Hooks setting. Required next steps appear beneath each agent. Setup runs in the background without a separate results window.
 
 The application list fills automatically as sessions are discovered. Entries and your choices are retained after applications close and across monitor restarts. Hiding an application removes its sessions from the list and the green working count. Notifications and the orange pending-request counter still include its requests. Typing a title filter only changes the list.
 
@@ -307,15 +291,15 @@ The app now uses `com.melsomino.ai-agent-monitor` as its macOS bundle identifier
 
 ### A session or approval is missing
 
-Check that the agent runs locally. For Claude Code, restart after hook installation; for Cline, enable hooks and reopen the task. For Codex CLI approvals, review the hook's trust in `/hooks`.
+Check that the agent runs locally. For Claude Code, restart after hook installation; for Cline, enable hooks and reopen the task. Codex uses a direct local connection; restart its client if live requests are unavailable.
 
 Open **Settings → Integrations** to inspect agent status and errors, then use **Check & set up** to retry setup. No terminal commands are required.
 
-Codex's local client protocol is version-dependent. If a live request cannot be read or answered, use the agent's own interface. The monitor falls back to logs and hooks when possible. Historical chats are not added as substitutes for unavailable session data. If an agent adapter stops, its sessions are marked unavailable and replies are disabled; restart the monitor to reconnect.
+Codex's local client protocol is version-dependent. If a live request cannot be read or answered, use the agent's own interface. Logs can still supply session activity and messages; approvals require the direct connection. Historical chats are not added as substitutes for unavailable session data. If an agent adapter stops, its sessions are marked unavailable and replies are disabled; restart the monitor to reconnect.
 
 ### Hooks stopped working after moving the app
 
-Open the app from its **new location**, then use **Settings → Integrations → Check & set up** and restart the agent. Review updated Codex hooks again in `/hooks`.
+Open the app from its **new location**, then use **Settings → Integrations → Check & set up** and restart the agent. Codex requires no hook configuration.
 
 ## Updating and uninstalling
 
@@ -332,7 +316,7 @@ open -g "$HOME/Applications/AI Agent Monitor.app"
 
 If the app path is unchanged, existing hooks keep pointing to it. If an integration changes in an update, use **Settings → Integrations → Check & set up** and restart the agent.
 
-To uninstall, turn off **Launch at login**, quit the monitor, and remove its hook entries before deleting the app. For Codex, disable the hook in `/hooks` or remove only the `AIAgentMonitor hook` handler from `hooks.PermissionRequest` in `hooks.json`. For Claude Code, remove this monitor's hook commands from its settings. For Cline, remove only wrappers installed by this project from its Hooks directory. Keep unrelated hooks intact.
+To uninstall, turn off **Launch at login**, quit the monitor, and remove its hook entries before deleting the app. Codex requires no hook cleanup. For Claude Code, remove this monitor's hook commands from its settings. For Cline, remove only wrappers installed by this project from its Hooks directory. Keep unrelated hooks intact.
 
 ## Development
 

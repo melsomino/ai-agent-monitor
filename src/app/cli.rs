@@ -27,8 +27,6 @@ impl AgentKind {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Process a Codex PermissionRequest event from JSON on stdin.
-    Hook,
     /// Receive a lifecycle/permission hook from Claude Code or Cline.
     AgentHook {
         #[arg(value_enum)]
@@ -65,18 +63,6 @@ pub enum Command {
     Bundle,
     /// Build a drag-and-drop macOS disk image from this binary.
     Dmg,
-    /// Install or update the Codex approval hook.
-    Install {
-        /// Codex configuration directory (defaults to CODEX_HOME or ~/.codex).
-        #[arg(long, value_name = "PATH")]
-        codex_home: Option<PathBuf>,
-    },
-    /// Inspect hook discovery and trust without starting a model.
-    CheckHooks {
-        /// Codex engine to query.
-        #[arg(long, default_value = "codex", value_name = "PATH")]
-        binary: String,
-    },
     /// Ask macOS for notification permission.
     #[command(long_flag = "setup")]
     Setup,

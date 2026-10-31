@@ -1,5 +1,5 @@
 //! First-launch integration discovery and installation, independent of AppKit.
-use crate::{agents, app::core};
+use crate::agents;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -10,10 +10,13 @@ pub struct Integration {
     pub directory: PathBuf,
 }
 impl Integration {
-    /// Inspect actual hook configuration; a remembered setup flag alone is insufficient.
+    /// Codex needs no installation; other integrations inspect their actual hooks.
     pub fn installed(&self, executable: &Path) -> Result<bool> {
+        if self.agent == Agent::Codex {
+            return Ok(true);
+        }
         let config_path = self.directory.join(match self.agent {
-            Agent::Codex => "hooks.json",
+            Agent::Codex => unreachable!(),
             Agent::Claude => "settings.json",
             Agent::Cline => "",
         });
@@ -66,11 +69,7 @@ impl Integration {
         if self.agent == Agent::Claude && config["disableAllHooks"] == true {
             return Ok(false);
         }
-        let events: &[&str] = if self.agent == Agent::Codex {
-            &["PermissionRequest"]
-        } else {
-            agents::claude::EVENTS
-        };
+        let events = agents::claude::EVENTS;
         Ok(events.iter().all(|event| {
             config["hooks"][event].as_array().is_some_and(|groups| {
                 groups.iter().any(|group| {
@@ -78,14 +77,7 @@ impl Integration {
                         hooks.iter().any(|hook| {
                             hook["type"] == "command"
                                 && hook["command"].as_str().is_some_and(|command| {
-                                    matches(
-                                        command,
-                                        if self.agent == Agent::Codex {
-                                            &["hook"]
-                                        } else {
-                                            &["agent-hook", "claude"]
-                                        },
-                                    )
+                                    matches(command, &["agent-hook", "claude"])
                                 })
                         })
                     })
@@ -96,11 +88,7 @@ impl Integration {
 
     pub fn install(&self, executable: &Path) -> Result<bool> {
         match self.agent {
-            Agent::Codex => core::install(
-                &self.directory,
-                executable,
-                &core::home().join(".ai-agent-monitor-legacy/notify.py"),
-            ),
+            Agent::Codex => Ok(false),
             Agent::Claude => agents::claude::install(&self.directory, executable),
             Agent::Cline => agents::cline::install(&self.directory, executable),
         }
@@ -176,6 +164,12 @@ mod tests {
         );
         let exe = Path::new("/Applications/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor");
         for integration in found {
+            if integration.agent == Agent::Codex {
+                assert!(integration.installed(exe).unwrap());
+                assert!(!integration.install(exe).unwrap());
+                assert!(!integration.directory.join("hooks.json").exists());
+                continue;
+            }
             assert!(!integration.installed(exe).unwrap());
             assert!(integration.install(exe).unwrap());
             assert!(integration.installed(exe).unwrap());
@@ -188,6 +182,29 @@ mod tests {
             );
             assert!(!integration.install(exe).unwrap());
         }
+    }
+
+    #[test]
+    fn codex_setup_never_reads_or_modifies_hooks() {
+        let root = tempfile::tempdir().unwrap();
+        let integration = Integration {
+            agent: Agent::Codex,
+            directory: root.path().join("codex"),
+        };
+        let executable =
+            Path::new("/Applications/AI Agent Monitor.app/Contents/MacOS/AIAgentMonitor");
+        assert!(integration.installed(executable).unwrap());
+        assert!(!integration.install(executable).unwrap());
+        assert!(!integration.directory.exists());
+        fs::create_dir_all(&integration.directory).unwrap();
+        let path = integration.directory.join("hooks.json");
+        fs::write(&path, "unrelated configuration, deliberately not JSON").unwrap();
+        assert!(integration.installed(executable).unwrap());
+        assert!(!integration.install(executable).unwrap());
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "unrelated configuration, deliberately not JSON"
+        );
     }
 
     #[test]
