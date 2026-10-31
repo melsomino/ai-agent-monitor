@@ -21,6 +21,7 @@ use std::{
 };
 
 mod sessions;
+mod text;
 
 pub use crate::domain::telegram::Status;
 pub fn diagnostics(status: &Status) -> Value {
@@ -186,13 +187,13 @@ fn api(token: &str, method: &str, payload: Value) -> Result<Value> {
 fn api_result(method: &str, value: Value) -> Result<Value> {
     if value["ok"] != true && value["error_code"] == 400 {
         let description = value["description"].as_str().unwrap_or_default();
-        if method == "editMessageText"
+        if matches!(method, "editMessageText" | "editMessageReplyMarkup")
             && description.starts_with("Bad Request: message is not modified")
         {
             return Ok(json!({"unchanged":true}));
         }
         if (method == "deleteMessage" && description == "Bad Request: message to delete not found")
-            || (method == "editMessageText"
+            || (matches!(method, "editMessageText" | "editMessageReplyMarkup")
                 && description == "Bad Request: message to edit not found")
         {
             return Ok(json!(true));
@@ -260,62 +261,79 @@ impl Pending {
             phase: None,
         })
     }
-    fn content(&self) -> (String, Value) {
+    fn body_content(&self) -> (text::Text, Value) {
         let body = self
             .session
             .approval
             .as_ref()
             .map(|a| a.body.trim())
             .unwrap_or_default();
-        let mut text = format!("{}\n{body}", self.session.title);
+        let mut text = text::Text::default();
         let mut rows = Vec::new();
-        if let Some(question) = self.interaction.questions.get(self.question) {
-            text.push_str(&format!(
-                "\n\nQuestion {} of {}: {}",
-                self.question + 1,
-                self.interaction.questions.len(),
-                question.title
-            ));
-            if question.secret {
-                text = format!(
-                    "{}\nThis request needs a private answer. Open the agent app to respond.",
-                    self.session.title
-                );
-            } else {
+        let question = self.interaction.questions.get(self.question);
+        if question.is_some_and(|q| q.secret) {
+            text.plain("This request needs a private answer. Open the agent app to respond.");
+        } else {
+            text.markdown(body, 2200);
+            if let Some(question) = question {
+                text.plain(&format!(
+                    "\n\nQuestion {} of {}: ",
+                    self.question + 1,
+                    self.interaction.questions.len()
+                ));
+                text.bold(&question.title);
                 for (index, choice) in question.choices.iter().enumerate().take(90) {
-                    rows.push(json!([{"text":short(&choice.label, 80),"callback_data":format!("{}:{index}",self.nonce)}]));
+                    rows.push(json!([{"text":short(&choice.label,80),"callback_data":format!("{}:{index}",self.nonce)}]));
                     if !choice.description.is_empty() {
-                        text.push_str(&format!("\n{}: {}", choice.label, choice.description));
+                        text.plain(&format!("\n{}: ", choice.label));
+                        text.markdown(&choice.description, 300);
                     }
                 }
                 if question.freeform {
-                    text.push_str("\n\nReply to this message to write your own answer.");
+                    text.plain("\n\nReply to this message to write your own answer.");
                 }
-            }
-        } else {
-            for (index, action) in self.interaction.actions.iter().enumerate().take(90) {
-                rows.push(json!([{"text":short(&action.label,80),"callback_data":format!("{}:{index}",self.nonce)}]));
-                if !action.detail.is_empty() {
-                    text.push_str(&format!("\n\n{}: {}", action.label, action.detail));
+            } else {
+                for (index, action) in self.interaction.actions.iter().enumerate().take(90) {
+                    rows.push(json!([{"text":short(&action.label,80),"callback_data":format!("{}:{index}",self.nonce)}]));
+                    if !action.detail.is_empty() {
+                        text.plain(&format!("\n\n{}: ", action.label));
+                        text.markdown(&action.detail, 300);
+                    }
                 }
-            }
-            if rows.is_empty() {
-                text.push_str("\n\nOpen the agent app to respond.");
+                if rows.is_empty() {
+                    text.plain("\n\nOpen the agent app to respond.");
+                }
             }
         }
         match &self.phase {
             Some(monitor::Submission::Sending) => {
-                text.push_str("\n\nSending answer…");
+                text.plain("\n\nSending answer…");
                 rows.clear();
             }
             Some(monitor::Submission::Reconciling) => {
-                text.push_str("\n\nChecking whether the agent received the answer…");
+                text.plain("\n\nChecking whether the agent received the answer…");
                 rows.clear();
             }
-            Some(monitor::Submission::Failed(error)) => text.push_str(&format!("\n\n{error}")),
+            Some(monitor::Submission::Failed(error)) => text.plain(&format!("\n\n{error}")),
             None => {}
         }
-        (short(&text, 3900), json!({"inline_keyboard":rows}))
+        (text, json!({"inline_keyboard":rows}))
+    }
+    fn payload(&self) -> Value {
+        let (body, keyboard) = self.body_content();
+        let mut text = text::Text::default();
+        text.bold(&self.session.title);
+        text.plain("\n");
+        text.append(body);
+        text.payload(keyboard)
+    }
+    #[cfg(test)]
+    fn content(&self) -> (String, Value) {
+        let payload = self.payload();
+        (
+            payload["text"].as_str().unwrap().into(),
+            payload["reply_markup"].clone(),
+        )
     }
     fn choose(&mut self, index: Option<usize>, text: Option<&str>) -> Result<Option<Response>> {
         if let Some(question) = self.interaction.questions.get(self.question) {
@@ -359,12 +377,10 @@ impl Pending {
     }
 }
 fn edit_pending(token: &str, chat: Option<i64>, pending: &Pending) -> Result<()> {
-    let (text, keyboard) = pending.content();
-    api(
-        token,
-        "editMessageText",
-        json!({"chat_id":chat,"message_id":pending.message,"text":text,"reply_markup":keyboard}),
-    )?;
+    let mut payload = pending.payload();
+    payload["chat_id"] = json!(chat);
+    payload["message_id"] = json!(pending.message);
+    api(token, "editMessageText", payload)?;
     Ok(())
 }
 struct Worker {
@@ -801,11 +817,9 @@ impl Worker {
             .find(|(_, p)| self.config.enabled && p.message.is_none())
             .map(|(k, _)| k.clone())
         {
-            let (text, keyboard) = self.pending[&key].content();
-            match self.api(
-                "sendMessage",
-                json!({"chat_id":self.config.chat,"text":text,"reply_markup":keyboard}),
-            ) {
+            let mut payload = self.pending[&key].payload();
+            payload["chat_id"] = json!(self.config.chat);
+            match self.api("sendMessage", payload) {
                 Ok(result) => {
                     if let Some(id) = result["message_id"].as_i64() {
                         self.pending.get_mut(&key).unwrap().message = Some(id);
@@ -853,12 +867,43 @@ impl Worker {
     }
     fn flush_browser(&mut self) {
         let snapshot = self.monitor.snapshot();
+        let token = self.token.clone();
+        if self.flush_browser_with(&snapshot, |method, payload| api(&token, method, payload)) {
+            self.save();
+        }
+    }
+    fn flush_browser_with(
+        &mut self,
+        snapshot: &monitor::State,
+        mut send: impl FnMut(&str, Value) -> Result<Value>,
+    ) -> bool {
         let Some(browser) = self.browser.as_mut() else {
-            return;
+            return false;
         };
-        let content = browser.content(&snapshot, &self.pending);
+        let content = browser.content(snapshot, &self.pending);
+        // Remove controls first. If this fails, retain ownership and retry that
+        // idempotent operation before sending a new message.
+        if browser.needs_new_message() {
+            let old = browser.message.unwrap();
+            match send(
+                "editMessageReplyMarkup",
+                json!({"chat_id":self.config.chat,"message_id":old,"reply_markup":{"inline_keyboard":[]}}),
+            ) {
+                Ok(_) => {
+                    self.browser.as_mut().unwrap().detach_message();
+                    self.config.messages.retain(|id| *id != old);
+                    self.retry = Instant::now() + Duration::from_secs(1);
+                    return true;
+                }
+                Err(error) => {
+                    self.note(&error.to_string());
+                    self.retry = Instant::now() + Duration::from_secs(15);
+                    return false;
+                }
+            }
+        }
         if content == browser.rendered {
-            return;
+            return false;
         }
         let message = browser.message;
         let mut payload = content.clone();
@@ -871,29 +916,29 @@ impl Worker {
         } else {
             "sendMessage"
         };
-        match self.api(method, payload) {
+        match send(method, payload) {
             Ok(result) => {
+                let mut changed = false;
                 if let Some(id) = result["message_id"].as_i64() {
                     let browser = self.browser.as_mut().unwrap();
                     browser.message = Some(id);
                     browser.commit(content);
                     if message.is_none() {
                         self.config.messages.push(id);
-                        self.save();
+                        changed = true;
                     }
                 } else if message.is_some() && result["unchanged"] == true {
                     self.browser.as_mut().unwrap().commit(content);
                 } else if message.is_some() {
-                    // A deleted Telegram message cannot be revived by editing.
-                    let browser = self.browser.as_mut().unwrap();
-                    browser.message = None;
-                    browser.rendered = Value::Null;
+                    self.browser.as_mut().unwrap().detach_message();
                 }
                 self.retry = Instant::now() + Duration::from_secs(1);
+                changed
             }
             Err(error) => {
                 self.note(&error.to_string());
                 self.retry = Instant::now() + Duration::from_secs(15);
+                false
             }
         }
     }
@@ -910,6 +955,7 @@ impl Worker {
                 json!({"scope":{"type":"chat","chat_id":chat},"commands":[
                     {"command":"sessions","description":"List all open agent sessions"},
                     {"command":"status","description":"Show monitor and notification status"},
+                    {"command":"info","description":"Show the selected session folder and Git branch"},
                     {"command":"help","description":"Show available commands"}
                 ]}),
             )
@@ -940,9 +986,13 @@ impl Worker {
                 self.browser = Some(browser);
                 return Ok(());
             }
+            BotCommand::Info => {
+                if self.browser.as_mut().is_some_and(|browser|browser.open_info()) {return Ok(());}
+                vec!["Select a session in Sessions first.".into()]
+            }
             BotCommand::Status => vec![format!("AI Agent Monitor {}\nNotifications: {}\nPending questions: {}",
                 core::VERSION, if self.config.enabled {"enabled"} else {"paused"}, self.pending.len())],
-            BotCommand::Help => vec!["/sessions — List all open sessions, including idle sessions\n/status — Monitor and notification status\n/help — Show these commands\n\nOpen a session and type in chat to send a message to that agent. Previous message loads an earlier agent message. Use answer buttons on question messages, or reply to one to enter a custom answer.\nCommands require your Mac and monitor to be running.".into()],
+            BotCommand::Help => vec!["/sessions — List all open sessions, including idle sessions\n/status — Monitor and notification status\n/info — Selected session folder and Git branch\n/help — Show these commands\n\nOpen a session and type in chat to send a message to that agent. Previous message loads an earlier agent message. Use answer buttons on question messages, or reply to one to enter a custom answer.\nCommands require your Mac and monitor to be running.".into()],
         };
         anyhow::ensure!(
             self.outbox.len() + messages.len() <= 128,
@@ -1158,12 +1208,14 @@ impl Worker {
 enum BotCommand {
     Sessions,
     Status,
+    Info,
     Help,
 }
 fn bot_command(text: &str, username: &str) -> Option<BotCommand> {
     match text.trim() {
         "Sessions" => return Some(BotCommand::Sessions),
         "Status" => return Some(BotCommand::Status),
+        "Info" => return Some(BotCommand::Info),
         "Help" => return Some(BotCommand::Help),
         _ => {}
     }
@@ -1179,6 +1231,7 @@ fn bot_command(text: &str, username: &str) -> Option<BotCommand> {
     match command {
         "/sessions" => Some(BotCommand::Sessions),
         "/status" => Some(BotCommand::Status),
+        "/info" => Some(BotCommand::Info),
         "/help" | "/start" => Some(BotCommand::Help),
         _ => None,
     }
@@ -1581,6 +1634,103 @@ mod tests {
         assert!(commands.try_recv().is_err());
     }
     #[test]
+    fn question_payload_formats_body_and_preserves_exact_button_captions() {
+        let mut request = pending(Interaction::allow());
+        request.session.title = "Chat 🤖".into();
+        request.session.approval.as_mut().unwrap().body = "Run **tests** in `some_dir`?".into();
+        let payload = request.payload();
+        assert_eq!(payload["text"], "Chat 🤖\nRun tests in some_dir?");
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "Allow"
+        );
+        assert!(
+            payload["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entity| entity["type"] == "code")
+        );
+        assert!(payload.get("parse_mode").is_none());
+        request.interaction.questions = vec![question("private", true)];
+        request.interaction.questions[0].secret = true;
+        assert!(
+            !request.payload()["text"]
+                .as_str()
+                .unwrap()
+                .contains("some_dir")
+        );
+    }
+    #[test]
+    fn new_agent_message_removes_old_controls_before_posting_the_new_message() {
+        let mut worker = worker();
+        let mut chat = session();
+        chat.approval = None;
+        chat.last_message = "First message".into();
+        chat.activity = crate::agents::sessions::Activity::Idle;
+        let mut state = monitor::State {
+            sessions: vec![chat],
+            ..Default::default()
+        };
+        let mut browser = sessions::Browser::new().unwrap();
+        browser.message = Some(77);
+        let list = browser.content(&state, &worker.pending);
+        let select = list["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row.as_array().unwrap())
+            .find_map(|button| {
+                button["callback_data"]
+                    .as_str()
+                    .filter(|data| data.contains(":s:"))
+            })
+            .unwrap();
+        browser.navigate(77, select).unwrap();
+        let detail = browser.content(&state, &worker.pending);
+        browser.commit(detail);
+        worker.browser = Some(browser);
+        worker.config.messages = vec![50, 77];
+        state.sessions[0].last_message = "Second **message**".into();
+        assert!(!worker.flush_browser_with(&state, |method, payload| {
+            assert_eq!(method, "editMessageReplyMarkup");
+            assert_eq!(payload["message_id"], 77);
+            bail!("offline")
+        }));
+        assert_eq!(worker.browser.as_ref().unwrap().message, Some(77));
+        assert!(worker.flush_browser_with(&state, |method, payload| {
+            assert_eq!(method, "editMessageReplyMarkup");
+            assert_eq!(payload["message_id"], 77);
+            assert_eq!(payload["reply_markup"]["inline_keyboard"], json!([]));
+            Ok(json!(true))
+        }));
+        assert_eq!(worker.config.messages, vec![50]);
+        assert!(worker.browser.as_ref().unwrap().selected(77).is_none());
+        assert!(worker.flush_browser_with(&state, |method, payload| {
+            assert_eq!(method, "sendMessage");
+            assert!(payload.get("message_id").is_none());
+            assert!(payload["text"].as_str().unwrap().contains("Second message"));
+            assert!(
+                !payload["reply_markup"]["inline_keyboard"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(json!({"message_id":78}))
+        }));
+        assert_eq!(worker.config.messages, vec![50, 78]);
+        assert_eq!(worker.browser.as_ref().unwrap().message, Some(78));
+        assert!(!worker.flush_browser_with(&state, |_, _| panic!(
+            "unchanged message must not be resent"
+        )));
+        state.sessions[0].activity = crate::agents::sessions::Activity::Working;
+        assert!(!worker.flush_browser_with(&state, |method, payload| {
+            assert_eq!(method, "editMessageText");
+            assert_eq!(payload["message_id"], 78);
+            Ok(json!({"message_id":78}))
+        }));
+    }
+    #[test]
     fn structured_questions_collect_all_answers_and_invalidate_previous_buttons() {
         let mut request = pending(Interaction {
             actions: vec![],
@@ -1708,6 +1858,8 @@ mod tests {
             Some(BotCommand::Sessions)
         );
         assert_eq!(bot_command("/status", "my_bot"), Some(BotCommand::Status));
+        assert_eq!(bot_command("/info", "my_bot"), Some(BotCommand::Info));
+        assert_eq!(bot_command("Info", "my_bot"), Some(BotCommand::Info));
         assert_eq!(bot_command("/help", "my_bot"), Some(BotCommand::Help));
         assert_eq!(bot_command("/start", "my_bot"), Some(BotCommand::Help));
         assert_eq!(bot_command("/sessions@other_bot", "my_bot"), None);

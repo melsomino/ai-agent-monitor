@@ -1,5 +1,5 @@
 //! A bounded, state-driven Telegram view of the native sessions list.
-use super::{Pending, Session, nonce, short};
+use super::{Pending, Session, nonce, short, text::Text};
 use crate::{
     actors::monitor,
     agents::sessions::{Activity, Client},
@@ -30,6 +30,9 @@ pub(super) struct Browser {
     history_note: Option<String>,
     history_exhausted: bool,
     outgoing: Option<String>,
+    show_info: bool,
+    delivered_agent: Option<(String, String)>,
+    staged_agent: Option<(String, String)>,
 }
 impl Browser {
     pub fn new() -> Result<Self> {
@@ -48,6 +51,9 @@ impl Browser {
             history_note: None,
             history_exhausted: false,
             outgoing: None,
+            show_info: false,
+            delivered_agent: None,
+            staged_agent: None,
         })
     }
     pub fn selected(&self, message: i64) -> Option<&str> {
@@ -65,6 +71,7 @@ impl Browser {
         self.history_exhausted = false;
         self.previous_requested = false;
         self.outgoing = None;
+        self.show_info = false;
     }
     pub fn track_send(&mut self, id: String) {
         self.reset_detail();
@@ -133,13 +140,38 @@ impl Browser {
             self.history_error("History request interrupted. Try Previous message again.".into());
         }
     }
+    pub fn open_info(&mut self) -> bool {
+        if self.selected.is_none() {
+            return false;
+        }
+        self.show_info = true;
+        true
+    }
+    pub fn needs_new_message(&self) -> bool {
+        self.message.is_some()
+            && self
+                .delivered_agent
+                .as_ref()
+                .zip(self.staged_agent.as_ref())
+                .is_some_and(|((old_key, old), (key, text))| {
+                    old_key == key && old != text && !text.is_empty()
+                })
+    }
+    pub fn detach_message(&mut self) {
+        self.message = None;
+        self.rendered = Value::Null;
+        self.active_request = None;
+    }
     pub fn commit(&mut self, content: Value) {
         self.rendered = content;
         self.active_request = self.staged_request.clone();
+        self.delivered_agent = self.staged_agent.clone();
     }
     pub fn permits_answer(&self, message: i64, pending: &Pending) -> bool {
-        self.selected(message)
-            .is_some_and(|key| key == pending.session.key())
+        !self.show_info
+            && self
+                .selected(message)
+                .is_some_and(|key| key == pending.session.key())
             && self.active_request.as_ref().is_some_and(|(key, nonce)| {
                 pending.session.approval_key().as_ref() == Some(key) && *nonce == pending.nonce
             })
@@ -165,6 +197,10 @@ impl Browser {
         } else if command == "back" {
             self.selected = None;
             self.reset_detail();
+        } else if command == "info" {
+            self.show_info = true;
+        } else if command == "message" {
+            self.show_info = false;
         } else if command == "previous" {
             self.previous_requested = true;
         } else if command == "latest" {
@@ -198,22 +234,48 @@ impl Browser {
                     }
                 })
         });
-        self.staged_request = self.selected.as_ref().and_then(|selected| {
-            sessions
-                .iter()
-                .find(|s| s.key() == *selected)?
-                .approval_key()
-                .and_then(|key| pending.get(&key).map(|p| (key, p.nonce.clone())))
+        self.staged_agent = self.selected.as_ref().and_then(|selected| {
+            let session = sessions.iter().find(|s| s.key() == *selected)?;
+            if session.last_message.is_empty() {
+                self.delivered_agent
+                    .clone()
+                    .filter(|(key, _)| key == selected)
+            } else {
+                Some((selected.clone(), session.last_message.clone()))
+            }
         });
+        if self.needs_new_message() {
+            // New agent output returns a history/info view to the live message.
+            let outgoing = self.outgoing.take();
+            self.reset_detail();
+            self.outgoing = outgoing;
+        }
+        self.staged_request =
+            self.selected
+                .as_ref()
+                .filter(|_| !self.show_info)
+                .and_then(|selected| {
+                    sessions
+                        .iter()
+                        .find(|s| s.key() == *selected)?
+                        .approval_key()
+                        .and_then(|key| pending.get(&key).map(|p| (key, p.nonce.clone())))
+                });
         let mut rows = Vec::new();
         let text;
         if let Some(key) = &self.selected {
             if let Some(session) = sessions.iter().find(|s| s.key() == *key) {
-                text = self.detail(session, state, pending, &mut rows);
+                text = if self.show_info {
+                    self.info(session)
+                } else {
+                    self.detail(session, state, pending, &mut rows)
+                };
             } else {
-                text = "This session is closed or hidden in Applications settings.".to_owned();
+                let mut value = Text::default();
+                value.plain("This session is closed or hidden in Applications settings.");
+                text = value;
             }
-            if sessions.iter().any(|session| session.key() == *key) {
+            if !self.show_info && sessions.iter().any(|session| session.key() == *key) {
                 let mut history = vec![self.button(
                     if self.history_waiting.is_some() {
                         "Loading…"
@@ -229,12 +291,17 @@ impl Browser {
             }
             rows.push(json!([
                 self.button("‹ Sessions", "back"),
+                if self.show_info {
+                    self.button("‹ Message", "message")
+                } else {
+                    self.button("Info", "info")
+                },
                 self.button("↻ Refresh", "refresh")
             ]));
         } else {
             let pages = sessions.len().div_ceil(PAGE_SIZE).max(1);
             self.page = self.page.min(pages - 1);
-            text = if sessions.is_empty() {
+            let caption = if sessions.is_empty() {
                 "No open agent sessions.".to_owned()
             } else if pages > 1 {
                 format!(
@@ -248,6 +315,9 @@ impl Browser {
                     sessions.len()
                 )
             };
+            let mut value = Text::default();
+            value.plain(&caption);
+            text = value;
             for session in sessions.iter().skip(self.page * PAGE_SIZE).take(PAGE_SIZE) {
                 let key = session.key();
                 let index = if let Some(index) = self.keys.iter().position(|k| *k == key) {
@@ -281,7 +351,7 @@ impl Browser {
             }
             rows.push(json!(navigation));
         }
-        json!({"text":short(&text,3899), "reply_markup":{"inline_keyboard":rows}})
+        text.payload(json!({"inline_keyboard":rows}))
     }
     fn detail(
         &self,
@@ -289,14 +359,8 @@ impl Browser {
         state: &monitor::State,
         pending: &HashMap<String, Pending>,
         rows: &mut Vec<Value>,
-    ) -> String {
-        let mut text = format!(
-            "{}\n{}{}",
-            session.client.label(),
-            status_symbol(session),
-            session.title
-        );
-        text.push_str("\nType a message to send it to this session.");
+    ) -> Text {
+        let mut text = self.header(session);
         let message = self
             .earlier
             .as_ref()
@@ -304,31 +368,32 @@ impl Browser {
                 message.text.as_str()
             });
         if self.earlier.is_some() {
-            text.push_str("\n\nEarlier message");
+            text.plain("\n\nEarlier message");
         }
         if !message.trim().is_empty() {
-            text.push_str(&format!("\n\n{}", short(message.trim(), 1700)));
+            text.plain("\n\n");
+            text.markdown(message.trim(), 1700);
         }
         if let Some(note) = &self.history_note {
-            text.push_str(&format!("\n\n{note}"));
+            text.plain(&format!("\n\n{note}"));
         }
         if let Some(send) = self
             .outgoing
             .as_ref()
             .and_then(|id| state.message_sends.get(id))
         {
-            text.push_str(&match &send.status {
-                monitor::MessageStatus::Sending => "\n\nSending message…".into(),
-                monitor::MessageStatus::Sent => "\n\nMessage sent.".into(),
-                monitor::MessageStatus::Failed(error) => format!("\n\n{}", short(error, 300)),
-            });
+            match &send.status {
+                monitor::MessageStatus::Sending => text.plain("\n\nSending message…"),
+                monitor::MessageStatus::Sent => {}
+                monitor::MessageStatus::Failed(error) => {
+                    text.plain(&format!("\n\n{}", short(error, 300)))
+                }
+            }
         }
         if let Some(request) = session.approval_key().and_then(|key| pending.get(&key)) {
-            let (body, keyboard) = request.content();
-            let body = body
-                .strip_prefix(&format!("{}\n", session.title))
-                .unwrap_or(&body);
-            text.push_str(&format!("\n\n{}", short(body, 1500)));
+            let (body, keyboard) = request.body_content();
+            text.plain("\n\n");
+            text.append_limited(body, 1500);
             rows.extend(
                 keyboard["inline_keyboard"]
                     .as_array()
@@ -336,8 +401,23 @@ impl Browser {
                     .unwrap_or_default(),
             );
         } else if let Some(approval) = &session.approval {
-            text.push_str(&format!("\n\n{}", short(&approval.body, 1500)));
+            text.plain("\n\n");
+            text.markdown(&approval.body, 1500);
         }
+        text
+    }
+    fn header(&self, session: &Session) -> Text {
+        let mut text = Text::default();
+        text.plain(&format!("{} ", app_symbol(session.client)));
+        text.bold(&session.title);
+        let status = status_symbol(session).trim();
+        if !status.is_empty() {
+            text.plain(&format!("  {status}"));
+        }
+        text
+    }
+    fn info(&self, session: &Session) -> Text {
+        let mut text = self.header(session);
         let directory = session.working_directory();
         let home = std::env::var_os("HOME");
         let path = home
@@ -351,9 +431,11 @@ impl Browser {
                 }
             })
             .unwrap_or_else(|| directory.display().to_string());
-        text.push_str(&format!("\n\n📁 {}", short(&path, 240)));
+        text.plain("\n\n📁 ");
+        text.code(&short(&path, 240));
         if let Some(branch) = &session.git_branch {
-            text.push_str(&format!("\n⑂ {}", short(branch, 160)));
+            text.plain("\n⑂ ");
+            text.code(&short(branch, 160));
         }
         text
     }
@@ -490,8 +572,13 @@ mod tests {
         let detail = browser.content(&state, &HashMap::new());
         assert!(detail["text"].as_str().unwrap().contains("Zulu"));
         assert!(detail["text"].as_str().unwrap().contains("Latest message"));
-        assert!(detail["text"].as_str().unwrap().contains("/work/project"));
-        assert!(detail["text"].as_str().unwrap().contains("main"));
+        assert!(!detail["text"].as_str().unwrap().contains("/work/project"));
+        browser
+            .navigate(7, &format!("{}:info", browser.nonce))
+            .unwrap();
+        let info = browser.content(&state, &HashMap::new());
+        assert!(info["text"].as_str().unwrap().contains("/work/project"));
+        assert!(info["text"].as_str().unwrap().contains("main"));
         state.sessions.clear();
         assert!(
             browser.content(&state, &HashMap::new())["text"]
@@ -543,7 +630,7 @@ mod tests {
         state.sessions[0].approval = None;
         let resolved = browser.content(&state, &pending);
         assert!(!resolved["text"].as_str().unwrap().contains("Allow test?"));
-        assert_eq!(callbacks(&resolved).len(), 3);
+        assert_eq!(callbacks(&resolved).len(), 4);
     }
     #[test]
     fn previous_message_uses_monitor_history_and_latest_restores_live_message() {
@@ -618,6 +705,162 @@ mod tests {
                 .unwrap()
                 .contains("Previous agent message")
         );
+    }
+    #[test]
+    fn rendered_message_entities_are_shifted_past_literal_header_and_clipped_safely() {
+        let mut chat = session("1", "Chat **literal** 🤖", Client::VSCode);
+        chat.last_message =
+            "## Итог\n\n**Готово 🤖**: [ссылка](https://example.com) и `file_name.rs`".into();
+        let mut state = monitor::State {
+            sessions: vec![chat],
+            ..Default::default()
+        };
+        let mut browser = Browser::new().unwrap();
+        browser.message = Some(7);
+        let list = browser.content(&state, &HashMap::new());
+        let data = callbacks(&list)
+            .into_iter()
+            .find(|(_, data)| data.contains(":s:"))
+            .unwrap()
+            .1;
+        browser.navigate(7, &data).unwrap();
+        let payload = browser.content(&state, &HashMap::new());
+        let text = payload["text"].as_str().unwrap();
+        let utf16: Vec<_> = text.encode_utf16().collect();
+        assert!(text.contains("Chat **literal** 🤖"));
+        assert!(text.contains("Готово 🤖: ссылка и file_name.rs"));
+        let spans: Vec<_> = payload["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entity| {
+                let start = entity["offset"].as_u64().unwrap() as usize;
+                let len = entity["length"].as_u64().unwrap() as usize;
+                (
+                    entity["type"].as_str().unwrap(),
+                    String::from_utf16(&utf16[start..start + len]).unwrap(),
+                )
+            })
+            .collect();
+        assert!(
+            spans
+                .iter()
+                .any(|(kind, span)| *kind == "bold" && span.contains("Готово 🤖"))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|(kind, span)| *kind == "text_link" && span == "ссылка")
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|(kind, span)| *kind == "code" && span == "file_name.rs")
+        );
+        state.sessions[0].last_message = format!("**{}**", "🤖".repeat(3000));
+        let clipped = browser.content(&state, &HashMap::new());
+        let size = clipped["text"].as_str().unwrap().encode_utf16().count();
+        assert!(size <= 3900);
+        for entity in clipped["entities"].as_array().unwrap() {
+            assert!(
+                entity["offset"].as_u64().unwrap() + entity["length"].as_u64().unwrap()
+                    <= size as u64
+            );
+        }
+    }
+    #[test]
+    fn compact_header_hides_service_text_and_metadata_until_info() {
+        let mut chat = session("1", "Chat", Client::VSCode);
+        chat.activity = Activity::Working;
+        let mut state = monitor::State {
+            sessions: vec![chat],
+            ..Default::default()
+        };
+        let mut browser = Browser::new().unwrap();
+        browser.message = Some(7);
+        let list = browser.content(&state, &HashMap::new());
+        let data = callbacks(&list)
+            .into_iter()
+            .find(|(_, data)| data.contains(":s:"))
+            .unwrap()
+            .1;
+        browser.navigate(7, &data).unwrap();
+        browser.track_send("send".into());
+        state.message_sends.insert(
+            "send".into(),
+            monitor::MessageSend {
+                session: "codex:1".into(),
+                status: monitor::MessageStatus::Sent,
+            },
+        );
+        let detail = browser.content(&state, &HashMap::new());
+        let text = detail["text"].as_str().unwrap();
+        assert!(text.starts_with("💻 Chat  🟢\n\nLatest message"));
+        for unwanted in [
+            "VS Code",
+            "Type a message",
+            "Message sent",
+            "/work/project",
+            "main",
+        ] {
+            assert!(!text.contains(unwanted));
+        }
+        assert!(browser.open_info());
+        let info = browser.content(&state, &HashMap::new());
+        assert!(info["text"].as_str().unwrap().contains("/work/project"));
+        assert!(info["text"].as_str().unwrap().contains("main"));
+        assert!(!info["text"].as_str().unwrap().contains("Latest message"));
+        browser
+            .navigate(7, &format!("{}:message", browser.nonce))
+            .unwrap();
+        assert!(
+            browser.content(&state, &HashMap::new())["text"]
+                .as_str()
+                .unwrap()
+                .contains("Latest message")
+        );
+    }
+    #[test]
+    fn only_new_agent_text_moves_controls_to_a_new_message() {
+        let mut state = monitor::State {
+            sessions: vec![session("1", "Chat", Client::VSCode)],
+            ..Default::default()
+        };
+        let mut browser = Browser::new().unwrap();
+        browser.message = Some(7);
+        let list = browser.content(&state, &HashMap::new());
+        let data = callbacks(&list)
+            .into_iter()
+            .find(|(_, data)| data.contains(":s:"))
+            .unwrap()
+            .1;
+        browser.navigate(7, &data).unwrap();
+        let detail = browser.content(&state, &HashMap::new());
+        browser.commit(detail);
+        state.sessions[0].activity = Activity::Working;
+        let status = browser.content(&state, &HashMap::new());
+        assert!(!browser.needs_new_message());
+        browser.commit(status);
+        browser.open_info();
+        let info = browser.content(&state, &HashMap::new());
+        assert!(!browser.needs_new_message());
+        browser.commit(info);
+        state.sessions[0].last_message = "A new agent reply".into();
+        let fresh = browser.content(&state, &HashMap::new());
+        assert!(browser.needs_new_message());
+        assert!(
+            fresh["text"]
+                .as_str()
+                .unwrap()
+                .contains("A new agent reply")
+        );
+        assert!(!fresh["text"].as_str().unwrap().contains("/work/project"));
+        browser.detach_message();
+        assert_eq!(browser.selected(7), None);
+        browser.message = Some(8);
+        browser.commit(fresh);
+        assert!(!browser.needs_new_message());
+        assert_eq!(browser.selected(8), Some("codex:1"));
     }
     #[test]
     fn large_lists_paginate_and_keep_telegram_limits() {

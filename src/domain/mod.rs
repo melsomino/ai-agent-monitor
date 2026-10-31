@@ -3,6 +3,7 @@ pub mod agent;
 pub mod history;
 pub mod integrations;
 pub mod interaction;
+pub mod markdown;
 pub mod preferences;
 pub mod session;
 pub mod shortcut;
