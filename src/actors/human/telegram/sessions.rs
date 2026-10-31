@@ -161,21 +161,26 @@ impl Browser {
         self.show_info = true;
         true
     }
-    pub fn needs_new_message(&self) -> bool {
-        let new_text = self
-            .delivered_agent
+    fn has_new_agent_text(&self) -> bool {
+        self.delivered_agent
             .as_ref()
             .zip(self.staged_agent.as_ref())
             .is_some_and(|((old_key, old), (key, text))| {
                 old_key == key && old != text && !text.is_empty()
-            });
+            })
+    }
+    /// Request-only transitions notify without archiving another copy of the same reply.
+    pub fn replaces_current_message(&self) -> bool {
+        self.needs_new_message() && !self.has_new_agent_text()
+    }
+    pub fn needs_new_message(&self) -> bool {
         let new_request = self.selected.is_some()
             && self.delivered_session == self.selected
             && self
                 .staged_request
                 .as_ref()
                 .is_some_and(|(key, _)| self.delivered_interaction.as_ref() != Some(key));
-        self.message.is_some() && (new_text || new_request)
+        self.message.is_some() && (self.has_new_agent_text() || new_request)
     }
     pub fn detach_message(&mut self) {
         self.message = None;

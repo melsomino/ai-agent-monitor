@@ -194,6 +194,9 @@ fn api_result(method: &str, value: Value) -> Result<Value> {
         {
             return Ok(json!({"unchanged":true}));
         }
+        if method == "deleteMessage" && description == "Bad Request: message can't be deleted" {
+            return Ok(json!({"cannot_delete":true}));
+        }
         if (method == "deleteMessage" && description == "Bad Request: message to delete not found")
             || (matches!(method, "editMessageText" | "editMessageReplyMarkup")
                 && description == "Bad Request: message to edit not found")
@@ -950,14 +953,31 @@ impl Worker {
             return false;
         };
         let content = browser.content(snapshot, &self.pending);
-        // Remove controls first. If this fails, retain ownership and retry that
-        // idempotent operation before sending a new message.
+        // Genuine replies remain in history; request-only transitions replace the
+        // previous card so successive approvals cannot archive duplicate agent text.
+        // Complete cleanup before sending, retaining ownership on transient failures.
         if browser.needs_new_message() {
             let old = browser.message.unwrap();
-            match send(
-                "editMessageReplyMarkup",
-                json!({"chat_id":self.config.chat,"message_id":old,"reply_markup":{"inline_keyboard":[]}}),
-            ) {
+            let replace = browser.replaces_current_message();
+            let clear_controls = json!({"chat_id":self.config.chat,"message_id":old,"reply_markup":{"inline_keyboard":[]}});
+            let cleanup = if replace {
+                send(
+                    "deleteMessage",
+                    json!({"chat_id":self.config.chat,"message_id":old}),
+                )
+                .and_then(|result| {
+                    // Telegram cannot delete some old messages. Preserve that
+                    // history entry without controls, but still deliver the request.
+                    if result["cannot_delete"] == true {
+                        send("editMessageReplyMarkup", clear_controls)
+                    } else {
+                        Ok(result)
+                    }
+                })
+            } else {
+                send("editMessageReplyMarkup", clear_controls)
+            };
+            match cleanup {
                 Ok(_) => {
                     self.browser.as_mut().unwrap().detach_message();
                     self.config.messages.retain(|id| *id != old);
@@ -1952,6 +1972,141 @@ mod tests {
             "already shown requests must not notify again after Back"
         );
     }
+    #[test]
+    fn consecutive_approvals_do_not_archive_copies_of_the_same_agent_reply() {
+        fn flush(
+            worker: &mut Worker,
+            state: &monitor::State,
+            messages: &mut BTreeMap<i64, Value>,
+            next: &mut i64,
+        ) {
+            worker.flush_browser_with(state, |method, payload| {
+                let id = payload["message_id"].as_i64().unwrap_or(*next);
+                match method {
+                    "deleteMessage" => {
+                        messages.remove(&id);
+                        Ok(json!(true))
+                    }
+                    "editMessageReplyMarkup" => {
+                        messages.get_mut(&id).unwrap()["reply_markup"] =
+                            payload["reply_markup"].clone();
+                        Ok(json!(true))
+                    }
+                    "editMessageText" => {
+                        messages.insert(id, payload);
+                        Ok(json!({"message_id":id}))
+                    }
+                    "sendMessage" => {
+                        *next += 1;
+                        messages.insert(id, payload);
+                        Ok(json!({"message_id":id}))
+                    }
+                    _ => panic!("unexpected Telegram method: {method}"),
+                }
+            });
+        }
+        let (mut worker, mut state, _, _) = browsing_request(pending(Interaction::allow()));
+        state.sessions[0].approval = None;
+        state.sessions[0].activity = Activity::Working;
+        state.sessions[0].last_message = "I will commit and push the changes.".into();
+        worker.pending.clear();
+        let mut messages = BTreeMap::new();
+        let mut next = 78;
+        flush(&mut worker, &state, &mut messages, &mut next);
+        assert_eq!(messages.len(), 1);
+        for question in ["Commit?", "Push?"] {
+            state.sessions[0].approval = Some(Approval {
+                id: question.into(),
+                body: question.into(),
+                expires: u64::MAX,
+                can_allow: true,
+            });
+            state.sessions[0].activity = Activity::Confirmation;
+            let request = Pending::new(state.sessions[0].clone()).unwrap();
+            worker
+                .pending
+                .insert(state.sessions[0].approval_key().unwrap(), request);
+            let old = worker.browser.as_ref().unwrap().message.unwrap();
+            flush(&mut worker, &state, &mut messages, &mut next);
+            assert!(!messages.contains_key(&old));
+            flush(&mut worker, &state, &mut messages, &mut next);
+            assert_eq!(messages.len(), 1);
+            assert!(
+                messages.values().next().unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(question)
+            );
+            state.sessions[0].approval = None;
+            state.sessions[0].activity = Activity::Working;
+            worker.pending.clear();
+            flush(&mut worker, &state, &mut messages, &mut next);
+            assert_eq!(messages.len(), 1);
+            assert!(
+                !messages.values().next().unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(question)
+            );
+        }
+        state.sessions[0].last_message = "Pushed to main.".into();
+        state.sessions[0].activity = Activity::Idle;
+        flush(&mut worker, &state, &mut messages, &mut next);
+        flush(&mut worker, &state, &mut messages, &mut next);
+        assert_eq!(
+            messages.len(),
+            2,
+            "only the two genuine replies belong in history"
+        );
+        assert_eq!(
+            messages
+                .values()
+                .filter(|message| message["text"].as_str().unwrap().contains("I will commit"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            worker.browser.as_ref().unwrap().current_session(),
+            Some(state.sessions[0].key().as_str())
+        );
+    }
+
+    #[test]
+    fn failed_request_card_deletion_keeps_ownership_until_retry() {
+        let (mut worker, mut state, _, _) = browsing_request(pending(Interaction::allow()));
+        state.sessions[0].approval = None;
+        worker.pending.clear();
+        worker.flush_browser_with(&state, |_, _| Ok(json!({"message_id":77})));
+        state.sessions[0].approval = Some(Approval {
+            id: "next".into(),
+            body: "Next?".into(),
+            expires: u64::MAX,
+            can_allow: true,
+        });
+        let key = state.sessions[0].approval_key().unwrap();
+        worker.pending.insert(
+            key.clone(),
+            Pending::new(state.sessions[0].clone()).unwrap(),
+        );
+        worker.flush_browser_with(&state, |method, _| {
+            assert_eq!(method, "deleteMessage");
+            bail!("offline")
+        });
+        assert_eq!(worker.browser.as_ref().unwrap().message, Some(77));
+        assert!(!worker.pending[&key].delivered());
+        let mut calls = Vec::new();
+        worker.flush_browser_with(&state, |method, _| {
+            calls.push(method.to_owned());
+            api_result(method, json!({"ok":false,"error_code":400,"description":"Bad Request: message can't be deleted"}))
+        });
+        assert_eq!(calls, ["deleteMessage", "editMessageReplyMarkup"]);
+        assert_eq!(
+            worker.browser.as_ref().unwrap().message,
+            Some(77),
+            "a failed fallback must not release the old buttons"
+        );
+    }
+
     #[test]
     fn showing_a_request_in_the_session_retires_its_old_standalone_notification() {
         let request = pending(Interaction::allow());
