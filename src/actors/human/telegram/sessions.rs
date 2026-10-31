@@ -20,6 +20,7 @@ pub(super) struct Browser {
     nonce: String,
     page: usize,
     selected: Option<String>,
+    selected_available: bool,
     // IDs never change when sessions are reordered or removed.
     keys: Vec<String>,
     active_request: Option<(String, String)>,
@@ -32,6 +33,9 @@ pub(super) struct Browser {
     outgoing: Option<String>,
     show_info: bool,
     delivered_agent: Option<(String, String)>,
+    delivered_session: Option<String>,
+    delivered_interaction: Option<String>,
+    staged_interaction: Option<String>,
     staged_agent: Option<(String, String)>,
 }
 impl Browser {
@@ -42,6 +46,7 @@ impl Browser {
             nonce: nonce()?,
             page: 0,
             selected: None,
+            selected_available: false,
             keys: vec![],
             active_request: None,
             staged_request: None,
@@ -53,6 +58,9 @@ impl Browser {
             outgoing: None,
             show_info: false,
             delivered_agent: None,
+            delivered_session: None,
+            delivered_interaction: None,
+            staged_interaction: None,
             staged_agent: None,
         })
     }
@@ -148,14 +156,20 @@ impl Browser {
         true
     }
     pub fn needs_new_message(&self) -> bool {
-        self.message.is_some()
+        let new_text = self
+            .delivered_agent
+            .as_ref()
+            .zip(self.staged_agent.as_ref())
+            .is_some_and(|((old_key, old), (key, text))| {
+                old_key == key && old != text && !text.is_empty()
+            });
+        let new_request = self.selected.is_some()
+            && self.delivered_session == self.selected
             && self
-                .delivered_agent
+                .staged_request
                 .as_ref()
-                .zip(self.staged_agent.as_ref())
-                .is_some_and(|((old_key, old), (key, text))| {
-                    old_key == key && old != text && !text.is_empty()
-                })
+                .is_some_and(|(key, _)| self.delivered_interaction.as_ref() != Some(key));
+        self.message.is_some() && (new_text || new_request)
     }
     pub fn detach_message(&mut self) {
         self.message = None;
@@ -166,6 +180,15 @@ impl Browser {
         self.rendered = content;
         self.active_request = self.staged_request.clone();
         self.delivered_agent = self.staged_agent.clone();
+        self.delivered_session = self.selected.clone();
+        self.delivered_interaction = self.staged_interaction.clone();
+    }
+    pub fn can_present(&self, pending: &Pending) -> bool {
+        self.selected_available
+            && !self.show_info
+            && self
+                .current_session()
+                .is_some_and(|key| key == pending.session.key())
     }
     pub fn permits_answer(&self, message: i64, pending: &Pending) -> bool {
         !self.show_info
@@ -191,6 +214,8 @@ impl Browser {
                     .ok_or_else(|| anyhow::anyhow!("Session unavailable."))?
                     .clone(),
             );
+
+            self.selected_available = true;
         } else if let Some(page) = command.strip_prefix("p:") {
             self.page = page.parse::<usize>()?;
             self.selected = None;
@@ -234,6 +259,10 @@ impl Browser {
                     }
                 })
         });
+        self.selected_available = self
+            .selected
+            .as_ref()
+            .is_some_and(|key| sessions.iter().any(|session| session.key() == *key));
         self.staged_agent = self.selected.as_ref().and_then(|selected| {
             let session = sessions.iter().find(|s| s.key() == *selected)?;
             if session.last_message.is_empty() {
@@ -244,23 +273,27 @@ impl Browser {
                 Some((selected.clone(), session.last_message.clone()))
             }
         });
+        let pending_request = self.selected.as_ref().and_then(|selected| {
+            sessions
+                .iter()
+                .find(|session| session.key() == *selected)?
+                .approval_key()
+                .and_then(|key| pending.get(&key).map(|p| (key, p.nonce.clone())))
+        });
+        self.staged_interaction = pending_request.as_ref().map(|(key, _)| key.clone());
+        self.staged_request = if self.show_info {
+            None
+        } else {
+            pending_request.clone()
+        };
         if self.needs_new_message() {
-            // New agent output returns a history/info view to the live message.
+            // New output or a new request must notify, not just silently edit
+            // the previous message while Telegram may be in the background.
             let outgoing = self.outgoing.take();
             self.reset_detail();
             self.outgoing = outgoing;
+            self.staged_request = pending_request;
         }
-        self.staged_request =
-            self.selected
-                .as_ref()
-                .filter(|_| !self.show_info)
-                .and_then(|selected| {
-                    sessions
-                        .iter()
-                        .find(|s| s.key() == *selected)?
-                        .approval_key()
-                        .and_then(|key| pending.get(&key).map(|p| (key, p.nonce.clone())))
-                });
         let mut rows = Vec::new();
         let text;
         if let Some(key) = &self.selected {
@@ -296,7 +329,6 @@ impl Browser {
                 } else {
                     self.button("Info", "info")
                 },
-                self.button("↻ Refresh", "refresh")
             ]));
         } else {
             let pages = sessions.len().div_ceil(PAGE_SIZE).max(1);
@@ -345,11 +377,12 @@ impl Browser {
             if self.page > 0 {
                 navigation.push(self.button("‹ Previous", &format!("p:{}", self.page - 1)));
             }
-            navigation.push(self.button("↻ Refresh", "refresh"));
             if self.page + 1 < pages {
                 navigation.push(self.button("Next ›", &format!("p:{}", self.page + 1)));
             }
-            rows.push(json!(navigation));
+            if !navigation.is_empty() {
+                rows.push(json!(navigation));
+            }
         }
         text.payload(json!({"inline_keyboard":rows}))
     }
@@ -517,6 +550,11 @@ mod tests {
         ];
         let mut browser = Browser::new().unwrap();
         let content = browser.content(&state, &HashMap::new());
+        assert!(
+            !callbacks(&content)
+                .iter()
+                .any(|(label, _)| label.contains("Refresh"))
+        );
         let labels: Vec<_> = callbacks(&content)
             .into_iter()
             .map(|(title, _)| title)
@@ -630,7 +668,7 @@ mod tests {
         state.sessions[0].approval = None;
         let resolved = browser.content(&state, &pending);
         assert!(!resolved["text"].as_str().unwrap().contains("Allow test?"));
-        assert_eq!(callbacks(&resolved).len(), 4);
+        assert_eq!(callbacks(&resolved).len(), 3);
     }
     #[test]
     fn previous_message_uses_monitor_history_and_latest_restores_live_message() {
@@ -805,8 +843,18 @@ mod tests {
         ] {
             assert!(!text.contains(unwanted));
         }
+        assert!(
+            !callbacks(&detail)
+                .iter()
+                .any(|(label, _)| label.contains("Refresh"))
+        );
         assert!(browser.open_info());
         let info = browser.content(&state, &HashMap::new());
+        assert!(
+            !callbacks(&info)
+                .iter()
+                .any(|(label, _)| label.contains("Refresh"))
+        );
         assert!(info["text"].as_str().unwrap().contains("/work/project"));
         assert!(info["text"].as_str().unwrap().contains("main"));
         assert!(!info["text"].as_str().unwrap().contains("Latest message"));
@@ -861,6 +909,60 @@ mod tests {
         browser.commit(fresh);
         assert!(!browser.needs_new_message());
         assert_eq!(browser.selected(8), Some("codex:1"));
+    }
+    #[test]
+    fn a_new_request_posts_a_new_session_message_even_without_new_agent_text() {
+        let mut state = monitor::State {
+            sessions: vec![session("1", "Chat", Client::VSCode)],
+            ..Default::default()
+        };
+        let mut browser = Browser::new().unwrap();
+        browser.message = Some(7);
+        let list = browser.content(&state, &HashMap::new());
+        browser.commit(list.clone());
+        let data = callbacks(&list)
+            .into_iter()
+            .find(|(_, data)| data.contains(":s:"))
+            .unwrap()
+            .1;
+        browser.navigate(7, &data).unwrap();
+        let detail = browser.content(&state, &HashMap::new());
+        browser.commit(detail);
+        state.sessions[0].approval = Some(Approval {
+            id: "new-request".into(),
+            body: "Allow?".into(),
+            expires: u64::MAX,
+            can_allow: true,
+        });
+        state.sessions[0].interaction_data = crate::domain::interaction::Interaction::allow();
+        let key = state.sessions[0].approval_key().unwrap();
+        let mut pending = HashMap::from([(
+            key.clone(),
+            Pending::new(state.sessions[0].clone()).unwrap(),
+        )]);
+        let request = browser.content(&state, &pending);
+        assert!(browser.needs_new_message());
+        browser.detach_message();
+        browser.message = Some(8);
+        browser.commit(request);
+        assert!(browser.permits_answer(8, &pending[&key]));
+        browser.open_info();
+        let info = browser.content(&state, &pending);
+        browser.commit(info);
+        browser
+            .navigate(8, &format!("{}:message", browser.nonce))
+            .unwrap();
+        browser.content(&state, &pending);
+        assert!(
+            !browser.needs_new_message(),
+            "returning from Info is not a new request"
+        );
+        pending.get_mut(&key).unwrap().nonce = "next-question-step".into();
+        browser.content(&state, &pending);
+        assert!(
+            !browser.needs_new_message(),
+            "draft steps of one request edit the current message"
+        );
     }
     #[test]
     fn large_lists_paginate_and_keep_telegram_limits() {

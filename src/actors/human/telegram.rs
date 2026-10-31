@@ -247,6 +247,7 @@ struct Pending {
     question: usize,
     answers: BTreeMap<String, Vec<String>>,
     phase: Option<monitor::Submission>,
+    browser_delivered: bool,
 }
 impl Pending {
     fn new(session: Session) -> Result<Self> {
@@ -259,7 +260,11 @@ impl Pending {
             question: 0,
             answers: BTreeMap::new(),
             phase: None,
+            browser_delivered: false,
         })
+    }
+    fn delivered(&self) -> bool {
+        self.message.is_some() || self.browser_delivered
     }
     fn body_content(&self) -> (text::Text, Value) {
         let body = self
@@ -472,16 +477,8 @@ impl Worker {
             command_menu_ready: self.commands_ready,
             snapshot_pending: 0,
             suppressed: 0,
-            queued: self
-                .pending
-                .values()
-                .filter(|p| p.message.is_none())
-                .count(),
-            delivered: self
-                .pending
-                .values()
-                .filter(|p| p.message.is_some())
-                .count(),
+            queued: self.pending.values().filter(|p| !p.delivered()).count(),
+            delivered: self.pending.values().filter(|p| p.delivered()).count(),
             link: self
                 .pair
                 .as_ref()
@@ -516,16 +513,8 @@ impl Worker {
     fn update_counts(&self) {
         let mut status = self.status.borrow_mut();
         status.command_menu_ready = self.commands_ready;
-        status.queued = self
-            .pending
-            .values()
-            .filter(|p| p.message.is_none())
-            .count();
-        status.delivered = self
-            .pending
-            .values()
-            .filter(|p| p.message.is_some())
-            .count();
+        status.queued = self.pending.values().filter(|p| !p.delivered()).count();
+        status.delivered = self.pending.values().filter(|p| p.delivered()).count();
         drop(status);
         self.emit();
     }
@@ -810,13 +799,22 @@ impl Worker {
         if self.token.is_empty() || self.config.chat.is_none() || Instant::now() < self.retry {
             return;
         }
+        // First present requests in the selected session. Only a successful
+        // presentation records delivery; a failed API call keeps the request queued.
+        if self.pending.values().any(|pending| {
+            !pending.browser_delivered
+                && self
+                    .browser
+                    .as_ref()
+                    .is_some_and(|browser| browser.can_present(pending))
+        }) {
+            self.flush_browser();
+            if Instant::now() < self.retry {
+                return;
+            }
+        }
         // One request per pass avoids bursts and leaves time for local changes.
-        if let Some(key) = self
-            .pending
-            .iter()
-            .find(|(_, p)| self.config.enabled && p.message.is_none())
-            .map(|(k, _)| k.clone())
-        {
+        if let Some(key) = self.next_request_message() {
             let mut payload = self.pending[&key].payload();
             payload["chat_id"] = json!(self.config.chat);
             match self.api("sendMessage", payload) {
@@ -865,6 +863,42 @@ impl Worker {
         }
         self.flush_browser();
     }
+    fn next_request_message(&self) -> Option<String> {
+        self.pending
+            .iter()
+            .find(|(_, p)| {
+                self.config.enabled
+                    && !p.delivered()
+                    && !self
+                        .browser
+                        .as_ref()
+                        .is_some_and(|browser| browser.can_present(p))
+            })
+            .map(|(key, _)| key.clone())
+    }
+    fn adopt_browser_requests(&mut self) {
+        let Some(browser) = &self.browser else {
+            return;
+        };
+        let Some(message) = browser.message else {
+            return;
+        };
+        let shown: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| browser.permits_answer(message, p))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in shown {
+            let pending = self.pending.get_mut(&key).unwrap();
+            pending.browser_delivered = true;
+            let old = pending.message.take();
+            self.edits.retain(|queued| *queued != key);
+            if let Some(old) = old.filter(|id| *id != message) {
+                self.finish(old, "This request is shown in the session message.");
+            }
+        }
+    }
     fn flush_browser(&mut self) {
         let snapshot = self.monitor.snapshot();
         let token = self.token.clone();
@@ -903,6 +937,8 @@ impl Worker {
             }
         }
         if content == browser.rendered {
+            browser.commit(content);
+            self.adopt_browser_requests();
             return false;
         }
         let message = browser.message;
@@ -932,6 +968,7 @@ impl Worker {
                 } else if message.is_some() {
                     self.browser.as_mut().unwrap().detach_message();
                 }
+                self.adopt_browser_requests();
                 self.retry = Instant::now() + Duration::from_secs(1);
                 changed
             }
@@ -1198,7 +1235,9 @@ impl Worker {
                 .map_err(anyhow::Error::msg)?;
             // Do not resolve locally. Every channel observes the Monitor's next state.
         } else {
-            self.edit(&pending)?;
+            if pending.message.is_some() {
+                self.edit(&pending)?;
+            }
             self.pending.insert(key.to_owned(), pending);
         }
         Ok(())
@@ -1287,6 +1326,7 @@ mod tests {
             question: 0,
             answers: BTreeMap::new(),
             phase: None,
+            browser_delivered: false,
         }
     }
     fn worker() -> Worker {
@@ -1660,6 +1700,159 @@ mod tests {
                 .unwrap()
                 .contains("some_dir")
         );
+    }
+    fn browsing_request(request: Pending) -> (Worker, monitor::State, String, String) {
+        let mut worker = worker();
+        let mut chat = request.session.clone();
+        chat.interaction_data = request.interaction.clone();
+        let key = chat.approval_key().unwrap();
+        let state = monitor::State {
+            sessions: vec![chat],
+            ..Default::default()
+        };
+        worker.pending.insert(key.clone(), request);
+        let mut browser = sessions::Browser::new().unwrap();
+        browser.message = Some(77);
+        let list = browser.content(&state, &worker.pending);
+        browser.commit(list.clone());
+        let data = list["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row.as_array().unwrap())
+            .find_map(|button| {
+                button["callback_data"]
+                    .as_str()
+                    .filter(|data| data.contains(":s:"))
+            })
+            .unwrap()
+            .to_owned();
+        browser.navigate(77, &data).unwrap();
+        worker.browser = Some(browser);
+        (worker, state, key, data)
+    }
+    #[test]
+    fn browser_delivery_prevents_a_duplicate_notification_and_failed_delivery_stays_queued() {
+        let mut request = pending(Interaction::allow());
+        request.message = None;
+        let (mut worker, state, key, select) = browsing_request(request);
+        assert!(worker.next_request_message().is_none());
+        assert!(!worker.pending[&key].delivered());
+        worker.flush_browser_with(&state, |_, _| bail!("offline"));
+        assert!(!worker.pending[&key].browser_delivered);
+        let detail = worker
+            .browser
+            .as_mut()
+            .unwrap()
+            .content(&state, &worker.pending);
+        let back = detail["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row.as_array().unwrap())
+            .find_map(|button| {
+                button["callback_data"]
+                    .as_str()
+                    .filter(|data| data.ends_with(":back"))
+            })
+            .unwrap()
+            .to_owned();
+        worker
+            .browser
+            .as_mut()
+            .unwrap()
+            .navigate(77, &back)
+            .unwrap();
+        assert_eq!(worker.next_request_message(), Some(key.clone()));
+        worker
+            .browser
+            .as_mut()
+            .unwrap()
+            .navigate(77, &select)
+            .unwrap();
+        worker.flush_browser_with(&state, |method, _| {
+            assert_eq!(method, "editMessageText");
+            Ok(json!({"message_id":77}))
+        });
+        assert!(worker.pending[&key].browser_delivered);
+        assert!(worker.pending[&key].message.is_none());
+        worker.update_counts();
+        assert_eq!(worker.status.borrow().queued, 0);
+        assert_eq!(worker.status.borrow().delivered, 1);
+        worker
+            .browser
+            .as_mut()
+            .unwrap()
+            .navigate(77, &back)
+            .unwrap();
+        assert!(
+            worker.next_request_message().is_none(),
+            "already shown requests must not notify again after Back"
+        );
+    }
+    #[test]
+    fn showing_a_request_in_the_session_retires_its_old_standalone_notification() {
+        let request = pending(Interaction::allow());
+        let (mut worker, state, key, _) = browsing_request(request);
+        worker.flush_browser_with(&state, |_, _| Ok(json!({"message_id":77})));
+        assert!(worker.pending[&key].browser_delivered);
+        assert!(worker.pending[&key].message.is_none());
+        let (id, _) = worker
+            .cleanup
+            .pop_ready(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(id, 50);
+        assert!(worker.next_request_message().is_none());
+        let old = json!({"from":{"id":42},"message":{"message_id":50,"chat":{"id":42,"type":"private"}},"data":"random-opaque-value:0"});
+        assert!(worker.callback_key(&old).is_none());
+        let mut current = old;
+        current["message"]["message_id"] = json!(77);
+        assert_eq!(worker.callback_key(&current), Some((key, 0)));
+    }
+    #[test]
+    fn hidden_session_does_not_suppress_an_undelivered_question() {
+        let mut request = pending(Interaction::allow());
+        request.message = None;
+        let (mut worker, mut state, key, _) = browsing_request(request);
+        state
+            .preferences
+            .applications
+            .observe([crate::agents::sessions::Client::Terminal]);
+        state.preferences.applications.set_enabled(
+            &crate::agents::sessions::Client::Terminal.application_id(),
+            false,
+        );
+        worker
+            .browser
+            .as_mut()
+            .unwrap()
+            .content(&state, &worker.pending);
+        assert!(!worker.pending[&key].browser_delivered);
+        assert_eq!(worker.next_request_message(), Some(key));
+    }
+    #[test]
+    fn multi_question_browser_answers_advance_without_editing_a_missing_notification() {
+        let mut request = pending(Interaction {
+            actions: vec![],
+            questions: vec![question("one", false), question("two", false)],
+        });
+        request.message = None;
+        let (mut worker, state, key, _) = browsing_request(request);
+        let (_, snapshots) = tokio::sync::watch::channel(std::sync::Arc::new(state.clone()));
+        worker.monitor = monitor::Handle {
+            tx: tokio::sync::mpsc::channel(8).0,
+            state: snapshots,
+        };
+        worker.flush_browser_with(&state, |_, _| Ok(json!({"message_id":77})));
+        assert!(worker.answer(&key, Some(0), None).is_ok());
+        assert_eq!(worker.pending[&key].question, 1);
+        assert!(worker.next_request_message().is_none());
+        worker.flush_browser_with(&state, |method, payload| {
+            assert_eq!(method, "editMessageText");
+            assert!(payload["text"].as_str().unwrap().contains("Question two"));
+            Ok(json!({"message_id":77}))
+        });
+        assert!(worker.pending[&key].browser_delivered);
     }
     #[test]
     fn new_agent_message_removes_old_controls_before_posting_the_new_message() {
