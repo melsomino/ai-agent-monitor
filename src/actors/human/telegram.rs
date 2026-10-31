@@ -282,6 +282,10 @@ impl Pending {
             text.plain("This request needs a private answer. Open the agent app to respond.");
         } else {
             text.markdown(body, 2200);
+            if let Some(command) = &self.interaction.command {
+                text.plain("\n\n");
+                text.code(&short(command, 1600));
+            }
             if let Some(question) = question {
                 text.plain(&format!(
                     "\n\nQuestion {} of {}: ",
@@ -1665,6 +1669,7 @@ mod tests {
     fn chat_text_targets_selected_session_but_explicit_reply_remains_an_answer() {
         let mut worker = worker();
         let mut request = pending(Interaction {
+            command: None,
             actions: vec![],
             questions: vec![question("one", true)],
         });
@@ -1990,6 +1995,7 @@ mod tests {
     #[test]
     fn multi_question_browser_answers_advance_without_editing_a_missing_notification() {
         let mut request = pending(Interaction {
+            command: None,
             actions: vec![],
             questions: vec![question("one", false), question("two", false)],
         });
@@ -2083,6 +2089,7 @@ mod tests {
     #[test]
     fn structured_questions_collect_all_answers_and_invalidate_previous_buttons() {
         let mut request = pending(Interaction {
+            command: None,
             actions: vec![],
             questions: vec![question("one", false), question("two", true)],
         });
@@ -2101,6 +2108,7 @@ mod tests {
     #[test]
     fn only_offered_choices_and_explicitly_freeform_questions_are_accepted() {
         let mut request = pending(Interaction {
+            command: None,
             actions: vec![],
             questions: vec![question("one", false)],
         });
@@ -2116,8 +2124,30 @@ mod tests {
         assert!(keyboard["inline_keyboard"].as_array().unwrap().is_empty());
     }
     #[test]
+    fn approval_command_is_literal_code_below_question() {
+        let command = "printf '%s' '<hello> **literal**'";
+        let mut interaction = Interaction::allow();
+        interaction.command = Some(command.into());
+        let request = pending(interaction);
+        let payload = request.payload();
+        let text = payload["text"].as_str().unwrap();
+        let question = request.session.approval.as_ref().unwrap().body.as_str();
+        assert!(text.find(question).unwrap() < text.find(command).unwrap());
+        assert!(
+            payload["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entity| {
+                    entity["type"] == "code" && entity["length"] == command.encode_utf16().count()
+                })
+        );
+    }
+
+    #[test]
     fn button_captions_and_action_values_stay_separate() {
         let mut request = pending(Interaction {
+            command: None,
             questions: vec![],
             actions: vec![
                 Action {

@@ -3342,6 +3342,82 @@ impl MenuController {
         }
     }
 
+    fn request_context(
+        &self,
+        session: &Session,
+        width: f64,
+    ) -> Option<(Retained<SessionListView>, f64)> {
+        let interaction = session.interaction();
+        let mut sections = Vec::new();
+        if let Some(command) = interaction.command.filter(|value| !value.trim().is_empty()) {
+            sections.push(("Command".to_owned(), command));
+        }
+        for action in interaction.actions {
+            if !action.detail.is_empty() {
+                sections.push((action.label, action.detail));
+            }
+        }
+        if sections.is_empty() {
+            return None;
+        }
+        // This container shares the flipped coordinates of the surrounding document.
+        let view: Retained<SessionListView> = unsafe {
+            msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, width, 1.0)]
+        };
+        let mut y = 0.0;
+        for (title, text) in sections {
+            if y > 0.0 {
+                y += 8.0;
+            }
+            let caption = NSTextField::labelWithString(&NSString::from_str(&title), self.mtm());
+            caption.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            caption.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            caption.setFrame(rect(0.0, y, width, 16.0));
+            view.addSubview(&caption);
+            y += 20.0;
+            let code = NSTextField::wrappingLabelWithString(
+                &NSString::from_str(text.trim_end()),
+                self.mtm(),
+            );
+            code.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(12.0, 0.0)));
+            code.setTextColor(Some(&NSColor::labelColor()));
+            code.setSelectable(true);
+            code.setMaximumNumberOfLines(0);
+            if let Some(cell) = code.cell() {
+                cell.setLineBreakMode(NSLineBreakMode::ByCharWrapping);
+            }
+            let code_width = width - 20.0;
+            let height = code
+                .cell()
+                .map(|cell| {
+                    cell.cellSizeForBounds(rect(0.0, 0.0, code_width, 1000000.0))
+                        .height
+                        .ceil()
+                })
+                .unwrap_or(18.0)
+                .max(18.0);
+            let background: Retained<StatusContentView> = unsafe {
+                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, y, width, height + 16.0)]
+            };
+            let box_view = NSBox::initWithFrame(
+                NSBox::alloc(self.mtm()),
+                rect(0.0, 0.0, width, height + 16.0),
+            );
+            box_view.setBoxType(NSBoxType::Custom);
+            box_view.setTitlePosition(NSTitlePosition::NoTitle);
+            box_view.setCornerRadius(8.0);
+            box_view.setBorderWidth(0.0);
+            box_view.setFillColor(&appearance_color([0.0; 3], [255.0; 3], 0.06));
+            background.addSubview(&box_view);
+            view.addSubview(&background);
+            code.setFrame(rect(10.0, y + 8.0, code_width, height));
+            view.addSubview(&code);
+            y += height + 16.0;
+        }
+        view.setFrameSize(NSSize::new(width, y));
+        Some((view, y))
+    }
+
     fn session_metadata(&self, session: &Session) -> (Retained<SessionListView>, f64) {
         // Use the same flipped coordinate system as the expanded detail document.
         // SAFETY: This ivar-free view uses NSView's initializer.
@@ -3536,6 +3612,15 @@ impl MenuController {
                 0.0
             };
             let control_width = content_width - 2.0 * control_inset;
+            let context = if is_question && inline.is_none() {
+                self.request_context(session, content_width)
+            } else {
+                None
+            };
+            let context_height = context
+                .as_ref()
+                .map(|(_, height)| height + 8.0)
+                .unwrap_or(0.0);
             let control_sizes: Vec<_> = controls
                 .iter()
                 .map(|control| {
@@ -3698,6 +3783,7 @@ impl MenuController {
                         + MESSAGE_TOP_GAP
                         + 16.0
                         + controls_height
+                        + context_height
                         + 2.0 * question_padding
                         + metadata_gap
                         + earlier_height
@@ -3860,7 +3946,8 @@ impl MenuController {
                 };
                 let question_top = MESSAGE_TOP_GAP + earlier_height;
                 let message_top = question_top + question_padding;
-                let message_end = message_top + text_height;
+                let text_end = message_top + text_height;
+                let message_end = text_end + context_height;
                 let controls_gap = if inline.is_some() { 0.0 } else { 8.0 };
                 let footer_y =
                     message_end + controls_gap + controls_height + question_padding + metadata_gap;
@@ -3889,6 +3976,10 @@ impl MenuController {
                     card.setFillColor(&appearance_color([231.0; 3], [55.0; 3], 1.0));
                     decoration.addSubview(&card);
                     document.addSubview(&decoration);
+                }
+                if let Some((context, _)) = context {
+                    context.setFrameOrigin(NSPoint::new(content_x, text_end + 8.0));
+                    document.addSubview(&context);
                 }
                 metadata.setFrameOrigin(NSPoint::new(SESSION_TEXT_LEFT, footer_y));
                 document.addSubview(&metadata);

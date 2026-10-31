@@ -154,6 +154,7 @@ mod tests {
     use crate::agents::interaction::{Action, Choice, Question};
     fn question(count: usize) -> Interaction {
         Interaction {
+            command: None,
             actions: vec![],
             questions: vec![Question {
                 id: "q".into(),
@@ -220,6 +221,7 @@ mod tests {
         other.questions[0].choices[0].label = "Different".into();
         assert_ne!(first.category(), Plan::new(&other).category());
         let plan = Plan::new(&Interaction {
+            command: None,
             actions: vec![Action {
                 id: "decline".into(),
                 label: "Decline".into(),

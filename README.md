@@ -92,7 +92,7 @@ Normal launches keep only the robot icon in the menu bar. Click it to see your s
 - **Local session data.** Discovery, message history, Git metadata, and Codex quota are read on your Mac. Passive monitoring does not start model turns. Answers and chat messages are sent to the existing agent only after you explicitly choose or submit them.
 - **Hook configuration.** Codex connects directly without modifying its hook configuration. First-launch setup connects Claude Code and Cline through hooks. Modified Claude configuration is backed up; unrelated hooks are preserved, and existing third-party Cline hook files are not overwritten. Review the result in **Settings → Integrations**.
 - **macOS permissions.** Notification permission enables banners and answer buttons. macOS may request Automation permission to select tabs in Terminal or iTerm. Launch at login is optional and controlled in settings.
-- **Optional Telegram delivery.** The monitor connects directly to your bot; there is no project-hosted relay. Once paired and enabled, session titles, question text, and answer choices are sent to Telegram, and replies return through the bot. The bot token is stored in macOS Keychain. Browsing sessions and opening **Info** also sends the requested message history or folder/branch metadata. Pausing question delivery still allows read-only commands from the paired account.
+- **Optional Telegram delivery.** The monitor connects directly to your bot; there is no project-hosted relay. Once paired and enabled, session titles, question text, approval commands, permission scopes, and answer choices are sent to Telegram, and replies return through the bot. The bot token is stored in macOS Keychain. Browsing sessions and opening **Info** also sends the requested message history or folder/branch metadata. Pausing question delivery still allows read-only commands from the paired account.
 
 ## Price & license
 
@@ -191,6 +191,8 @@ In a custom-answer field, **↑ / ↓** finish editing and continue menu navigat
 Filtering ignores case and splits the query on spaces. Every word must appear in the title: `api tests` matches titles containing both `api` and `tests`, in any order. The current query appears in the footer.
 
 ### Approvals and questions
+
+Command approvals show the command in a selectable monospaced block below the question. When Codex offers **Allow similar commands**, its allowed command prefix is shown separately from the full command. Telegram includes the command and readable permission scope too.
 
 Expand a pending request to read it and see its available actions beneath the message. Buttons follow the choices offered by the agent. When they fit, they share one row; otherwise they form a column.
 

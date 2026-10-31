@@ -28,12 +28,15 @@ pub struct Action {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Interaction {
+    /// Exact command shown for review, separate from permission scope and wire decisions.
+    pub command: Option<String>,
     pub actions: Vec<Action>,
     pub questions: Vec<Question>,
 }
 impl Interaction {
     pub fn allow() -> Self {
         Self {
+            command: None,
             actions: vec![Action {
                 id: "allow".into(),
                 label: "Allow".into(),
@@ -65,6 +68,7 @@ mod tests {
     #[test]
     fn structured_answers_require_all_questions_and_only_offered_choices() {
         let mut interaction = Interaction {
+            command: None,
             actions: vec![],
             questions: vec![Question {
                 id: "one".into(),

@@ -70,11 +70,47 @@ fn decision_label(value: &Value, request: &Value) -> Option<String> {
         _ => None,
     }
 }
+fn decision_detail(value: &Value) -> String {
+    if let Some(arguments) = value["acceptWithExecpolicyAmendment"]["execpolicy_amendment"]
+        .as_array()
+        .filter(|items| !items.is_empty() && items.iter().all(Value::is_string))
+    {
+        let prefix = arguments
+            .iter()
+            .map(|argument| shlex::try_quote(argument.as_str().unwrap()))
+            .collect::<Result<Vec<_>, _>>();
+        return prefix
+            .map(|words| format!("Future commands starting with: {}", words.join(" ")))
+            .unwrap_or_default();
+    }
+    value["applyNetworkPolicyAmendment"]["network_policy_amendment"]["host"]
+        .as_str()
+        .map(|host| format!("Host: {host}"))
+        .unwrap_or_default()
+}
+
 pub fn interaction(request: &Value) -> Interaction {
     let params = &request["params"];
     let mut result = Interaction::default();
     match request["method"].as_str() {
         Some("item/commandExecution/requestApproval" | "item/fileChange/requestApproval") => {
+            if request["method"] == "item/commandExecution/requestApproval" {
+                result.command = params["command"]
+                    .as_str()
+                    .filter(|command| !command.trim().is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        let arguments = params["command"].as_array()?;
+                        if arguments.is_empty() {
+                            return None;
+                        }
+                        arguments
+                            .iter()
+                            .map(|argument| shlex::try_quote(argument.as_str()?).ok())
+                            .collect::<Option<Vec<_>>>()
+                            .map(|words| words.join(" "))
+                    });
+            }
             for (index, value) in decisions(request).into_iter().enumerate() {
                 if let Some(label) = decision_label(&value, request) {
                     result.actions.push(Action {
@@ -84,11 +120,7 @@ pub fn interaction(request: &Value) -> Interaction {
                             format!("decision:{index}")
                         },
                         label,
-                        detail: if value.is_object() {
-                            serde_json::to_string_pretty(&value).unwrap_or_default()
-                        } else {
-                            String::new()
-                        },
+                        detail: decision_detail(&value),
                     });
                 }
             }
@@ -256,6 +288,48 @@ mod tests {
         assert_eq!(value, request["params"]["availableDecisions"][1]);
         assert_eq!(interaction(&request).actions.len(), 2);
     }
+    #[test]
+    fn policy_choices_show_readable_scope_and_keep_original_wire_value() {
+        let decision = json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","commit","-m","Remove Codex approval hook"]}});
+        let request = json!({"method":"item/commandExecution/requestApproval","params":{"availableDecisions":["accept",decision,"decline"]}});
+        let actions = interaction(&request).actions;
+        assert_eq!(actions[1].label, "Allow similar commands");
+        assert_eq!(
+            actions[1].detail,
+            "Future commands starting with: git commit -m 'Remove Codex approval hook'"
+        );
+        assert_eq!(
+            wire_response(&request, &Response::Action(actions[1].id.clone()))
+                .unwrap()
+                .2,
+            decision
+        );
+        assert!(actions[0].detail.is_empty());
+        assert!(actions[2].detail.is_empty());
+    }
+
+    #[test]
+    fn displayed_command_is_exact_and_separate_from_the_allowed_prefix() {
+        let command = "git commit -m 'Hello world'\n";
+        let request = json!({"method":"item/commandExecution/requestApproval","params":{"command":command,"availableDecisions":[{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","commit"]}}]}});
+        let view = interaction(&request);
+        assert_eq!(view.command.as_deref(), Some(command));
+        assert_eq!(
+            view.actions[0].detail,
+            "Future commands starting with: git commit"
+        );
+        let mut args = request.clone();
+        args["params"]["command"] = json!(["echo", "hello world"]);
+        assert_eq!(
+            interaction(&args).command.as_deref(),
+            Some("echo 'hello world'")
+        );
+        args["params"]["command"] = json!(["echo", null]);
+        assert!(interaction(&args).command.is_none());
+        args["params"].as_object_mut().unwrap().remove("command");
+        assert!(interaction(&args).command.is_none());
+    }
+
     #[test]
     fn user_input_answers_use_question_ids_and_reject_unoffered_choices() {
         let request = json!({"method":"item/tool/requestUserInput","params":{"questions":[{"id":"q","question":"Pick?","isOther":false,"options":[{"label":"A","description":"first"}]}]}});

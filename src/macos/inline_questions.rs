@@ -1157,6 +1157,7 @@ mod tests {
         let mut second = first.clone();
         second.id = "two".into();
         let interaction = Interaction {
+            command: None,
             questions: vec![first.clone(), second],
             actions: vec![],
         };
