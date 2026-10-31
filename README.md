@@ -2,9 +2,10 @@
   <img src="assets/AppIcon-robots.png" width="128" alt="AI Agent Monitor — two robots">
 
   <h1>AI Agent Monitor</h1>
+  <!-- Add a real demo GIF here once recorded: open sessions → permission request → Allow → project. -->
 
   <p><strong>Your coding agents, one menu away.</strong></p>
-  <p>A native macOS menu bar app for Codex, Claude Code, and Cline.<br>See what is running, catch requests for input, and get back to the right project.</p>
+  <p>A native macOS menu bar app for your Codex sessions.<br>See what’s working, answer approval requests, and jump back to the right project.<br>Experimental support for Claude Code and Cline.</p>
 
   <p>
     <img src="https://img.shields.io/badge/macOS-13%2B-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 13 or later">
@@ -13,21 +14,18 @@
   </p>
 
   <p><a href="https://github.com/melsomino/ai-agent-monitor/releases/latest/download/AI-Agent-Monitor-apple-silicon.dmg"><strong>Download for Mac · Apple Silicon</strong></a></p>
+  <p>Free to use · Open source under <a href="LICENSE">Apache-2.0</a></p>
 
-  <p><a href="#features">Features</a> · <a href="#installation">Installation</a> · <a href="#connect-your-agents">Agent setup</a> · <a href="#using-the-monitor">Usage</a> · <a href="#troubleshooting">Troubleshooting</a></p>
+  <p><a href="#features">Features</a> · <a href="#installation">Installation</a> · <a href="#privacy--permissions">Privacy</a> · <a href="#connect-your-agents">Agent setup</a> · <a href="#using-the-monitor">Usage</a> · <a href="#troubleshooting">Troubleshooting</a></p>
 </div>
 
 ## Features
 
-- **All open sessions in one place.** Sessions are grouped by application and sorted by name. Working, waiting, and idle sessions stay visible; closed chat history stays out of the list.
-- **Status at a glance.** Green robot eyes show activity in the menu bar. A count badge takes priority when requests need a response.
-- **Useful details, inline.** Expand a session to see its latest message or pending question, working directory, and Git branch. Working sessions and pending requests expand automatically when you open the menu.
-- **Answer without switching windows.** Approve supported requests, choose an offered answer, or open a form for custom text and multiple questions. Actions also appear in macOS notifications when supported.
-- **Jump back to the project.** Click a session or notification to open its project in VS Code. Live VS Code workspace information takes priority over directories used by individual commands.
-- **Keyboard navigation and instant filtering.** Move through sessions with the arrow keys, expand details, or start typing to filter titles. Matching words are highlighted.
-- **A compact, live view.** The list refreshes in the background every two seconds. The menu follows its contents up to 80% of the screen height, then scrolls.
-- **Your preferences, remembered.** Launch at login, choose a global shortcut, toggle menu bar animation, and hide sessions from selected applications.
-- **Codex usage in the footer.** See the last reported remaining quota and reset date alongside the monitor's build version.
+- **All open sessions in one place.** See your Codex sessions across VS Code, terminal apps, and the desktop client, grouped by application and sorted by name.
+- **Status at a glance.** A green number counts working sessions, green robot eyes show activity, and an amber counter beside the icon counts requests waiting for a response.
+- **Answer from the menu or a notification.** Read approval requests and questions, choose an offered answer, or enter a custom reply without switching windows.
+- **Return to the right project.** Jump to a VS Code workspace or the session’s terminal app, with matching-tab selection in Terminal and iTerm.
+- **Take questions to Telegram.** Connect your own bot, answer remotely, or browse open sessions with the **Sessions** button. Resolved question messages are removed automatically.
 
 One Rust executable, native AppKit controls, and macOS notifications. No Python or Swift runtime is needed.
 
@@ -36,8 +34,10 @@ One Rust executable, native AppKit controls, and macOS notifications. No Python 
 | Agent | Session discovery | Respond from the monitor | Setup |
 | --- | --- | --- | --- |
 | **Codex** | Local CLI, VS Code, and desktop sessions | Approval actions, supported questions, custom answers | Automatic local discovery; optional approval hook for CLI requests |
-| **Claude Code** | Lifecycle hooks in terminal and VS Code | One-time **Allow** for permission requests | Install hooks and restart Claude Code |
-| **Cline** | Lifecycle hooks and the current task's messages | Open the project and respond in Cline | Install hooks and enable them in Cline |
+| **Claude Code** *(experimental)* | Lifecycle hooks in terminal and VS Code | One-time **Allow** for permission requests | Install hooks and restart Claude Code |
+| **Cline** *(experimental)* | Lifecycle hooks and the current task's messages | Open the project and respond in Cline | Install hooks and enable them in Cline |
+
+**Claude Code and Cline integrations are experimental.** Discovery, activity tracking, and hook behavior may vary with agent and extension versions. For Cline, requests must be answered in Cline; external approval is not supported.
 
 The monitor runs on the Mac that hosts the agents. SSH, containers, and remote development environments need a separate delivery mechanism. Linux is not supported yet.
 
@@ -50,11 +50,11 @@ Use your own Telegram bot to receive agent questions and answer them away from t
 3. Click **Open pairing link**, then press **Start** in your bot. The one-time pairing link expires after 10 minutes.
 4. Click **Send test** to verify delivery. **Send questions to Telegram** pauses or resumes the integration; **Disconnect** removes the saved token and pairing.
 
-The bot's **Menu** button lists `/sessions`, `/status`, and `/help`. `/sessions` reads the currently open sessions (including idle ones), grouped by application with their status; `/status` shows the monitor version and notification state. Command replies also include a button keyboard. These read-only commands remain available while Telegram question notifications are paused.
+The bot's **Menu** button lists `/sessions`, `/status`, and `/help`. **Sessions** (or `/sessions`) opens an interactive list of currently open sessions, including idle ones, using the same application filters and ordering as the menu. Each session button shows its application symbol before the title and its status before the disclosure arrow. Select a session to view its latest message, working folder, Git branch, and current question with answer buttons. **Previous message** steps back through agent messages; **Latest message** returns to the live view. Plain chat text is sent to the selected session through the monitor. This currently requires a live Codex connection (VS Code or desktop); unsupported integrations report an error. Use Reply on a question message to enter a custom answer. Use **‹ Sessions** to return to the list; open views update automatically. Large lists are paginated. `/status` shows the monitor version and notification state. Command replies also include a button keyboard. The session list and status commands remain available while Telegram question notifications are paused.
 
 Approval messages use the agent's offered answer buttons. For a question that accepts a custom answer, reply to its bot message. Multiple questions are presented one at a time and submitted together. Questions marked as secret must be answered in the agent app.
 
-Only the paired private Telegram account can reply. The monitor rechecks the live request before forwarding an answer, and removes answer buttons when a request is resolved elsewhere. Your Mac must be awake and the monitor running to deliver notifications or process replies. Session titles and question text are sent through Telegram; this integration is opt-in. Use a separate bot for each monitor instance: Telegram polling cannot be shared with another bot client or an active webhook.
+Only the paired private Telegram account can reply. The monitor rechecks the live request before forwarding an answer, and deletes its bot message when a request is resolved, including answers made in the editor or monitor. If Telegram cannot delete the message, the monitor replaces its text and removes the answer buttons. Temporary cleanup failures are retried. Your Mac must be awake and the monitor running to deliver notifications or process replies. Session titles and question text, and viewed messages, working folder, and Git branch when browsing sessions, are sent through Telegram; this integration is opt-in. Use a separate bot for each monitor instance: Telegram polling cannot be shared with another bot client or an active webhook.
 
 ## Installation
 
@@ -67,7 +67,7 @@ Only the paired private Telegram account can reply. The monitor rechecks the liv
 
 Requires **macOS 13+** and **Apple Silicon** for the prebuilt DMG. Agents are installed separately. Rust, Xcode, and terminal commands are not needed to run the downloaded app.
 
-The current release is ad-hoc signed and **not notarized by Apple**. If macOS blocks the first launch, follow [Apple's instructions for opening an unnotarized app](https://support.apple.com/en-us/102445): after attempting to open it, use **System Settings → Privacy & Security → Open Anyway** if you trust this release. No system-wide security settings need to be disabled.
+Official release DMGs are signed with Developer ID and notarized by Apple. Download the DMG from this repository’s GitHub Releases; source builds signed ad hoc are intended for local development.
 
 The robot icon appears in the menu bar. To start automatically next time, enable **Settings → General → Launch at login**. Setup can be rerun from **Settings → Integrations → Check & set up**, including after installing another agent. Existing unrelated hooks are preserved.
 
@@ -79,13 +79,13 @@ For development or a native Intel build, install Rust/Cargo with support for the
 git clone https://github.com/melsomino/ai-agent-monitor.git
 cd ai-agent-monitor
 
-cargo run --release --locked -- bundle
+AI_AGENT_MONITOR_SIGN_IDENTITY=- cargo run --release --locked -- bundle
 
 mkdir -p "$HOME/Applications"
 ditto "build/AI Agent Monitor.app" "$HOME/Applications/AI Agent Monitor.app"
 ```
 
-The build creates a locally signed app bundle. Install it at its final location **before** configuring hooks: hooks store the absolute executable path.
+This command creates an ad-hoc signed app bundle for local development. Install it at its final location **before** configuring hooks: hooks store the absolute executable path.
 
 Define these paths for the commands below:
 
@@ -101,6 +101,17 @@ open -g "$monitor_app"
 ```
 
 Normal launches keep only the robot icon in the menu bar. Click it to see your sessions.
+
+## Privacy & permissions
+
+- **Local session data.** Discovery, message history, Git metadata, and Codex quota are read on your Mac. Passive monitoring does not start model turns. Answers are sent to the existing agent only after you explicitly choose or submit one.
+- **Hook configuration.** First-launch setup connects detected agents by updating their hook configuration. Modified Codex and Claude configuration is backed up; unrelated hooks are preserved, and existing third-party Cline hook files are not overwritten. Review the result in **Settings → Integrations**.
+- **macOS permissions.** Notification permission enables banners and answer buttons. macOS may request Automation permission to select tabs in Terminal or iTerm. Launch at login is optional and controlled in settings.
+- **Optional Telegram delivery.** The monitor connects directly to your bot; there is no project-hosted relay. Once paired and enabled, session titles, question text, and answer choices are sent to Telegram, and replies return through the bot. The bot token is stored in macOS Keychain. Pausing question delivery still allows explicitly requested `/sessions`, `/status`, and `/help` replies to the paired account.
+
+## Price & license
+
+AI Agent Monitor is **free to download and use**. The source code is available under the **Apache License 2.0**; see [LICENSE](LICENSE) for the full terms. Agent services and Telegram are separate from the monitor.
 
 ## Connect your agents
 
@@ -131,7 +142,7 @@ By default, the monitor uses `$CODEX_HOME` or `~/.codex`. To install the hook in
 
 Run the monitor with the same `CODEX_HOME` when monitoring that configuration.
 
-### Claude Code
+### Claude Code (experimental)
 
 ```sh
 "$monitor_bin" install-agent claude
@@ -145,7 +156,7 @@ The installer updates `$CLAUDE_CONFIG_DIR/settings.json` or `~/.claude/settings.
 "$monitor_bin" install-agent claude --home /path/to/claude-config
 ```
 
-### Cline
+### Cline (experimental)
 
 ```sh
 "$monitor_bin" install-agent cline
@@ -165,6 +176,12 @@ Cline requests are displayed and generate notifications, but approval happens in
 
 ### Sessions and navigation
 
+The menu includes working, waiting, and idle sessions; closed chat history stays out of the list. Sessions refresh in the background every two seconds. The window follows its content up to 80% of the screen height, then scrolls.
+
+Sessions use a flat list with application icons in the left gutter instead of group headings. Each icon stays pinned while its application's sessions scroll past, then gives way to the next application. Subtle separators appear only between applications. Session titles are semibold; messages use neutral text, and folder/branch metadata stays at the bottom of the expanded session.
+
+Expand a session to read its latest message, working directory, and Git branch. Pending questions appear in a separate panel below the messages. Working sessions and requests needing a response expand automatically when you open the menu. The green working count disappears when no sessions are working; it remains visible alongside the red request badge when both states are present.
+
 Click the robot icon, or use your configured shortcut, to open the menu. Idle sessions are included and have no status icon. Hover over a status icon for its description.
 
 - **Click the session title** to switch to its host. VS Code sessions open their project; terminal sessions activate their terminal app. Terminal and iTerm select the matching tab when it can be identified; Warp currently supports app activation only. macOS may ask for Automation permission to select terminal tabs.
@@ -181,13 +198,19 @@ Project navigation opens the workspace in VS Code; it does not select a particul
 
 | Key | Action |
 | --- | --- |
-| **↑ / ↓** | Select the previous or next session |
-| **Enter** | Open the selected session's project |
-| **→** | Expand the selected session |
-| **←** | Collapse the selected session |
+| **↑ / ↓** | Move between sessions and enabled answer buttons in expanded sessions |
+| **Enter** | Open the selected session's editor or terminal, or activate the selected answer |
+| **Space on a preset answer** | Choose it, just like Enter; Space in a custom-answer field inserts a space |
+| **→** | Expand the selected session; on a horizontal answer row, select the next answer (wraps) |
+| **←** | Collapse the selected session; on a horizontal answer row, select the previous answer (wraps) |
 | **Type text** | Filter session titles |
 | **Backspace** | Delete the last filter character |
 | **Escape** | Close the menu |
+
+When the menu opens with pending requests, the first enabled answer button is selected and scrolled into view.
+
+In a custom-answer field, **↑ / ↓** finish editing and continue menu navigation without discarding the text. **← / →** move the text cursor.
+Custom-answer fields use a system focus ring. **Send answer** remains in the navigation order when answers are incomplete; sending is enabled only when every required answer is valid.
 
 Filtering ignores case and splits the query on spaces. Every word must appear in the title: `api tests` matches titles containing both `api` and `tests`, in any order. The current query appears in the footer.
 
@@ -195,11 +218,11 @@ Filtering ignores case and splits the query on spaces. Every word must appear in
 
 Expand a pending request to read it and see its available actions beneath the message. Buttons follow the choices offered by the agent. When they fit, they share one row; otherwise they form a column.
 
-For supported Codex requests, actions can include one-time approval, approval for a session, decline, cancellation, or proposed policy changes. Questions can offer answer buttons, a custom response, or a separate form for multiple questions. Secret answers use a secure input field in the form.
+For supported Codex requests, actions can include one-time approval, approval for a session, decline, cancellation, or proposed policy changes. A single question lists answer buttons vertically, followed by an optional **Your own answer** field with **Send answer** beside it. Clicking a preset sends it immediately; the button beside the field sends only the entered text. Multiple questions appear directly in the menu, each with radio choices and an optional **Your own answer** field; **Send answer** submits all answers together. Selections and text survive menu refreshes. Secret answers use secure input fields. Answer actions in macOS notifications open the request in the sessions menu.
 
 The monitor rechecks that the request is still current before sending a response. A successful response refreshes the session and removes its notification without closing the menu. Requests answered in the editor also disappear after the monitor observes the update. Unsupported request types direct you to the editor.
 
-macOS notifications use actions specific to the request. Depending on the notification layout, these may appear in an actions menu. Larger sets of answers use **More answers** or open the full form. macOS controls how many actions and text lines are visible.
+macOS notifications use actions specific to the request. Depending on the notification layout, these may appear in an actions menu. **Answer questions** and **More answers** open the sessions menu with the request expanded. macOS controls how many actions and text lines are visible.
 
 **Hook-based approvals:** hooks forward their events to the resident monitor and wait up to 60 seconds for a one-time **Allow**. The monitor owns the request, notification, and response to the agent. The same response handler serves notification buttons and the session menu. Dismissing a notification leaves the request in the monitor; expiry, disconnection, or restarting the monitor returns control without approval. A stale notification cannot approve a later request. Errors never grant permission automatically.
 
@@ -211,7 +234,7 @@ This is a cached report from Codex sessions, checked every ten seconds, rather t
 
 ## Settings
 
-Settings use a native preferences toolbar with three sections: **General**, **Applications**, and **Integrations**.
+Settings use a native preferences toolbar with four sections: **General**, **Applications**, **Integrations**, and **Telegram**.
 
 | Section | Setting | Behavior |
 | --- | --- | --- |
@@ -220,10 +243,11 @@ Settings use a native preferences toolbar with three sections: **General**, **Ap
 | **Integrations** | Check & set up | Inspect detected agents, hook status and errors, or retry setup |
 | **General** | Keyboard shortcut | Records a global shortcut using ⌘, ⌥, or ⌃; **Escape** cancels recording and **×** clears it |
 | **Applications** | Application switches | Show or hide that application's sessions in the menu |
+| **Telegram** | Personal bot | Connect and pair your bot, pause or resume questions, send a test, or disconnect |
 
 The Integrations section shows detected agents with **Needs setup**, **Setting up…**, **Hooks installed**, or **Needs attention**. Status is checked against the current hook configuration; **Hooks installed** does not mean that Codex trust or Cline’s Enable Hooks setting has been confirmed. Required next steps appear beneath each agent. Setup runs in the background without a separate results window.
 
-The application list fills automatically as sessions are discovered. Entries and your choices are retained after applications close and across monitor restarts. Hiding an application affects the session list; notifications and the menu bar indicator still account for its sessions.
+The application list fills automatically as sessions are discovered. Entries and your choices are retained after applications close and across monitor restarts. Hiding an application removes its sessions from the list and the green working count. Notifications and the red pending-request badge still include its requests. Typing a title filter only changes the list.
 
 macOS **Reduce Motion** also stops the menu bar animation. If macOS requires approval for a Login Item, settings provide a button to open the relevant system controls.
 
@@ -233,40 +257,17 @@ macOS **Reduce Motion** also stops the menu bar animation. If macOS requires app
 
 Check **System Settings → Notifications → AI Agent Monitor** and allow banners or alerts. Check the current **Focus / Do Not Disturb** mode as well. A successful delivery can still be silent when macOS suppresses banners.
 
-Inspect the notification configuration or send a harmless test:
-
-```sh
-"$monitor_bin" notification-settings
-"$monitor_bin" test
-"$monitor_bin" test --approval
-```
-
-The test **Allow** button only checks the response path; it does not grant any agent permissions. To use a specific Codex chat title in the test:
-
-```sh
-"$monitor_bin" test --approval --session-id THREAD_ID
-```
-
 ### A session or approval is missing
 
 Check that the agent runs locally. For Claude Code, restart after hook installation; for Cline, enable hooks and reopen the task. For Codex CLI approvals, review the hook's trust in `/hooks`.
 
-```sh
-"$monitor_bin" sessions --json
-"$monitor_bin" check-hooks
-```
+Open **Settings → Integrations** to inspect agent status and errors, then use **Check & set up** to retry setup. No terminal commands are required.
 
-`sessions --json` prints discovered open sessions without opening the menu; application visibility preferences only filter the window. `check-hooks` inspects Codex hook discovery and trust without starting a model. To inspect another Codex executable:
-
-```sh
-"$monitor_bin" check-hooks --binary /path/to/codex
-```
-
-Codex's local client protocol is version-dependent. If a live request cannot be read or answered, use the agent's own interface. The monitor falls back to logs and hooks when possible. Historical chats are not added as substitutes for unavailable session data.
+Codex's local client protocol is version-dependent. If a live request cannot be read or answered, use the agent's own interface. The monitor falls back to logs and hooks when possible. Historical chats are not added as substitutes for unavailable session data. If an agent adapter stops, its sessions are marked unavailable and replies are disabled; restart the monitor to reconnect.
 
 ### Hooks stopped working after moving the app
 
-Run the corresponding `install` or `install-agent` command from the app's **new location**, then restart the agent. Review updated Codex hooks again in `/hooks`.
+Open the app from its **new location**, then use **Settings → Integrations → Check & set up** and restart the agent. Review updated Codex hooks again in `/hooks`.
 
 ## Updating and uninstalling
 
@@ -276,21 +277,24 @@ For a source build, quit the monitor, pull the latest code, rebuild, and replace
 
 ```sh
 git pull --ff-only
-cargo run --release --locked -- bundle
+AI_AGENT_MONITOR_SIGN_IDENTITY=- cargo run --release --locked -- bundle
 ditto "build/AI Agent Monitor.app" "$HOME/Applications/AI Agent Monitor.app"
 open -g "$HOME/Applications/AI Agent Monitor.app"
 ```
 
-If the app path is unchanged, existing hooks keep pointing to it. If an integration changes in an update, run its installer again and restart the agent.
+If the app path is unchanged, existing hooks keep pointing to it. If an integration changes in an update, use **Settings → Integrations → Check & set up** and restart the agent.
 
 To uninstall, turn off **Launch at login**, quit the monitor, and remove its hook entries before deleting the app. For Codex, disable the hook in `/hooks` or remove only the `AIAgentMonitor hook` handler from `hooks.PermissionRequest` in `hooks.json`. For Claude Code, remove this monitor's hook commands from its settings. For Cline, remove only wrappers installed by this project from its Hooks directory. Keep unrelated hooks intact.
 
 ## Development
 
 ```sh
+cargo +nightly fmt --all -- --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
+
+Nightly is used for formatting; ordinary builds do not require a nightly toolchain.
 
 `build.rs` increments `build-number.txt` on each Cargo build, including test and check builds. The compiled version, such as `0.1.0+44`, appears in `--version` and the menu footer; its numeric build suffix is stored in the bundle's `CFBundleVersion`. Packaging the same binary preserves its compiled build number.
 
@@ -306,13 +310,49 @@ src/
 └── macos/       Menu, notifications, settings, shortcuts, and answer forms
 ```
 
-To create a distributable disk image for the build machine's architecture:
+To create an ad-hoc signed disk image for local testing on the build machine’s architecture:
 
 ```sh
-cargo run --release --locked -- dmg
+AI_AGENT_MONITOR_SIGN_IDENTITY=- cargo run --release --locked -- dmg
 ```
 
-This packages the signed app and an Applications shortcut into `build/release/AI-Agent-Monitor-apple-silicon.dmg` (or `AI-Agent-Monitor-intel.dmg` for an Intel build), alongside `SHA256SUMS`. DMG packaging does not grant a Developer ID signature or notarization.
+This packages the app and an Applications shortcut into `build/release/AI-Agent-Monitor-apple-silicon.dmg` (or `AI-Agent-Monitor-intel.dmg` for an Intel build), alongside `SHA256SUMS`. The command above uses ad-hoc signing and does not notarize the app. For public distribution, use the signed and notarized release script below.
+
+### Signed and notarized releases
+
+Run the complete release pipeline from the repository root:
+
+```sh
+./scripts/release-macos.sh
+```
+
+The script lists valid **Developer ID Application** signing identities from Keychain
+and asks you to select one by number, even when only one is available. It then
+builds the current architecture, signs the app and DMG with the selected identity,
+submits the DMG to Apple, requires an `Accepted` result, staples the ticket to the
+DMG, and checks the signature, ticket, disk image, and Gatekeeper assessment.
+`SHA256SUMS` is regenerated only after these checks, because signing and stapling
+change the DMG. Upload the resulting DMG and `SHA256SUMS` from `build/release` to
+GitHub Releases; the script does not publish or tag anything. The app inside the
+DMG is covered by notarization; the offline ticket is attached to the DMG.
+
+Once per build Mac, save notarization credentials in Keychain (the command prompts
+for an Apple app-specific password; do not put passwords in scripts):
+
+```sh
+xcrun notarytool store-credentials ai-agent-monitor-notary \
+  --apple-id YOUR_EMAIL --team-id YOUR_TEAM_ID
+```
+
+The default profile is `ai-agent-monitor-notary`. Override it with
+`AI_AGENT_MONITOR_NOTARY_PROFILE`, and override the signing certificate with
+`AI_AGENT_MONITOR_SIGN_IDENTITY` for non-interactive certificate selection. The
+override must match the SHA-1 or full name of an available Developer ID Application
+identity. Ad-hoc signing is rejected. Submission
+receipts and rejection logs are retained in `build/notarization` for diagnostics.
+If any step fails, do not publish that artifact. Fix the problem and rerun the
+script. Each new build needs notarization; do not rebuild, re-sign, or modify a
+completed release artifact.
 
 The resident uses Tokio actors with one-way commands and state subscriptions. Window controllers, macOS notifications, and Telegram share the Monitor state; no application state is stored in global variables. See the [actor architecture](docs/actor-architecture.md) for the design.
 

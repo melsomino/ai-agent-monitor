@@ -298,6 +298,53 @@ impl Runtime {
             });
         valid && self.allow(&approval.id)
     }
+    /// Send only to the already running owner; never resume a second agent.
+    pub fn send_message(&self, session: &str, text: &str) -> Result<()> {
+        let mut attempted = false;
+        let result = (|| -> Result<bool> {
+            let mut connection = Connection::connect(&self.socket)?;
+            let owner = connection.owner(session)?;
+            connection.follow(session, &owner, true)?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let Some(message) = connection.next()? else {
+                    continue;
+                };
+                if message["method"] != "thread-stream-state-changed"
+                    || message["sourceClientId"] != owner
+                    || message["version"] != STREAM_VERSION
+                    || message["params"]["conversationId"] != session
+                    || message["params"]["hostId"] != "local"
+                    || message["params"]["change"]["type"] != "snapshot"
+                {
+                    continue;
+                }
+                let state = &message["params"]["change"]["conversationState"];
+                anyhow::ensure!(
+                    state["id"] == session,
+                    "Session owner returned a different conversation."
+                );
+                let client_id = client_message_id()?;
+                let (method, version, params) =
+                    async_questions::reply_envelope(state, text, &client_id)
+                        .context("This session is not accepting messages right now.")?;
+                attempted = true;
+                let result = connection.request(method, params, version, Some(&owner))?;
+                return Ok(admission(&result, false, &mut attempted));
+            }
+            anyhow::bail!("No live message connection to this session.")
+        })();
+        match result {
+            Ok(true) => Ok(()),
+            Ok(false) if !attempted => {
+                anyhow::bail!("Codex rejected the message. It was not sent.")
+            }
+            Err(error) if !attempted => Err(error.context("Message not sent")),
+            _ => anyhow::bail!(
+                "Could not confirm delivery. Check the agent before sending this message again."
+            ),
+        }
+    }
     pub fn interaction_for(&self, session: &crate::agents::sessions::Session) -> Interaction {
         let Some(approval) = &session.approval else {
             return Interaction::default();
@@ -402,22 +449,7 @@ impl Runtime {
                 return Ok(false);
             }
             if let Some(text) = async_text {
-                let mut random = [0u8; 16];
-                fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-                random[6] = (random[6] & 0x0f) | 0x40;
-                random[8] = (random[8] & 0x3f) | 0x80;
-                let hex = random
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>();
-                let client_id = format!(
-                    "{}-{}-{}-{}-{}",
-                    &hex[..8],
-                    &hex[8..12],
-                    &hex[12..16],
-                    &hex[16..20],
-                    &hex[20..]
-                );
+                let client_id = client_message_id()?;
                 let Some((method, version, params)) = async_questions::reply_envelope(
                     &change["conversationState"],
                     &text,
@@ -493,6 +525,26 @@ fn socket_path(home: &std::path::Path) -> std::path::PathBuf {
 }
 
 // A received rejection proves non-admission. A missing/malformed response does not.
+fn client_message_id() -> Result<String> {
+    let mut random = [0u8; 16];
+    fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    random[6] = (random[6] & 0x0f) | 0x40;
+    random[8] = (random[8] & 0x3f) | 0x80;
+    let hex = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let client_id = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    );
+
+    Ok(client_id)
+}
 fn admission(result: &Value, approval: bool, attempted: &mut bool) -> bool {
     let accepted =
         result["resultType"] == "success" && (!approval || result["result"]["ok"] == true);
@@ -892,6 +944,107 @@ fn apply_patch(value: &mut Value, path: &[Value], op: &str, replacement: &Value)
 #[cfg(test)]
 mod tests {
     #[test]
+    fn chat_messages_target_the_existing_owner_and_never_retry_uncertain_delivery() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        fn read(stream: &mut UnixStream) -> Value {
+            let mut size = [0u8; 4];
+            stream.read_exact(&mut size).unwrap();
+            let mut data = vec![0; u32::from_le_bytes(size) as usize];
+            stream.read_exact(&mut data).unwrap();
+            serde_json::from_slice(&data).unwrap()
+        }
+        fn write(stream: &mut UnixStream, value: Value) {
+            let data = serde_json::to_vec(&value).unwrap();
+            stream
+                .write_all(&(data.len() as u32).to_le_bytes())
+                .unwrap();
+            stream.write_all(&data).unwrap();
+        }
+        for (status, outcome) in [
+            ("idle", "success"),
+            ("active", "success"),
+            ("active", "error"),
+            ("idle", "disconnect"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("ipc.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let init = read(&mut socket);
+                assert_eq!(init["method"], "initialize");
+                write(
+                    &mut socket,
+                    json!({"type":"response","requestId":init["requestId"],"resultType":"success","result":{"clientId":"monitor"}}),
+                );
+                let discovery = read(&mut socket);
+                assert_eq!(discovery["method"], "thread-owner-discovery");
+                assert_eq!(discovery["params"]["conversationId"], "chat");
+                write(
+                    &mut socket,
+                    json!({"type":"response","requestId":discovery["requestId"],"resultType":"success","handledByClientId":"owner"}),
+                );
+                let follow = read(&mut socket);
+                assert_eq!(follow["method"], "thread-stream-following-changed");
+                assert_eq!(follow["targetClientIds"], json!(["owner"]));
+                write(
+                    &mut socket,
+                    json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner","version":STREAM_VERSION,"params":{"hostId":"local","conversationId":"chat","change":{"type":"snapshot","revision":1,"conversationState":{"id":"chat","requests":[],"threadRuntimeStatus":{"type":status}}}}}),
+                );
+                let request = read(&mut socket);
+                assert_eq!(request["targetClientId"], "owner");
+                assert_eq!(request["params"]["conversationId"], "chat");
+                if status == "idle" {
+                    assert_eq!(request["method"], "thread-follower-start-turn");
+                    assert_eq!(request["version"], 2);
+                    assert_eq!(
+                        request["params"]["turnStart"]["request"]["input"][0]["text"],
+                        "Hello from Telegram"
+                    );
+                    assert_eq!(
+                        request["params"]["turnStart"]["context"]["inheritThreadSettings"],
+                        true
+                    );
+                } else {
+                    assert_eq!(request["method"], "thread-follower-steer-turn");
+                    assert_eq!(request["version"], 1);
+                    assert_eq!(request["params"]["input"][0]["text"], "Hello from Telegram");
+                }
+                if outcome != "disconnect" {
+                    write(
+                        &mut socket,
+                        json!({"type":"response","requestId":request["requestId"],"resultType":outcome,"result":{}}),
+                    );
+                }
+            });
+            let (wanted, _requests) = tokio::sync::watch::channel(HashSet::new());
+            let (_published, observed) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
+            let runtime = Runtime {
+                socket: path,
+                wanted,
+                observed,
+                state: RefCell::new(State::default()),
+                epoch: 0,
+            };
+            let result = runtime.send_message("chat", "Hello from Telegram");
+            server.join().unwrap();
+            match outcome {
+                "success" => assert!(result.is_ok(), "{result:?}"),
+                "error" => assert!(result.unwrap_err().to_string().contains("rejected")),
+                _ => assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Could not confirm delivery")
+                ),
+            }
+        }
+    }
+    #[test]
     fn explicit_rejections_are_not_confused_with_unknown_delivery() {
         for (value, approval) in [
             (serde_json::json!({"resultType":"error"}), false),
@@ -977,6 +1130,43 @@ mod tests {
         );
     }
     #[test]
+    fn async_answer_turn_does_not_issue_a_new_interaction_ticket() {
+        let raw = json!({"id":"chat","requests":[],"threadRuntimeStatus":{"type":"idle"},"turns":[{"turnId":"one","turnStartedAtMs":1,"items":[{"type":"agentMessage","id":"call","questions":[{"title":"Pick?","options":["A","B"]}]}]}]});
+        let mut live = HashMap::new();
+        apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &json!({"type":"snapshot","revision":1,"conversationState":raw}),
+        );
+        let (published, observed) = tokio::sync::watch::channel(Arc::new(live.clone()));
+        let (wanted, _requests) = tokio::sync::watch::channel(HashSet::new());
+        let runtime = Runtime {
+            socket: std::path::PathBuf::new(),
+            wanted,
+            observed,
+            state: RefCell::new(State::default()),
+            epoch: 0,
+        };
+        let ids = HashSet::from(["chat".to_owned()]);
+        let initial = runtime.views(&ids)["chat"].approval.clone().unwrap();
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &json!({"type":"patches","baseRevision":1,"revision":2,"patches":[
+                {"op":"replace","path":["threadRuntimeStatus"],"value":{"type":"active","activeFlags":[]}},
+                {"op":"add","path":["turns",1],"value":{"turnId":"two","turnStartedAtMs":2,"items":[]}}
+            ]})
+        ));
+        published.send_replace(Arc::new(live));
+        assert_eq!(
+            runtime.views(&ids)["chat"].approval.as_ref(),
+            Some(&initial)
+        );
+        assert_eq!(runtime.state.borrow().next_ticket, 1);
+    }
+    #[test]
     fn async_questions_follow_history_patches_and_old_tickets_fail_after_a_reply() {
         let raw = json!({"id":"chat","requests":[],"threadRuntimeStatus":{"type":"idle"},"turnHistory":{"history":{"entitiesByKey":{"turn:one":{"turnId":"one","turnStartedAtMs":1,"items":[{"type":"userMessage","id":"u"},{"type":"agentMessage","id":"call","questions":null}]}}}}});
         let mut live = HashMap::new();
@@ -1005,6 +1195,43 @@ mod tests {
             "chat",
             "owner",
             &json!({"type":"patches","baseRevision":2,"revision":3,"patches":[{"op":"add","path":["turnHistory","history","entitiesByKey","turn:two"],"value":{"turnId":"two","turnStartedAtMs":2,"items":[{"type":"userMessage","id":"reply","content":[{"type":"text","text":"New input"}]}]}}]})
+        ));
+        assert!(!exact_request(&live["chat"].state, &ticket));
+        assert!(async_questions::pending(&live["chat"].state).is_none());
+    }
+    #[test]
+    fn accepted_vscode_steering_reply_patch_retires_the_async_ticket() {
+        let raw = json!({"id":"chat","requests":[],"threadRuntimeStatus":{"type":"active","activeFlags":[]},"turns":[{"turnId":"one","turnStartedAtMs":1,"items":[{"type":"agentMessage","id":"call","questions":[{"title":"Pick?","options":["A","B"]}]}]}]});
+        let mut live = HashMap::new();
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &json!({"type":"snapshot","revision":1,"conversationState":raw})
+        ));
+        let request = async_questions::pending(&live["chat"].state).unwrap();
+        let id = request["params"]["questions"][0]["id"].as_str().unwrap();
+        let text = format!(
+            "<send_user_message_question_reply>{}</send_user_message_question_reply>",
+            json!([{"questionItemId":id,"answer":"A"}])
+        );
+        let ticket = Ticket {
+            session: "chat".into(),
+            owner: "owner".into(),
+            request,
+        };
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &json!({"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"add","path":["turns",0,"items",1],"value":{"type":"steeringUserMessage","id":"reply","status":"pending","input":[{"type":"text","text":text}]}}]})
+        ));
+        assert!(exact_request(&live["chat"].state, &ticket));
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &json!({"type":"patches","baseRevision":2,"revision":3,"patches":[{"op":"replace","path":["turns",0,"items",1,"status"],"value":"accepted"}]})
         ));
         assert!(!exact_request(&live["chat"].state, &ticket));
         assert!(async_questions::pending(&live["chat"].state).is_none());

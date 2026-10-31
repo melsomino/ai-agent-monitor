@@ -57,6 +57,16 @@ pub(crate) async fn run(
                         });
                     }
                 }
+                AgentCommand::SendMessage { id, session, text } => {
+                    let result = provider
+                        .send_message(&session, &text)
+                        .map_err(|error| error.to_string());
+                    let _ = handle.publish_from_worker(Command::MessageSent {
+                        id,
+                        session: session.key(),
+                        result,
+                    });
+                }
                 AgentCommand::History {
                     session,
                     cursor,

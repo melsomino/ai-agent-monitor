@@ -66,10 +66,7 @@ impl SessionProvider for Codex {
         crate::agents::history::jsonl(
             &path,
             before,
-            session
-                .approval
-                .is_none()
-                .then_some(session.last_message.as_str()),
+            Some(session.last_message.as_str()),
             crate::agents::history::codex,
         )
     }
@@ -93,6 +90,9 @@ impl SessionProvider for Codex {
         }
     }
 
+    fn send_message(&self, session: &Session, text: &str) -> Result<()> {
+        self.runtime.send_message(&session.id, text)
+    }
     fn interaction(&self, session: &Session) -> crate::agents::interaction::Interaction {
         if session
             .approval

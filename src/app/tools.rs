@@ -12,6 +12,36 @@ use std::{
     time::{Duration, Instant},
 };
 
+const DEFAULT_SIGNING_IDENTITY: &str = "-";
+
+fn sign_app(bundle: &Path) -> Result<()> {
+    let identity = env::var("AI_AGENT_MONITOR_SIGN_IDENTITY")
+        .unwrap_or_else(|_| DEFAULT_SIGNING_IDENTITY.into());
+    anyhow::ensure!(
+        !identity.trim().is_empty(),
+        "AI_AGENT_MONITOR_SIGN_IDENTITY must not be empty"
+    );
+    let mut command = Command::new("/usr/bin/codesign");
+    command.args(["--force", "--sign", &identity]);
+    if identity != "-" {
+        command.args(["--options", "runtime", "--timestamp"]);
+    }
+    let result = command.arg(bundle).output()?;
+    if !result.status.success() {
+        bail!("codesign: {}", String::from_utf8_lossy(&result.stderr));
+    }
+    let verified = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict"])
+        .arg(bundle)
+        .output()?;
+    anyhow::ensure!(
+        verified.status.success(),
+        "codesign verification: {}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    Ok(())
+}
+
 pub fn bundle() -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let contents = root.join("build").join(core::APP_NAME).join("Contents");
@@ -40,16 +70,16 @@ pub fn bundle() -> Result<()> {
             .replace("@VERSION@", env!("CARGO_PKG_VERSION")),
     )?;
     fs::write(
-        contents.join("Resources/AppIcon.icns"),
+        contents.join("Resources/AppIcon-robots.icns"),
         include_bytes!("../../assets/AppIcon.icns"),
     )?;
-    let result = Command::new("/usr/bin/codesign")
-        .args(["--force", "--sign", "-"])
-        .arg(contents.parent().unwrap())
-        .output()?;
-    if !result.status.success() {
-        bail!("codesign: {}", String::from_utf8_lossy(&result.stderr));
+    // Remove the legacy resource name so Launch Services cannot reuse its old icon.
+    match fs::remove_file(contents.join("Resources/AppIcon.icns")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
+    sign_app(contents.parent().unwrap())?;
     println!("Built: {}", contents.parent().unwrap().display());
     Ok(())
 }

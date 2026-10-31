@@ -18,6 +18,9 @@ pub trait SessionProvider: Send {
     ) -> Result<Option<crate::agents::history::Message>> {
         Ok(None)
     }
+    fn send_message(&self, _session: &Session, _text: &str) -> Result<()> {
+        anyhow::bail!("This agent integration does not support sending messages yet.")
+    }
     fn open_target(&self, session: &Session) -> String;
     fn allow(&self, session: &Session) -> bool;
     fn interaction(&self, session: &Session) -> Interaction {

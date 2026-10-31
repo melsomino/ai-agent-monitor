@@ -94,6 +94,13 @@ pub(crate) async fn run(
             Command::AgentStopped { source, error } => {
                 stopped.insert(source);
                 agents.remove(source);
+                for send in state.message_sends.values_mut() {
+                    if send.session.starts_with(&format!("{source}:"))
+                        && send.status == MessageStatus::Sending
+                    {
+                        send.status = MessageStatus::Failed(error.clone());
+                    }
+                }
                 if let Some(sessions) = sources.get_mut(source) {
                     for session in sessions {
                         session.authoritative = false;
@@ -155,6 +162,75 @@ pub(crate) async fn run(
                 state
                     .hooks
                     .retain(|_, h| h.session.agent != agent || h.session.id != id);
+            }
+            Command::SendMessage { id, session, text } => {
+                if state.message_sends.contains_key(&id) {
+                    continue;
+                }
+                while state.message_sends.len() >= 256 {
+                    let finished = state
+                        .message_sends
+                        .iter()
+                        .find(|(_, send)| send.status != MessageStatus::Sending)
+                        .map(|(id, _)| id.clone());
+                    if let Some(id) = finished {
+                        state.message_sends.remove(&id);
+                    } else {
+                        break;
+                    }
+                }
+                let current = state.sessions.iter().find(|s| s.key() == session).cloned();
+                let error = if text.trim().is_empty() || text.chars().count() > 16000 {
+                    Some("Enter a message of 1–16000 characters.")
+                } else if current.is_none() {
+                    Some("This session is no longer open.")
+                } else if !state
+                    .preferences
+                    .applications
+                    .enabled(current.as_ref().unwrap().client)
+                {
+                    Some("This application is hidden in monitor settings.")
+                } else if !current.as_ref().unwrap().authoritative {
+                    Some("No live message connection to this session. Open it in the agent app.")
+                } else if state.message_sends.len() >= 256 {
+                    Some("Message queue is busy. Try again later.")
+                } else {
+                    None
+                };
+                let status = if let Some(error) = error {
+                    MessageStatus::Failed(error.into())
+                } else if let Some(current) = current {
+                    match agents.get(current.agent).map(|agent| {
+                        agent.try_send(AgentCommand::SendMessage {
+                            id: id.clone(),
+                            session: Box::new(current),
+                            text,
+                        })
+                    }) {
+                        Some(Ok(())) => MessageStatus::Sending,
+                        _ => MessageStatus::Failed("Agent message queue is unavailable.".into()),
+                    }
+                } else {
+                    unreachable!()
+                };
+                state
+                    .message_sends
+                    .insert(id, MessageSend { session, status });
+            }
+            Command::MessageSent {
+                id,
+                session,
+                result,
+            } => {
+                if let Some(send) = state.message_sends.get_mut(&id)
+                    && send.session == session
+                    && send.status == MessageStatus::Sending
+                {
+                    send.status = match result {
+                        Ok(()) => MessageStatus::Sent,
+                        Err(error) => MessageStatus::Failed(error),
+                    };
+                }
             }
             Command::Submit { session, response } => {
                 if let Some(current) = state

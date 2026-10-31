@@ -152,7 +152,9 @@ fn exchange(mut stream: UnixStream, request: &Request) -> Result<Value> {
     if let Some(error) = reply.error {
         bail!("{error}");
     }
-    reply.result.context("Missing monitor result")
+    // JSON null is a successful result for passive notifications and hooks
+    // that return control without a decision. Option<Value> decodes it as None.
+    Ok(reply.result.unwrap_or(Value::Null))
 }
 
 /// Called only after the resident-process lock has been acquired.
@@ -445,6 +447,36 @@ async fn handle_request(
             {
                 anyhow::bail!("Notifications require macOS")
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn null_replies_are_successful_but_server_errors_still_fail() {
+        for error in [None, Some("Rejected".to_owned())] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let failed = error.is_some();
+            let task = std::thread::spawn(move || {
+                let _: Request = read_frame(&mut server).unwrap();
+                write_frame(
+                    &mut server,
+                    &Reply {
+                        result: Some(Value::Null),
+                        error,
+                    },
+                )
+                .unwrap();
+            });
+            let result = exchange(client, &Request::Sessions);
+            if failed {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), Value::Null);
+            }
+            task.join().unwrap();
         }
     }
 }

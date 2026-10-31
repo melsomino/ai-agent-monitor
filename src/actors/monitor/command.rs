@@ -17,6 +17,16 @@ pub enum Command {
         session: Box<Session>,
         response: Response,
     },
+    SendMessage {
+        id: String,
+        session: String,
+        text: String,
+    },
+    MessageSent {
+        id: String,
+        session: String,
+        result: Result<(), String>,
+    },
     Delivery {
         key: String,
         approval: Approval,
@@ -63,6 +73,11 @@ pub enum Command {
 }
 pub(crate) enum AgentCommand {
     Refresh,
+    SendMessage {
+        id: String,
+        session: Box<Session>,
+        text: String,
+    },
     Respond {
         session: Box<Session>,
         response: Response,

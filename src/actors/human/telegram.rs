@@ -20,6 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod sessions;
+
 pub use crate::domain::telegram::Status;
 pub fn diagnostics(status: &Status) -> Value {
     json!({"connected":status.connected,"enabled":status.enabled,"paired":status.paired,"status":status.text,"queued":status.queued,"delivered":status.delivered,"snapshotPending":status.snapshot_pending,"suppressed":status.suppressed,"commandMenuReady":status.command_menu_ready})
@@ -184,10 +186,14 @@ fn api(token: &str, method: &str, payload: Value) -> Result<Value> {
 fn api_result(method: &str, value: Value) -> Result<Value> {
     if value["ok"] != true && value["error_code"] == 400 {
         let description = value["description"].as_str().unwrap_or_default();
+        if method == "editMessageText"
+            && description.starts_with("Bad Request: message is not modified")
+        {
+            return Ok(json!({"unchanged":true}));
+        }
         if (method == "deleteMessage" && description == "Bad Request: message to delete not found")
             || (method == "editMessageText"
-                && (description == "Bad Request: message to edit not found"
-                    || description.starts_with("Bad Request: message is not modified")))
+                && description == "Bad Request: message to edit not found")
         {
             return Ok(json!(true));
         }
@@ -379,6 +385,7 @@ struct Worker {
     commands_ready: bool,
     commands_retry: Instant,
     outbox: VecDeque<String>,
+    browser: Option<sessions::Browser>,
 }
 impl Worker {
     fn load(monitor: monitor::Handle, tx: tokio::sync::mpsc::Sender<Event>) -> Self {
@@ -409,6 +416,7 @@ impl Worker {
             commands_ready: false,
             commands_retry: Instant::now(),
             outbox: VecDeque::new(),
+            browser: None,
         };
         worker.publish();
         if let Err(error) = credential {
@@ -609,6 +617,7 @@ impl Worker {
         true
     }
     fn retire_all(&mut self, text: &str) {
+        self.browser = None;
         self.pending.clear();
         self.edits = Default::default();
         for message in self.config.messages.clone() {
@@ -838,6 +847,54 @@ impl Worker {
                     self.retry = Instant::now() + Duration::from_secs(15);
                 }
             }
+            return;
+        }
+        self.flush_browser();
+    }
+    fn flush_browser(&mut self) {
+        let snapshot = self.monitor.snapshot();
+        let Some(browser) = self.browser.as_mut() else {
+            return;
+        };
+        let content = browser.content(&snapshot, &self.pending);
+        if content == browser.rendered {
+            return;
+        }
+        let message = browser.message;
+        let mut payload = content.clone();
+        payload["chat_id"] = json!(self.config.chat);
+        if let Some(message) = message {
+            payload["message_id"] = json!(message);
+        }
+        let method = if message.is_some() {
+            "editMessageText"
+        } else {
+            "sendMessage"
+        };
+        match self.api(method, payload) {
+            Ok(result) => {
+                if let Some(id) = result["message_id"].as_i64() {
+                    let browser = self.browser.as_mut().unwrap();
+                    browser.message = Some(id);
+                    browser.commit(content);
+                    if message.is_none() {
+                        self.config.messages.push(id);
+                        self.save();
+                    }
+                } else if message.is_some() && result["unchanged"] == true {
+                    self.browser.as_mut().unwrap().commit(content);
+                } else if message.is_some() {
+                    // A deleted Telegram message cannot be revived by editing.
+                    let browser = self.browser.as_mut().unwrap();
+                    browser.message = None;
+                    browser.rendered = Value::Null;
+                }
+                self.retry = Instant::now() + Duration::from_secs(1);
+            }
+            Err(error) => {
+                self.note(&error.to_string());
+                self.retry = Instant::now() + Duration::from_secs(15);
+            }
         }
     }
     fn ensure_commands(&mut self) {
@@ -876,11 +933,16 @@ impl Worker {
     fn command(&mut self, command: BotCommand) -> Result<()> {
         let messages = match command {
             BotCommand::Sessions => {
-                session_messages(&self.monitor.snapshot().sessions)
+                let browser = sessions::Browser::new()?;
+                if let Some(old) = self.browser.take().and_then(|browser| browser.message) {
+                    self.finish(old, "Session list refreshed.");
+                }
+                self.browser = Some(browser);
+                return Ok(());
             }
             BotCommand::Status => vec![format!("AI Agent Monitor {}\nNotifications: {}\nPending questions: {}",
                 core::VERSION, if self.config.enabled {"enabled"} else {"paused"}, self.pending.len())],
-            BotCommand::Help => vec!["/sessions — List all open sessions, including idle sessions\n/status — Monitor and notification status\n/help — Show these commands\n\nUse answer buttons on question messages, or reply to one to enter a custom answer.\nCommands require your Mac and monitor to be running.".into()],
+            BotCommand::Help => vec!["/sessions — List all open sessions, including idle sessions\n/status — Monitor and notification status\n/help — Show these commands\n\nOpen a session and type in chat to send a message to that agent. Previous message loads an earlier agent message. Use answer buttons on question messages, or reply to one to enter a custom answer.\nCommands require your Mac and monitor to be running.".into()],
         };
         anyhow::ensure!(
             self.outbox.len() + messages.len() <= 128,
@@ -913,7 +975,11 @@ impl Worker {
             if !self.paired(user, chat, kind) {
                 return;
             }
-            if let Some(command) = bot_command(text, &self.config.username) {
+            // Text button labels are commands only outside an explicit reply.
+            // A custom answer such as "Status" must still reach the question.
+            if let Some(command) = bot_command(text, &self.config.username)
+                && (text.trim_start().starts_with('/') || message["reply_to_message"].is_null())
+            {
                 if let Err(error) = self.command(command) {
                     let _ = self.api("sendMessage", json!({"chat_id":chat,"text":error.to_string(),"reply_markup":command_keyboard()}));
                 }
@@ -928,6 +994,18 @@ impl Worker {
                     .iter()
                     .find(|(_, p)| p.message == Some(message_id))
                     .map(|(k, _)| k.clone())
+                    .or_else(|| {
+                        let selected = self.browser.as_ref()?.selected(message_id)?;
+                        self.pending
+                            .iter()
+                            .find(|(_, p)| {
+                                p.session.key() == selected
+                                    && self.browser.as_ref().is_some_and(|browser| {
+                                        browser.permits_answer(message_id, p)
+                                    })
+                            })
+                            .map(|(key, _)| key.clone())
+                    })
             {
                 let result = self.answer(&key, None, Some(text));
                 if let Err(error) = result {
@@ -937,6 +1015,25 @@ impl Worker {
                     );
                 }
             }
+            if message["reply_to_message"].is_null()
+                && !text.trim().is_empty()
+                && let Some(session) = self
+                    .browser
+                    .as_ref()
+                    .and_then(|browser| browser.current_session())
+                    .map(str::to_owned)
+                && let Some(message_id) = message["message_id"].as_i64().filter(|id| *id > 0)
+            {
+                let id = format!("telegram:{chat}:{message_id}");
+                match self.monitor.send(monitor::Command::SendMessage {
+                    id: id.clone(),
+                    session,
+                    text: text.to_owned(),
+                }) {
+                    Ok(()) => self.browser.as_mut().unwrap().track_send(id),
+                    Err(error) => self.outbox.push_back(error),
+                }
+            }
         }
         if let Some(callback) = update.get("callback_query") {
             let user = callback["from"]["id"].as_i64().unwrap_or(0);
@@ -944,7 +1041,35 @@ impl Worker {
             let chat = message["chat"]["id"].as_i64().unwrap_or(0);
             let kind = message["chat"]["type"].as_str().unwrap_or_default();
             let mut feedback = "This request is no longer available.".to_owned();
-            if self.authorized(user, chat, kind) {
+            let navigation = if self.paired(user, chat, kind) {
+                self.browser
+                    .as_mut()
+                    .map(|browser| {
+                        browser.navigate(
+                            message["message_id"].as_i64().unwrap_or(0),
+                            callback["data"].as_str().unwrap_or_default(),
+                        )
+                    })
+                    .transpose()
+            } else {
+                Ok(None)
+            };
+            if matches!(&navigation, Ok(Some(true))) {
+                let snapshot = self.monitor.snapshot();
+                let history = self
+                    .browser
+                    .as_mut()
+                    .and_then(|browser| browser.history_command(&snapshot));
+                feedback = "Updated.".into();
+                if let Some(command) = history
+                    && let Err(error) = self.monitor.send(command)
+                {
+                    self.browser.as_mut().unwrap().history_error(error.clone());
+                    feedback = error;
+                }
+            } else if let Err(error) = navigation {
+                feedback = error.to_string();
+            } else if self.authorized(user, chat, kind) {
                 if let Some((key, index)) = self.callback_key(callback) {
                     feedback = match self.answer(&key, Some(index), None) {
                         Ok(()) => "Answer queued.".into(),
@@ -975,7 +1100,14 @@ impl Worker {
         let message_id = message["message_id"].as_i64()?;
         self.pending
             .iter()
-            .find(|(_, p)| p.nonce == nonce && p.message == Some(message_id))
+            .find(|(_, p)| {
+                p.nonce == nonce
+                    && (p.message == Some(message_id)
+                        || self
+                            .browser
+                            .as_ref()
+                            .is_some_and(|browser| browser.permits_answer(message_id, p)))
+            })
             .map(|(key, _)| (key.clone(), index))
     }
     fn answer(&mut self, key: &str, index: Option<usize>, text: Option<&str>) -> Result<()> {
@@ -1029,6 +1161,12 @@ enum BotCommand {
     Help,
 }
 fn bot_command(text: &str, username: &str) -> Option<BotCommand> {
+    match text.trim() {
+        "Sessions" => return Some(BotCommand::Sessions),
+        "Status" => return Some(BotCommand::Status),
+        "Help" => return Some(BotCommand::Help),
+        _ => {}
+    }
     let command = text.split_whitespace().next()?;
     let command = if let Some((command, target)) = command.split_once('@') {
         if !target.eq_ignore_ascii_case(username) {
@@ -1046,63 +1184,9 @@ fn bot_command(text: &str, username: &str) -> Option<BotCommand> {
     }
 }
 fn command_keyboard() -> Value {
-    json!({"keyboard":[[{"text":"/sessions"},{"text":"/status"}],[{"text":"/help"}]],
+    json!({"keyboard":[[{"text":"Sessions"},{"text":"Status"}],[{"text":"Help"}]],
         "resize_keyboard":true,"is_persistent":true,"input_field_placeholder":"Choose a command or reply to a question"})
 }
-fn session_messages(sessions: &[Session]) -> Vec<String> {
-    if sessions.is_empty() {
-        return vec!["No open agent sessions.".into()];
-    }
-    let mut sessions: Vec<_> = sessions.iter().collect();
-    sessions.sort_by_key(|session| {
-        (
-            session.client.label().to_lowercase(),
-            session.title.to_lowercase(),
-            session.agent,
-            session.id.as_str(),
-        )
-    });
-    let mut messages = Vec::new();
-    let mut page = format!("Open sessions ({})", sessions.len());
-    let mut group = "";
-    for session in sessions {
-        let app = session.client.label();
-        let title = short(
-            &session
-                .title
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
-            180,
-        );
-        let status = if session.approval.is_some() {
-            "Needs response"
-        } else {
-            session.activity.label()
-        };
-        let heading = if group != app {
-            format!("\n\n{app}")
-        } else {
-            String::new()
-        };
-        let line = format!("\n• {title} · {} · {status}", session.agent_label());
-        if page.encode_utf16().count()
-            + heading.encode_utf16().count()
-            + line.encode_utf16().count()
-            > 3900
-        {
-            messages.push(page);
-            page = format!("Open sessions (continued)\n\n{app}{line}");
-        } else {
-            page.push_str(&heading);
-            page.push_str(&line);
-        }
-        group = app;
-    }
-    messages.push(page);
-    messages
-}
-
 fn pairing_matches(user: i64, chat: i64, kind: &str, text: &str, code: &str, valid: bool) -> bool {
     valid
         && user > 0
@@ -1176,6 +1260,7 @@ mod tests {
             commands_ready: false,
             commands_retry: Instant::now(),
             outbox: VecDeque::new(),
+            browser: None,
         }
     }
     fn question(id: &str, freeform: bool) -> Question {
@@ -1399,6 +1484,103 @@ mod tests {
         assert!(worker.callback_key(&callback).is_none());
     }
     #[test]
+    fn browser_answers_require_the_delivered_request_and_its_message() {
+        let mut worker = worker();
+        let mut request = pending(Interaction::allow());
+        request.session.interaction_data = request.interaction.clone();
+        let key = request.session.approval_key().unwrap();
+        let state = monitor::State {
+            sessions: vec![request.session.clone()],
+            ..Default::default()
+        };
+        let data = format!("{}:0", request.nonce);
+        worker.pending.insert(key.clone(), request);
+        let mut browser = sessions::Browser::new().unwrap();
+        browser.message = Some(77);
+        let list = browser.content(&state, &worker.pending);
+        let select = list["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row.as_array().unwrap())
+            .find_map(|button| {
+                let data = button["callback_data"].as_str()?;
+                data.contains(":s:").then_some(data)
+            })
+            .unwrap();
+        browser.navigate(77, select).unwrap();
+        let detail = browser.content(&state, &worker.pending);
+        worker.browser = Some(browser);
+        let callback = json!({"from":{"id":42},"message":{"chat":{"id":42,"type":"private"},"message_id":77},"data":data});
+        assert!(worker.callback_key(&callback).is_none());
+        worker.browser.as_mut().unwrap().commit(detail);
+        assert_eq!(worker.callback_key(&callback), Some((key.clone(), 0)));
+        let mut wrong_message = callback.clone();
+        wrong_message["message"]["message_id"] = json!(78);
+        assert!(worker.callback_key(&wrong_message).is_none());
+        worker.pending.get_mut(&key).unwrap().nonce = "next-step".into();
+        assert!(worker.callback_key(&callback).is_none());
+    }
+    #[test]
+    fn chat_text_targets_selected_session_but_explicit_reply_remains_an_answer() {
+        let mut worker = worker();
+        let mut request = pending(Interaction {
+            actions: vec![],
+            questions: vec![question("one", true)],
+        });
+        request.session.interaction_data = request.interaction.clone();
+        request.message = Some(50);
+        let state = monitor::State {
+            sessions: vec![request.session.clone()],
+            ..Default::default()
+        };
+        let (tx, mut commands) = tokio::sync::mpsc::channel(8);
+        let (_, snapshots) = tokio::sync::watch::channel(std::sync::Arc::new(state.clone()));
+        worker.monitor = monitor::Handle {
+            tx,
+            state: snapshots,
+        };
+        worker
+            .pending
+            .insert(request.session.approval_key().unwrap(), request);
+        let mut browser = sessions::Browser::new().unwrap();
+        browser.message = Some(77);
+        let list = browser.content(&state, &worker.pending);
+        let select = list["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row.as_array().unwrap())
+            .find_map(|button| {
+                button["callback_data"]
+                    .as_str()
+                    .filter(|data| data.contains(":s:"))
+            })
+            .unwrap();
+        browser.navigate(77, select).unwrap();
+        worker.browser = Some(browser);
+        worker.update(&json!({"message":{"message_id":100,"from":{"id":42},"chat":{"id":42,"type":"private"},"text":"Continue with tests"}}));
+        let monitor::Command::SendMessage { id, session, text } = commands.try_recv().unwrap()
+        else {
+            panic!("message command expected")
+        };
+        assert_eq!(id, "telegram:42:100");
+        assert_eq!(session, "codex:session");
+        assert_eq!(text, "Continue with tests");
+        worker.update(&json!({"message":{"message_id":101,"from":{"id":42},"chat":{"id":42,"type":"private"},"reply_to_message":{"message_id":50},"text":"My custom answer"}}));
+        let monitor::Command::Submit { response, .. } = commands.try_recv().unwrap() else {
+            panic!("answer command expected")
+        };
+        assert_eq!(
+            response,
+            Response::Answers(BTreeMap::from([(
+                "one".into(),
+                vec!["My custom answer".into()]
+            )]))
+        );
+        assert!(commands.try_recv().is_err());
+    }
+    #[test]
     fn structured_questions_collect_all_answers_and_invalidate_previous_buttons() {
         let mut request = pending(Interaction {
             actions: vec![],
@@ -1530,34 +1712,16 @@ mod tests {
         assert_eq!(bot_command("/start", "my_bot"), Some(BotCommand::Help));
         assert_eq!(bot_command("/sessions@other_bot", "my_bot"), None);
         assert_eq!(bot_command("ordinary answer", "my_bot"), None);
-        assert_eq!(command_keyboard()["keyboard"][0][0]["text"], "/sessions");
-    }
-    #[test]
-    fn session_list_includes_idle_sessions_groups_sorts_and_paginates() {
-        let mut a = session();
-        a.title = "Zulu".into();
-        a.approval = None;
-        a.activity = Activity::Idle;
-        let mut b = a.clone();
-        b.title = "Alpha".into();
-        b.activity = Activity::Working;
-        let text = session_messages(&[a.clone(), b]).join("\n");
-        assert!(text.contains("Terminal"));
-        assert!(text.contains("Idle"));
-        assert!(text.contains("Working"));
-        assert!(text.find("Alpha").unwrap() < text.find("Zulu").unwrap());
-        assert_eq!(session_messages(&[]), vec!["No open agent sessions."]);
-        a.title = "🤖".repeat(200);
-        let pages = session_messages(&vec![a; 100]);
-        assert!(pages.len() > 1);
-        assert!(pages.iter().all(|page| page.encode_utf16().count() <= 3900));
         assert_eq!(
-            pages
-                .iter()
-                .map(|page| page.matches("• ").count())
-                .sum::<usize>(),
-            100
+            bot_command("Sessions", "my_bot"),
+            Some(BotCommand::Sessions)
         );
+        assert_eq!(bot_command("Status", "my_bot"), Some(BotCommand::Status));
+        assert_eq!(bot_command("Help", "my_bot"), Some(BotCommand::Help));
+        assert_eq!(bot_command("Sessions in this project", "my_bot"), None);
+        assert_eq!(command_keyboard()["keyboard"][0][0]["text"], "Sessions");
+        assert_eq!(command_keyboard()["keyboard"][0][1]["text"], "Status");
+        assert_eq!(command_keyboard()["keyboard"][1][0]["text"], "Help");
     }
     #[test]
     fn paused_notifications_allow_paired_commands_but_not_answers() {

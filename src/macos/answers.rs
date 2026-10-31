@@ -16,6 +16,10 @@ use std::{
     collections::BTreeMap,
 };
 
+// Native focus rings extend outside control frames; leave room inside the clip view.
+const FORM_INSET: f64 = 6.0;
+const FIELD_WIDTH: f64 = 472.0 - 2.0 * FORM_INSET;
+
 struct Input {
     question: Question,
     choice: Option<Retained<NSPopUpButton>>,
@@ -33,7 +37,7 @@ pub struct State {
 }
 define_class!(
     // SAFETY: NSObject subclass confined to the UI thread; weak action/delegate
-    // targets are retained in FORMS until after the window-close callback.
+    // targets are retained by the menu controller until after the window-close callback.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[ivars = State]
@@ -104,13 +108,13 @@ fn text(
     let height = label
         .cell()
         .map(|cell| {
-            cell.cellSizeForBounds(rect(0.0, 0.0, 472.0, 100000.0))
+            cell.cellSizeForBounds(rect(0.0, 0.0, FIELD_WIDTH, 100000.0))
                 .height
                 .ceil()
         })
         .unwrap_or(24.0)
         .max(20.0);
-    label.setFrame(rect(0.0, y, 472.0, height));
+    label.setFrame(rect(FORM_INSET, y, FIELD_WIDTH, height));
     label.setSelectable(true);
     view.addSubview(&label);
     height
@@ -215,7 +219,7 @@ pub fn show_with_draft(
         let choice = if !question.choices.is_empty() {
             let popup = NSPopUpButton::initWithFrame_pullsDown(
                 NSPopUpButton::alloc(mtm),
-                rect(0.0, y, 472.0, 28.0),
+                rect(FORM_INSET, y, FIELD_WIDTH, 28.0),
                 false,
             );
             popup.addItemWithTitle(ns_string!("Choose an answer…"));
@@ -233,11 +237,14 @@ pub fn show_with_draft(
             let field: Retained<NSTextField> = if question.secret {
                 NSSecureTextField::initWithFrame(
                     NSSecureTextField::alloc(mtm),
-                    rect(0.0, y, 472.0, 28.0),
+                    rect(FORM_INSET, y, FIELD_WIDTH, 28.0),
                 )
                 .into_super()
             } else {
-                NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(0.0, y, 472.0, 28.0))
+                NSTextField::initWithFrame(
+                    NSTextField::alloc(mtm),
+                    rect(FORM_INSET, y, FIELD_WIDTH, 28.0),
+                )
             };
             field.setPlaceholderString(Some(if choice.is_some() {
                 ns_string!("Or type your own answer")
@@ -314,7 +321,7 @@ pub fn show_with_draft(
     status.setFont(Some(&NSFont::systemFontOfSize(11.0)));
     content.addSubview(&status);
     form.ivars().status.set(status).unwrap();
-    // SAFETY: Implemented selectors; FORMS retains their weak target.
+    // SAFETY: Implemented selectors; the menu controller retains their weak target.
     let submit = unsafe {
         NSButton::buttonWithTitle_target_action(
             ns_string!("Send answer"),

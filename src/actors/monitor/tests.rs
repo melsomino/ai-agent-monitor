@@ -499,3 +499,129 @@ async fn rapid_application_changes_survive_stale_persistence_acknowledgements() 
     assert!(!updated.preferences.applications.enabled(Client::VSCode));
     assert!(!updated.preferences.applications.enabled(Client::Terminal));
 }
+
+#[tokio::test]
+async fn sending_chat_text_is_idempotent_and_delivery_is_published_in_state() {
+    let mut h = Harness::new();
+    let s = session("one", "request");
+    h.observe(vec![s.clone()]).await;
+    h.wait(|state| state.sessions.len() == 1).await;
+    for _ in 0..2 {
+        h.handle
+            .enqueue(Command::SendMessage {
+                id: "telegram:42:7".into(),
+                session: s.key(),
+                text: "Continue with the tests".into(),
+            })
+            .await
+            .unwrap();
+    }
+    h.wait(|state| {
+        state
+            .message_sends
+            .get("telegram:42:7")
+            .is_some_and(|send| send.status == MessageStatus::Sending)
+    })
+    .await;
+    let Some(AgentCommand::SendMessage {
+        id,
+        session: target,
+        text,
+    }) = h.agents.recv().await
+    else {
+        panic!("expected a message operation")
+    };
+    assert_eq!(target.key(), s.key());
+    assert_eq!(text, "Continue with the tests");
+    assert!(h.agents.try_recv().is_err());
+    h.handle
+        .enqueue(Command::MessageSent {
+            id: id.clone(),
+            session: "codex:other".into(),
+            result: Ok(()),
+        })
+        .await
+        .unwrap();
+    h.handle
+        .enqueue(Command::MessageSent {
+            id,
+            session: s.key(),
+            result: Ok(()),
+        })
+        .await
+        .unwrap();
+    h.wait(|state| {
+        state
+            .message_sends
+            .get("telegram:42:7")
+            .is_some_and(|send| send.status == MessageStatus::Sent)
+    })
+    .await;
+}
+#[tokio::test]
+async fn stale_empty_and_disconnected_chat_messages_never_reach_an_agent() {
+    let mut h = Harness::new();
+    let mut s = session("one", "request");
+    s.authoritative = false;
+    h.observe(vec![s.clone()]).await;
+    h.wait(|state| state.sessions.len() == 1).await;
+    for (id, target, text) in [
+        ("stale", "codex:gone", "Hello"),
+        ("empty", "codex:one", "  "),
+        ("disconnected", "codex:one", "Hello"),
+    ] {
+        h.handle
+            .enqueue(Command::SendMessage {
+                id: id.into(),
+                session: target.into(),
+                text: text.into(),
+            })
+            .await
+            .unwrap();
+    }
+    h.wait(|state| state.message_sends.len() == 3).await;
+    assert!(
+        h.handle
+            .snapshot()
+            .message_sends
+            .values()
+            .all(|send| matches!(send.status, MessageStatus::Failed(_)))
+    );
+    assert!(h.agents.try_recv().is_err());
+}
+#[tokio::test]
+async fn adapter_failure_clears_inflight_chat_sending_status() {
+    let h = Harness::new();
+    let s = session("one", "request");
+    h.observe(vec![s.clone()]).await;
+    h.wait(|state| state.sessions.len() == 1).await;
+    h.handle
+        .enqueue(Command::SendMessage {
+            id: "message".into(),
+            session: s.key(),
+            text: "Hello".into(),
+        })
+        .await
+        .unwrap();
+    h.wait(|state| {
+        state
+            .message_sends
+            .get("message")
+            .is_some_and(|send| send.status == MessageStatus::Sending)
+    })
+    .await;
+    h.handle
+        .enqueue(Command::AgentStopped {
+            source: "codex",
+            error: "Disconnected".into(),
+        })
+        .await
+        .unwrap();
+    h.wait(|state| {
+        state
+            .message_sends
+            .get("message")
+            .is_some_and(|send| matches!(send.status, MessageStatus::Failed(_)))
+    })
+    .await;
+}

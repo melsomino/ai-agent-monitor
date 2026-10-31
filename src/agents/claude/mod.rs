@@ -76,10 +76,7 @@ impl SessionProvider for Claude {
         crate::agents::history::jsonl(
             &path,
             before,
-            session
-                .approval
-                .is_none()
-                .then_some(session.last_message.as_str()),
+            Some(session.last_message.as_str()),
             crate::agents::history::claude,
         )
     }

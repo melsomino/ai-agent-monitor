@@ -28,7 +28,7 @@ Hooks from another copy of this app bundle are migrated to the current executabl
 
 Launching directly from `/Volumes` or App Translocation displays installation instructions and exits before acquiring the resident lock or writing hooks. The user must drag the bundle to a stable location such as Applications first.
 
-The `dmg` command packages the current executable, ad-hoc signs the bundle, creates a compressed read-only disk image with an Applications shortcut, and writes a SHA-256 checksum. Asset names identify the native architecture; no universal-binary claim is made.
+The `dmg` command packages the current executable, signs the bundle using the configured identity, creates a compressed read-only disk image with an Applications shortcut, and writes a SHA-256 checksum. Asset names identify the native architecture; no universal-binary claim is made. `bundle` and `dmg` default to Developer ID identity `-`, with `--options runtime --timestamp`, and verify the result with `codesign --verify --strict`. `AI_AGENT_MONITOR_SIGN_IDENTITY` overrides the identity; `-` explicitly selects ad-hoc signing without a timestamp. Signing does not perform notarization.
 
 ## Codex discovery
 
@@ -110,7 +110,7 @@ Cline's public `pressPrimaryButton()` API does not identify a specific task or r
 
 The settings window uses an `NSTabViewController` with a native preferences toolbar. General preferences, the global shortcut, and the observed application catalog are saved in the app's `NSUserDefaults` domain. Application IDs are independent of display names; discovery updates names and icons without resetting visibility. Closed and disabled applications remain in the catalog. Visibility changes are per-application Monitor commands; persistence acknowledgements do not replace newer catalog state. Global shortcut registration follows arriving preference snapshots, including delayed startup preferences.
 
-Application switches filter the window's sessions, alongside the title query. They do not delete session state, disable providers, or suppress notifications and the menu bar activity indicator.
+Application switches filter the window's sessions, alongside the title query. They also filter the green working count and its activity animation. They do not delete session state, disable providers, or suppress notifications and the pending-request badge. Title queries only filter the list.
 
 Codex quota is derived from the newest valid `token_count.rate_limits` report in recent local transcripts, cached for ten seconds. It displays `100 − used_percent`, with no network account query. Expired windows display `—` until a new report arrives. Reading quota or session state does not invoke a model.
 

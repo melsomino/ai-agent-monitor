@@ -161,14 +161,7 @@ impl SessionProvider for Cline {
             .into_iter()
             .find(|path| path.is_file())
             .ok_or_else(|| anyhow::anyhow!("Task history is unavailable"))?;
-        crate::agents::history::cline(
-            &path,
-            before,
-            session
-                .approval
-                .is_none()
-                .then_some(session.last_message.as_str()),
-        )
+        crate::agents::history::cline(&path, before, Some(session.last_message.as_str()))
     }
 
     #[cfg(test)]

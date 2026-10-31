@@ -5,6 +5,17 @@ pub enum Submission {
     Reconciling,
     Failed(String),
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageStatus {
+    Sending,
+    Sent,
+    Failed(String),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageSend {
+    pub session: String,
+    pub status: MessageStatus,
+}
 #[derive(Clone, Default)]
 pub struct History {
     pub messages: Vec<crate::domain::history::Message>,
@@ -29,6 +40,7 @@ pub struct State {
     pub revision: u64,
     pub sessions: Vec<Session>,
     pub submissions: HashMap<String, Submission>,
+    pub message_sends: HashMap<String, MessageSend>,
     pub history: HashMap<String, Arc<History>>,
     pub hooks: HashMap<String, HookState>,
     pub notices: Vec<Notice>,

@@ -49,12 +49,11 @@ async fn present_button(binding: Binding, index: usize, monitor: &monitor::Handl
                 eprintln!("ai-agent-monitor: {error}");
             }
         }
-        Some(kind) => {
-            let form = matches!(kind, Kind::Form | Kind::More | Kind::Text);
+        Some(_) => {
             let _ = ui
                 .send(Event::ShowRequest {
                     session: Box::new(binding.session),
-                    form,
+                    form: false,
                     draft: None,
                 })
                 .await;
@@ -171,8 +170,7 @@ pub async fn run(
                             submit_reply(&monitor, &binding.session, response).await;
                         } else { present_button(binding, index, &monitor, &ui).await; }
                     } else if event.action == unsafe { UNNotificationDefaultActionIdentifier.to_string() } {
-                        let form = !binding.session.interaction().questions.is_empty();
-                        let _ = ui.try_send(Event::ShowRequest { session: Box::new(binding.session), form, draft: None });
+                        let _ = ui.try_send(Event::ShowRequest { session: Box::new(binding.session), form: false, draft: None });
                     }
                 } else if event.action == unsafe { UNNotificationDefaultActionIdentifier.to_string() } {
                     let _ = ui.try_send(Event::Platform(crate::macos::bridge::PlatformCommand::Open(event.target)));
@@ -224,6 +222,44 @@ mod tests {
             }),
         }
     }
+    #[tokio::test]
+    async fn question_answer_button_opens_menu_without_submitting_or_showing_a_form() {
+        use crate::domain::interaction::Question;
+        let mut session = session();
+        session.interaction_data.questions = vec![
+            Question {
+                id: "one".into(),
+                title: "First?".into(),
+                choices: vec![],
+                freeform: true,
+                secret: false,
+            },
+            Question {
+                id: "two".into(),
+                title: "Second?".into(),
+                choices: vec![],
+                freeform: true,
+                secret: false,
+            },
+        ];
+        let binding = Binding {
+            plan: Plan::new(&session.interaction()),
+            session: session.clone(),
+        };
+        assert!(matches!(binding.plan.buttons[0].kind, Kind::Form));
+        let (tx, mut commands) = tokio::sync::mpsc::channel(4);
+        let monitor = monitor::Handle {
+            tx,
+            state: tokio::sync::watch::channel(std::sync::Arc::new(monitor::State::default())).1,
+        };
+        let (ui, mut events) = tokio::sync::mpsc::channel(4);
+        present_button(binding, 0, &monitor, &ui).await;
+        assert!(
+            matches!(events.try_recv(), Ok(Event::ShowRequest { session: shown, form: false, draft: None }) if shown.key() == session.key())
+        );
+        assert!(commands.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn notification_reply_waits_for_capacity_without_losing_the_answer() {
         use std::future::Future;

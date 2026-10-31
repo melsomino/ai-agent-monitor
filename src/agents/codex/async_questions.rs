@@ -6,6 +6,9 @@ fn item(value: &Value) -> Value {
     let mut result = json!({"type":value["type"],"id":value["id"],"questions":value["questions"]});
     if value["type"] == "userMessage" {
         result["content"] = value["content"].clone();
+    } else if value["type"] == "steeringUserMessage" {
+        result["input"] = value["input"].clone();
+        result["status"] = value["status"].clone();
     }
     result
 }
@@ -73,7 +76,7 @@ pub fn project_patch(path: &[Value], value: &Value) -> Option<Value> {
             if field == "items"
                 && matches!(
                     attribute.as_str(),
-                    Some("type" | "id" | "questions" | "content")
+                    Some("type" | "id" | "questions" | "content" | "input" | "status")
                 ) =>
         {
             Some(value.clone())
@@ -84,11 +87,11 @@ pub fn project_patch(path: &[Value], value: &Value) -> Option<Value> {
 
 pub fn pending(state: &Value) -> Option<Value> {
     let history = state["turnHistory"]["history"]["entitiesByKey"].as_object();
-    let unique: std::collections::BTreeMap<_, _> = state["turns"]
-        .as_array()
+    // The active turn wins over an older cached copy in history.
+    let unique: std::collections::BTreeMap<_, _> = history
         .into_iter()
-        .flatten()
-        .chain(history.into_iter().flat_map(|map| map.values()))
+        .flat_map(|map| map.values())
+        .chain(state["turns"].as_array().into_iter().flatten())
         .filter_map(|turn| Some((turn["turnId"].as_str()?, turn)))
         .collect();
     let mut turns: Vec<_> = unique.values().copied().collect();
@@ -98,12 +101,12 @@ pub fn pending(state: &Value) -> Option<Value> {
             .cmp(&b["turnStartedAtMs"].as_u64())
             .then_with(|| a["turnId"].as_str().cmp(&b["turnId"].as_str()))
     });
-    let latest = *turns.last()?;
     let mut questions = Vec::new();
     for turn in turns {
         for item in turn["items"].as_array().into_iter().flatten() {
-            if item["type"] == "userMessage" {
-                let text = item["content"]
+            let steering = item["type"] == "steeringUserMessage";
+            if item["type"] == "userMessage" || (steering && item["status"] == "accepted") {
+                let text = item[if steering { "input" } else { "content" }]
                     .as_array()
                     .into_iter()
                     .flatten()
@@ -113,7 +116,7 @@ pub fn pending(state: &Value) -> Option<Value> {
                 if let Some(replies) = reply_ids(&text) {
                     questions
                         .retain(|question: &Value| !replies.iter().any(|id| question["id"] == *id));
-                } else {
+                } else if !steering {
                     questions.clear();
                 }
             } else if item["type"] == "agentMessage" {
@@ -148,9 +151,17 @@ pub fn pending(state: &Value) -> Option<Value> {
     if questions.is_empty() {
         return None;
     }
-    Some(
-        json!({"method":METHOD,"id":latest["turnId"],"params":{"threadId":state["id"],"turnId":latest["turnId"],"questions":questions}}),
+    // Starting the answer turn can arrive before its user message. Keep the
+    // interaction identity tied to the questions, not that transient turn.
+    // Reply routing uses the owner's fresh runtime state in reply_envelope.
+    let id = serde_json::to_string(
+        &questions
+            .iter()
+            .map(|question| &question["id"])
+            .collect::<Vec<_>>(),
     )
+    .ok()?;
+    Some(json!({"method":METHOD,"id":id,"params":{"threadId":state["id"],"questions":questions}}))
 }
 fn reply_ids(text: &str) -> Option<Vec<String>> {
     let data = text
@@ -232,6 +243,64 @@ mod tests {
                 .get("text")
                 .is_none()
         );
+    }
+    #[test]
+    fn only_accepted_steering_answers_resolve_the_question() {
+        let mut state = state();
+        let request = pending(&project(&state)).unwrap();
+        let id = request["params"]["questions"][0]["id"].as_str().unwrap();
+        let text = format!(
+            "<send_user_message_question_reply>{}</send_user_message_question_reply>",
+            json!([{"questionItemId":id,"answer":"A"}])
+        );
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:one"]["items"].as_array_mut().unwrap()
+            .push(json!({"type":"steeringUserMessage","id":"reply","status":"pending","input":[{"type":"text","text":text}]}));
+        for status in ["pending", "rejected", "failed"] {
+            state["turnHistory"]["history"]["entitiesByKey"]["turn:one"]["items"][3]["status"] =
+                json!(status);
+            assert_eq!(pending(&project(&state)), Some(request.clone()));
+        }
+        state["turnHistory"]["history"]["entitiesByKey"]["turn:one"]["items"][3]["status"] =
+            json!("accepted");
+        assert!(pending(&project(&state)).is_none());
+    }
+    #[test]
+    fn current_turn_does_not_revive_a_question_from_its_cached_history_copy() {
+        let mut state = state();
+        let request = pending(&project(&state)).unwrap();
+        let id = request["params"]["questions"][0]["id"].as_str().unwrap();
+        let text = format!(
+            "<send_user_message_question_reply>{}</send_user_message_question_reply>",
+            json!([{"questionItemId":id,"answer":"A"}])
+        );
+        let mut active = state["turnHistory"]["history"]["entitiesByKey"]["turn:one"].clone();
+        active["items"].as_array_mut().unwrap().push(json!({"type":"steeringUserMessage","id":"reply","status":"accepted","input":[{"type":"text","text":text}]}));
+        state["turns"] = json!([active]);
+        assert!(pending(&project(&state)).is_none());
+    }
+    #[test]
+    fn answer_turn_keeps_question_identity_until_its_reply_arrives() {
+        let mut state = state();
+        let request = pending(&project(&state)).unwrap();
+        state["threadRuntimeStatus"] = json!({"type":"active","activeFlags":[]});
+        state["turns"] = json!([{"turnId":"two","turnStartedAtMs":2,"items":[]}]);
+        assert_eq!(pending(&project(&state)), Some(request.clone()));
+
+        let id = request["params"]["questions"][0]["id"].as_str().unwrap();
+        let text = format!(
+            "<send_user_message_question_reply>{}</send_user_message_question_reply>",
+            json!([{"questionItemId":id,"answer":"A"}])
+        );
+        state["turns"][0]["items"] =
+            json!([{"type":"userMessage","id":"reply","content":[{"type":"text","text":text}]}]);
+        assert!(pending(&project(&state)).is_none());
+
+        state["turns"][0]["items"].as_array_mut().unwrap().push(
+            json!({"type":"agentMessage","id":"call_new","questions":[{"title":"Pick?","options":["A","B"]}]}),
+        );
+        let next = pending(&project(&state)).unwrap();
+        assert_ne!(next["id"], request["id"]);
+        assert_eq!(next["params"]["questions"][0]["question"], "Pick?");
     }
     #[test]
     fn a_new_turn_or_later_user_input_clears_the_prompt_instead_of_reviving_history() {
