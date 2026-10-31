@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleIdentifier</key><string>local.codex.agent-monitor.notify</string>
+<key>CFBundleIdentifier</key><string>com.melsomino.ai-agent-monitor</string>
 <key>CFBundleName</key><string>AI Agent Monitor</string>
 <key>CFBundleDisplayName</key><string>AI Agent Monitor</string>
 <key>CFBundleExecutable</key><string>AIAgentMonitor</string>

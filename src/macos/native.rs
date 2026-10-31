@@ -244,6 +244,7 @@ pub fn run(command: NativeCommand) -> Result<()> {
     let app: Retained<MonitorApplication> =
         unsafe { msg_send![MonitorApplication::class(), sharedApplication] };
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    crate::macos::settings::migrate_legacy_preferences();
     if let NativeCommand::OpenTarget(target) = &command {
         if !open_target(target) {
             bail!("VS Code could not open this target");

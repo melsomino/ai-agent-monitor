@@ -85,6 +85,8 @@ struct Config {
     offset: i64,
     #[serde(default)]
     messages: Vec<i64>,
+    #[serde(default)]
+    selected_session: Option<String>,
 }
 fn config_path() -> std::path::PathBuf {
     core::home().join("Library/Application Support/AI Agent Monitor/telegram.json")
@@ -446,6 +448,9 @@ impl Worker {
         // Old inline buttons never regain authority after a resident restart.
         if !worker.token.is_empty() {
             worker.retire_all("Monitor restarted. Use the latest request message.");
+            if let Err(error) = worker.restore_browser() {
+                worker.note(&error.to_string());
+            }
         }
         worker
     }
@@ -535,6 +540,32 @@ impl Worker {
         if persist(&self.config).is_err() {
             self.note("Could not save Telegram settings.");
         }
+    }
+    fn remember_selection(&mut self) {
+        let selected = self
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.current_session())
+            .map(str::to_owned);
+        if self.config.selected_session == selected {
+            return;
+        }
+        self.config.selected_session = selected;
+        // No bot means no active conversation to persist (also keeps offline
+        // transport tests from touching a user's real Telegram configuration).
+        if !self.token.is_empty() {
+            self.save();
+        }
+    }
+    fn restore_browser(&mut self) -> Result<()> {
+        if self.browser.is_none()
+            && self.config.user.is_some()
+            && self.config.chat.is_some()
+            && let Some(session) = &self.config.selected_session
+        {
+            self.browser = Some(sessions::Browser::resume(session.clone())?);
+        }
+        Ok(())
     }
     fn edit(&self, pending: &Pending) -> Result<()> {
         edit_pending(&self.token, self.config.chat, pending)
@@ -991,7 +1022,6 @@ impl Worker {
                 "setMyCommands",
                 json!({"scope":{"type":"chat","chat_id":chat},"commands":[
                     {"command":"sessions","description":"List all open agent sessions"},
-                    {"command":"status","description":"Show monitor and notification status"},
                     {"command":"info","description":"Show the selected session folder and Git branch"},
                     {"command":"help","description":"Show available commands"}
                 ]}),
@@ -1021,6 +1051,7 @@ impl Worker {
                     self.finish(old, "Session list refreshed.");
                 }
                 self.browser = Some(browser);
+                self.remember_selection();
                 return Ok(());
             }
             BotCommand::Info => {
@@ -1102,22 +1133,37 @@ impl Worker {
                     );
                 }
             }
-            if message["reply_to_message"].is_null()
-                && !text.trim().is_empty()
-                && let Some(session) = self
-                    .browser
-                    .as_ref()
-                    .and_then(|browser| browser.current_session())
-                    .map(str::to_owned)
-                && let Some(message_id) = message["message_id"].as_i64().filter(|id| *id > 0)
-            {
+            if message["reply_to_message"].is_null() && !text.trim().is_empty() {
+                let session = self.config.selected_session.clone().or_else(|| {
+                    self.browser
+                        .as_ref()
+                        .and_then(|browser| browser.current_session())
+                        .map(str::to_owned)
+                });
+                let Some(session) = session else {
+                    self.outbox.push_back(
+                        "No session selected. Open Sessions and choose where to send your message."
+                            .into(),
+                    );
+                    return;
+                };
+                if let Err(error) = self.restore_browser() {
+                    self.note(&error.to_string());
+                }
+                let Some(message_id) = message["message_id"].as_i64().filter(|id| *id > 0) else {
+                    return;
+                };
                 let id = format!("telegram:{chat}:{message_id}");
                 match self.monitor.send(monitor::Command::SendMessage {
                     id: id.clone(),
                     session,
                     text: text.to_owned(),
                 }) {
-                    Ok(()) => self.browser.as_mut().unwrap().track_send(id),
+                    Ok(()) => {
+                        if let Some(browser) = self.browser.as_mut() {
+                            browser.track_send(id);
+                        }
+                    }
                     Err(error) => self.outbox.push_back(error),
                 }
             }
@@ -1142,6 +1188,7 @@ impl Worker {
                 Ok(None)
             };
             if matches!(&navigation, Ok(Some(true))) {
+                self.remember_selection();
                 let snapshot = self.monitor.snapshot();
                 let history = self
                     .browser
@@ -1276,7 +1323,7 @@ fn bot_command(text: &str, username: &str) -> Option<BotCommand> {
     }
 }
 fn command_keyboard() -> Value {
-    json!({"keyboard":[[{"text":"Sessions"},{"text":"Status"}],[{"text":"Help"}]],
+    json!({"keyboard":[[{"text":"Sessions"},{"text":"Help"}]],
         "resize_keyboard":true,"is_persistent":true,"input_field_placeholder":"Choose a command or reply to a question"})
 }
 fn pairing_matches(user: i64, chat: i64, kind: &str, text: &str, code: &str, valid: bool) -> bool {
@@ -1674,6 +1721,116 @@ mod tests {
         assert!(commands.try_recv().is_err());
     }
     #[test]
+    fn another_sessions_request_and_answer_keep_chat_text_targeting_the_selected_session() {
+        let mut worker = worker();
+        let mut current = session();
+        current.title = "Current session".into();
+        current.approval = None;
+        current.interaction_data = Interaction::default();
+        let current_key = current.key();
+        let mut other = pending(Interaction::allow());
+        other.session.id = "other".into();
+        other.session.title = "Other session".into();
+        other.session.approval.as_mut().unwrap().id = "other-request".into();
+        other.session.interaction_data = other.interaction.clone();
+        let other_key = other.session.approval_key().unwrap();
+        let state = monitor::State {
+            sessions: vec![current, other.session.clone()],
+            ..Default::default()
+        };
+        let (tx, mut commands) = tokio::sync::mpsc::channel(8);
+        let (_, snapshots) = tokio::sync::watch::channel(std::sync::Arc::new(state.clone()));
+        worker.monitor = monitor::Handle {
+            tx,
+            state: snapshots,
+        };
+        let mut browser = sessions::Browser::new().unwrap();
+        browser.message = Some(77);
+        let list = browser.content(&state, &worker.pending);
+        let select = list["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row.as_array().unwrap())
+            .find(|button| button["text"].as_str().unwrap().contains("Current session"))
+            .unwrap()["callback_data"]
+            .as_str()
+            .unwrap();
+        browser.navigate(77, select).unwrap();
+        let detail = browser.content(&state, &worker.pending);
+        browser.commit(detail);
+        worker.browser = Some(browser);
+        worker.event(Event::Observe(Box::new(other.session)));
+        assert_eq!(worker.next_request_message(), Some(other_key.clone()));
+        worker.pending.get_mut(&other_key).unwrap().message = Some(99);
+        worker.flush_browser_with(&state, |_, _| Ok(json!({"message_id":77})));
+        assert_eq!(
+            worker.browser.as_ref().unwrap().current_session(),
+            Some(current_key.as_str())
+        );
+        worker.answer(&other_key, Some(0), None).unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            monitor::Command::Submit { .. }
+        ));
+        worker.update(&json!({"message":{"message_id":100,"from":{"id":42},"chat":{"id":42,"type":"private"},"text":"Keep working here"}}));
+        let monitor::Command::SendMessage { session, text, .. } = commands.try_recv().unwrap()
+        else {
+            panic!("message command expected")
+        };
+        assert_eq!(session, current_key);
+        assert_eq!(text, "Keep working here");
+    }
+
+    #[test]
+    fn restored_selection_survives_presentation_loss_and_routes_plain_text() {
+        let mut worker = worker();
+        let key = session().key();
+        worker.config.selected_session = Some(key.clone());
+        // A process restart deserializes the selected key, not old callback IDs.
+        worker.config =
+            serde_json::from_value(serde_json::to_value(&worker.config).unwrap()).unwrap();
+        worker.restore_browser().unwrap();
+        assert_eq!(
+            worker.browser.as_ref().unwrap().current_session(),
+            Some(key.as_str())
+        );
+        assert!(worker.browser.as_ref().unwrap().message.is_none());
+        worker.browser = None;
+        let (tx, mut commands) = tokio::sync::mpsc::channel(8);
+        worker.monitor.tx = tx;
+        worker.update(&json!({"message":{"message_id":101,"from":{"id":42},"chat":{"id":42,"type":"private"},"text":"Continue in my session"}}));
+        let monitor::Command::SendMessage { session, text, .. } = commands.try_recv().unwrap()
+        else {
+            panic!("message expected")
+        };
+        assert_eq!(session, key);
+        assert_eq!(text, "Continue in my session");
+        assert!(worker.browser.is_some());
+        // Explicitly opening Sessions clears the target; arbitrary text is never lost silently.
+        worker.command(BotCommand::Sessions).unwrap();
+        assert!(worker.config.selected_session.is_none());
+        worker.update(&json!({"message":{"message_id":102,"from":{"id":42},"chat":{"id":42,"type":"private"},"text":"No target"}}));
+        assert!(commands.try_recv().is_err());
+        assert!(
+            worker
+                .outbox
+                .back()
+                .unwrap()
+                .contains("No session selected")
+        );
+    }
+
+    #[test]
+    fn old_telegram_configuration_without_selection_still_loads() {
+        let config: Config = serde_json::from_value(
+            json!({"enabled":true,"user":42,"chat":42,"username":"bot","offset":0,"messages":[]}),
+        )
+        .unwrap();
+        assert!(config.selected_session.is_none());
+    }
+
+    #[test]
     fn question_payload_formats_body_and_preserves_exact_button_captions() {
         let mut request = pending(Interaction::allow());
         request.session.title = "Chat 🤖".into();
@@ -2003,6 +2160,7 @@ mod tests {
             username: "my_bot".into(),
             offset: 100,
             messages: vec![1, 2],
+            selected_session: Some("codex:current".into()),
         };
         let value = serde_json::to_value(&config).unwrap();
         assert!(value.get("token").is_none());
@@ -2065,8 +2223,7 @@ mod tests {
         assert_eq!(bot_command("Help", "my_bot"), Some(BotCommand::Help));
         assert_eq!(bot_command("Sessions in this project", "my_bot"), None);
         assert_eq!(command_keyboard()["keyboard"][0][0]["text"], "Sessions");
-        assert_eq!(command_keyboard()["keyboard"][0][1]["text"], "Status");
-        assert_eq!(command_keyboard()["keyboard"][1][0]["text"], "Help");
+        assert_eq!(command_keyboard()["keyboard"][0][1]["text"], "Help");
     }
     #[test]
     fn paused_notifications_allow_paired_commands_but_not_answers() {

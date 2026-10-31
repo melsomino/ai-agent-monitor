@@ -76,15 +76,6 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn agent_label(&self) -> &str {
-        match self.agent {
-            "codex" => "Codex",
-            "claude" => "Claude Code",
-            "cline" => "Cline",
-            other => other,
-        }
-    }
-
     pub fn project_path(&self) -> &Path {
         self.workspace.as_deref().unwrap_or(&self.cwd)
     }

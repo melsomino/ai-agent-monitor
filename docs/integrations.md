@@ -16,7 +16,7 @@ AI Agent Monitor uses Rust with AppKit, UserNotifications, and the system SQLite
 
 The session menu is an `NSMenu` with custom content. AppKit owns its presentation and dismissal. The main list is the only scroll region; expanded messages do not introduce nested scrolling. Pointer sampling runs in common run-loop modes so hover stays independent of the first responder and native menu tracking. Keyboard selection and pointer hover are separate states.
 
-The bundle identifier remains `local.codex.agent-monitor.notify` to preserve existing notification authorization and preferences. The bundle command writes the compiled version and build number into `Info.plist`. It creates `build/AIAgentMonitor.previous` once when replacing an existing bundled executable.
+The bundle identifier is `com.melsomino.ai-agent-monitor`. On first launch under this identity, the app copies missing preferences from `local.codex.agent-monitor.notify` without overwriting new preferences or deleting the old domain. Notification authorization is requested again; the old notification result is not copied. Application Support files, hook paths, and the existing Telegram Keychain service are retained. macOS may ask for Keychain access or other permissions again because the signed app identity has changed. The bundle command writes the compiled version and build number into `Info.plist`. It creates `build/AIAgentMonitor.previous` once when replacing an existing bundled executable.
 
 ## First-launch setup and disk images
 

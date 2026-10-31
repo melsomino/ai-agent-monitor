@@ -11,7 +11,7 @@ use crate::{
     app::core,
     macos::{
         answers, hotkey, inline_questions, motion, native, pointer, search, session_layout,
-        settings,
+        session_robot::SessionRobot, session_thread::SessionThread, settings,
     },
 };
 use anyhow::{Context, Result};
@@ -38,7 +38,7 @@ const LIST_BOTTOM_PADDING: f64 = 8.0;
 const SESSION_HOVER_PADDING: f64 = 0.0;
 const SESSION_HOVER_LEFT: f64 = 6.0;
 const SESSION_HOVER_WIDTH: f64 = 374.0;
-const SESSION_HEADER_HOVER_LEFT: f64 = 4.0;
+const SESSION_HEADER_HOVER_LEFT: f64 = SESSION_TEXT_LEFT - 8.0;
 const SESSION_HEADER_HOVER_WIDTH: f64 = 384.0 - 2.0 * SESSION_HEADER_HOVER_LEFT;
 const MESSAGE_TOP_GAP: f64 = 4.0;
 const BUTTON_HOVER_PADDING: f64 = 0.0;
@@ -682,6 +682,7 @@ struct HoverState {
     matches: OnceCell<Vec<std::ops::Range<usize>>>,
     title: OnceCell<Retained<NSTextField>>,
     arrow: OnceCell<Retained<NSImageView>>,
+    thread: OnceCell<Retained<SessionThread>>,
 }
 define_class!(
     // SAFETY: This NSView only stores its hover decoration on the main thread.
@@ -734,12 +735,7 @@ impl SessionRowView {
         }
         self.paint_title(focused);
         if let Some(arrow) = self.ivars().arrow.get() {
-            let color = if focused {
-                NSColor::selectedMenuItemTextColor()
-            } else {
-                NSColor::secondaryLabelColor()
-            };
-            arrow.setContentTintColor(Some(&color));
+            arrow.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
         }
     }
     fn paint_title(&self, focused: bool) {
@@ -892,7 +888,12 @@ fn answer_button_layout(sizes: &[NSSize], available: f64) -> (Vec<NSRect>, f64) 
     }
 }
 
+#[cfg(test)]
 fn messages_before_request(session: &Session, history: &MessageHistory) -> String {
+    earlier_messages(session, history).join("\n\n")
+}
+
+fn earlier_messages<'a>(session: &'a Session, history: &'a MessageHistory) -> Vec<&'a str> {
     let mut messages: Vec<&str> = history
         .messages
         .iter()
@@ -906,7 +907,7 @@ fn messages_before_request(session: &Session, history: &MessageHistory) -> Strin
     if session.approval.is_some() && !latest.is_empty() {
         messages.push(latest);
     }
-    messages.join("\n\n")
+    messages
 }
 
 // AppKit may re-enter controller callbacks while a window is being shown or
@@ -2305,6 +2306,10 @@ impl MenuController {
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
         scroll.setHasHorizontalScroller(false);
+        // A menu has pinned decorations and live layout updates. Elastic
+        // overscroll fights their edge constraints and makes the gutter jump.
+        scroll.setVerticalScrollElasticity(NSScrollElasticity::None);
+        scroll.setHorizontalScrollElasticity(NSScrollElasticity::None);
         scroll.setDocumentView(Some(&list));
         view.addSubview(&scroll);
         let footer = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 392.0, 36.0));
@@ -2812,6 +2817,19 @@ impl MenuController {
     fn filter_edited(&self) {
         self.ivars().filter_dirty.set(true);
         self.filter();
+        // Filtering may select its first match, but background state updates
+        // must not recreate keyboard focus after an answer has resolved.
+        if !self.ivars().filter_query.borrow().is_empty()
+            && self.ivars().keyboard_focus.borrow().is_none()
+        {
+            *self.ivars().keyboard_focus.borrow_mut() = self
+                .ivars()
+                .layout
+                .borrow()
+                .iter()
+                .find_map(|row| row.id.clone());
+            self.apply_hover(self.ivars().hovered.get());
+        }
         self.render_footer();
         self.reveal_keyboard_focus();
     }
@@ -3146,7 +3164,12 @@ impl MenuController {
                 pointer::Area {
                     x: frame.origin.x + SESSION_HEADER_HOVER_LEFT,
                     y: frame.origin.y - SESSION_HOVER_PADDING,
-                    width: SESSION_HEADER_HOVER_WIDTH,
+                    width: item
+                        .row
+                        .as_ref()
+                        .and_then(|row| row.ivars().background.get())
+                        .map(|background| background.frame().size.width)
+                        .unwrap_or(SESSION_HEADER_HOVER_WIDTH),
                     height: SESSION_HEADER_HEIGHT + SESSION_HOVER_PADDING * 2.0,
                 }
             })
@@ -3257,6 +3280,12 @@ impl MenuController {
             let frame = item.view.frame();
             item.view
                 .setFrame(rect(frame.origin.x, y, frame.size.width, height));
+            if let Some(thread) = item.row.as_ref().and_then(|row| row.ivars().thread.get()) {
+                thread.setFrame(rect(0.0, 0.0, frame.size.width, height));
+                thread.setHidden(progress <= 0.0);
+                thread.setAlphaValue(progress);
+                thread.setNeedsDisplay(true);
+            }
             if let Some(detail) = &item.detail {
                 detail.setFrame(rect(0.0, 0.0, 384.0, detail_height));
                 detail.setAlphaValue(progress);
@@ -3387,18 +3416,6 @@ impl MenuController {
         let Some(list) = self.ivars().list.get() else {
             return;
         };
-        let focused_session = self
-            .ivars()
-            .keyboard_focus
-            .borrow()
-            .as_ref()
-            .and_then(|id| {
-                self.ivars()
-                    .request_controls
-                    .borrow()
-                    .get(id)
-                    .map(|control| control.session.key())
-            });
         let panels: Vec<_> = self
             .ivars()
             .question_panels
@@ -3564,40 +3581,41 @@ impl MenuController {
                 .get(&session.key())
                 .cloned()
                 .unwrap_or_default();
-            let earlier = messages_before_request(session, &history);
-            let mut earlier_label = None;
+            let earlier = earlier_messages(session, &history);
+            let mut earlier_labels = Vec::new();
             let mut earlier_height = 0.0;
-            if is_question
-                && !earlier.is_empty()
+            if !earlier.is_empty()
                 && (is_expanded
                     || reveal
                         .get(&session.key())
                         .is_some_and(|progress| *progress > 0.0))
             {
-                let label =
-                    NSTextField::wrappingLabelWithString(&NSString::from_str(&earlier), self.mtm());
-                label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-                label.setTextColor(Some(&detail_text_color(false)));
-                label.setSelectable(true);
-                label.setMaximumNumberOfLines(0);
-                message_style(&label, &detail_text_color(false));
-                let height = label
-                    .cell()
-                    .map(|cell| {
-                        cell.cellSizeForBounds(rect(0.0, 0.0, DETAIL_WIDTH, 1000000.0))
-                            .height
-                            .ceil()
-                    })
-                    .unwrap_or(22.0)
-                    .max(22.0);
-                label.setFrame(rect(
-                    SESSION_TEXT_LEFT,
-                    MESSAGE_TOP_GAP,
-                    DETAIL_WIDTH,
-                    height,
-                ));
-                earlier_height = height + 8.0;
-                earlier_label = Some(label);
+                for text in &earlier {
+                    let label =
+                        NSTextField::wrappingLabelWithString(&NSString::from_str(text), self.mtm());
+                    label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                    label.setTextColor(Some(&detail_text_color(false)));
+                    label.setSelectable(true);
+                    label.setMaximumNumberOfLines(0);
+                    message_style(&label, &detail_text_color(false));
+                    let height = label
+                        .cell()
+                        .map(|cell| {
+                            cell.cellSizeForBounds(rect(0.0, 0.0, DETAIL_WIDTH, 1000000.0))
+                                .height
+                                .ceil()
+                        })
+                        .unwrap_or(22.0)
+                        .max(22.0);
+                    label.setFrame(rect(
+                        SESSION_TEXT_LEFT,
+                        MESSAGE_TOP_GAP + earlier_height,
+                        DETAIL_WIDTH,
+                        height,
+                    ));
+                    earlier_height += height + 8.0;
+                    earlier_labels.push(label);
+                }
             }
             let mut first_message_height = 22.0;
             let detail = if is_expanded
@@ -3646,19 +3664,8 @@ impl MenuController {
                     })
                     .unwrap_or(22.0)
                     .max(22.0);
-                let combined = if !is_question && !earlier.is_empty() {
-                    if session.last_message.trim().is_empty() {
-                        earlier.clone()
-                    } else {
-                        format!("{earlier}\n\n{text}")
-                    }
-                } else {
-                    text.to_owned()
-                };
-                let label = NSTextField::wrappingLabelWithString(
-                    &NSString::from_str(&combined),
-                    self.mtm(),
-                );
+                let label =
+                    NSTextField::wrappingLabelWithString(&NSString::from_str(text), self.mtm());
                 label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
                 label.setTextColor(Some(&detail_text_color(session.approval.is_some())));
                 label.setSelectable(true);
@@ -3703,7 +3710,38 @@ impl MenuController {
                 // the divider aligned while either session expands or collapses.
                 self.separator(&row, height + session_gap / 2.0 - 0.5, SESSION_HOVER_WIDTH);
             }
-            let text_width = 280.0;
+            // Reserve the status and disclosure controls independently of the
+            // title's shared hover, keyboard highlight and click target.
+            let title_right = if session.activity == Activity::Idle {
+                348.0
+            } else {
+                326.0
+            };
+            let text_width = title_right - SESSION_TEXT_LEFT - 12.0;
+            let robot_button = self.action_button(
+                &row,
+                "",
+                sel!(expandSession:),
+                &session.key(),
+                rect(
+                    session_layout::ICON_LEFT - 1.0,
+                    height - SESSION_HEADER_HEIGHT / 2.0 - 12.0,
+                    26.0,
+                    24.0,
+                ),
+                false,
+            );
+            robot_button.setToolTip(Some(if is_expanded {
+                ns_string!("Collapse")
+            } else {
+                ns_string!("Show details")
+            }));
+            let robot = SessionRobot::new(
+                self.mtm(),
+                rect(6.0, (24.0 - 11.0) / 2.0 - 1.0, 14.0, 11.0),
+                session.activity,
+            );
+            robot_button.addSubview(&robot);
             let title = self.label(
                 &row,
                 &session.title,
@@ -3718,6 +3756,15 @@ impl MenuController {
                 false,
             );
             center_label(&title, height - SESSION_HEADER_HEIGHT / 2.0);
+            let natural_width = title
+                .cell()
+                .map(|cell| cell.cellSize().width.ceil())
+                .unwrap_or(text_width);
+            let highlight_width = SESSION_TEXT_LEFT + natural_width.min(text_width) + 12.0
+                - SESSION_HEADER_HOVER_LEFT;
+            if let Some(background) = row.ivars().background.get() {
+                background.setFrameSize(NSSize::new(highlight_width, SESSION_HEADER_HEIGHT));
+            }
             row.ivars()
                 .matches
                 .set(search::highlights(
@@ -3743,22 +3790,14 @@ impl MenuController {
                 rect(
                     SESSION_HEADER_HOVER_LEFT,
                     height - SESSION_HEADER_HEIGHT,
-                    328.0 - SESSION_HEADER_HOVER_LEFT,
+                    highlight_width,
                     SESSION_HEADER_HEIGHT,
                 ),
                 true,
             );
             open.setToolTip(Some(&NSString::from_str(&format!(
-                "{} · {} · {}\n{}\n{}",
-                session.title,
-                session.agent_label(),
-                session.client.label(),
-                session.project_path().display(),
-                if session.project_path().exists() {
-                    "Open project in VS Code"
-                } else {
-                    "Folder no longer exists. Switch to VS Code."
-                }
+                "Switch to {}",
+                session.client.label()
             ))));
             let arrow = self.action_button(
                 &row,
@@ -3883,9 +3922,33 @@ impl MenuController {
                 } else {
                     document.addSubview(&label);
                 }
-                if let Some(label) = earlier_label {
+                let mut message_centers: Vec<_> = earlier_labels
+                    .iter()
+                    .skip(1)
+                    .map(|label| SESSION_HEADER_HEIGHT + label.frame().origin.y + 9.0)
+                    .collect();
+                if !is_question && !earlier_labels.is_empty() {
+                    message_centers.push(SESSION_HEADER_HEIGHT + message_top + 9.0);
+                }
+                for label in earlier_labels {
                     document.addSubview(&label);
                 }
+                let request_center =
+                    is_question.then_some(SESSION_HEADER_HEIGHT + message_top + 2.0 + 6.5);
+                let contour = robot.bottom_contour_in(&row);
+                let start = row.bounds().size.height - contour.y;
+                let thread = SessionThread::new(
+                    self.mtm(),
+                    row.bounds(),
+                    start,
+                    request_center,
+                    message_centers,
+                );
+                row.addSubview_positioned_relativeTo(&thread, NSWindowOrderingMode::Below, None);
+                row.ivars()
+                    .thread
+                    .set(thread)
+                    .expect("thread initialized once");
                 let first_top = if earlier_height > 0.0 {
                     MESSAGE_TOP_GAP
                 } else {
@@ -4079,14 +4142,8 @@ impl MenuController {
             .as_ref()
             .is_some_and(|id| !self.keyboard_targets(&layout).contains(id))
         {
-            *self.ivars().keyboard_focus.borrow_mut() =
-                focused_session.filter(|id| layout.iter().any(|row| row.id.as_ref() == Some(id)));
-        }
-        if !self.ivars().filter_query.borrow().is_empty()
-            && self.ivars().keyboard_focus.borrow().is_none()
-        {
-            *self.ivars().keyboard_focus.borrow_mut() =
-                layout.iter().find_map(|row| row.id.clone());
+            // A removed answer control must not transfer focus to its session.
+            self.ivars().keyboard_focus.borrow_mut().take();
         }
         *self.ivars().layout.borrow_mut() = layout;
         self.layout_rows();

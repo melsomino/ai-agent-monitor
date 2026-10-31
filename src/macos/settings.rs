@@ -7,9 +7,70 @@ use objc2::{
     rc::Retained,
     runtime::{AnyClass, AnyObject, Bool},
 };
-use objc2_foundation::{NSError, NSUserDefaults, ns_string};
+use objc2_foundation::{NSBundle, NSError, NSString, NSUserDefaults, ns_string};
 
 pub use crate::domain::preferences::{Applications, LoginStatus, Preferences};
+
+/// Keep user preferences when moving away from the original notification identity.
+/// OS notification authorization is intentionally requested again by onboarding.
+pub fn migrate_legacy_preferences() {
+    if NSBundle::mainBundle().bundleIdentifier().as_deref()
+        != Some(ns_string!("com.melsomino.ai-agent-monitor"))
+    {
+        return;
+    }
+    let first_identity_launch =
+        !NSUserDefaults::standardUserDefaults().boolForKey(ns_string!("LegacyPreferencesMigrated"));
+    migrate_preferences(
+        &NSUserDefaults::standardUserDefaults(),
+        ns_string!("local.codex.agent-monitor.notify"),
+        ns_string!("com.melsomino.ai-agent-monitor"),
+    );
+    let defaults = NSUserDefaults::standardUserDefaults();
+    if first_identity_launch
+        && defaults.boolForKey(ns_string!("LaunchAtLoginEnabled"))
+        && !matches!(
+            login_status(),
+            LoginStatus::Enabled | LoginStatus::RequiresApproval
+        )
+        && let Err(error) = set_launch_at_login(true)
+    {
+        eprintln!("ai-agent-monitor: restore launch at login: {error:#}");
+    }
+}
+
+fn migrate_preferences(defaults: &NSUserDefaults, legacy_name: &NSString, current_name: &NSString) {
+    let marker = ns_string!("LegacyPreferencesMigrated");
+    if defaults.boolForKey(marker) {
+        return;
+    }
+    let current = defaults.persistentDomainForName(current_name);
+    if let Some(legacy) = defaults.persistentDomainForName(legacy_name) {
+        for key in [
+            ns_string!("KnownApplications"),
+            ns_string!("AnimateMenuBar"),
+            ns_string!("MenuShortcut"),
+            ns_string!("LaunchAtLoginEnabled"),
+        ] {
+            if current
+                .as_ref()
+                .is_some_and(|domain| domain.objectForKey(key).is_some())
+            {
+                continue;
+            }
+            if let Some(value) = legacy.objectForKey(key) {
+                // SAFETY: The original persistent domain supplies valid property-list values.
+                unsafe {
+                    defaults.setObject_forKey(Some(&value), key);
+                }
+            }
+        }
+    }
+    // First-launch and notification results are intentionally not inherited:
+    // onboarding reconnects existing hooks idempotently and requests permission.
+    defaults.setBool_forKey(true, marker);
+}
+
 pub fn applications() -> Applications {
     NSUserDefaults::standardUserDefaults()
         .stringForKey(ns_string!("KnownApplications"))
@@ -54,6 +115,8 @@ pub fn set_launch_at_login(enabled: bool) -> Result<LoginStatus> {
     if (enabled && matches!(status, LoginStatus::Enabled | LoginStatus::RequiresApproval))
         || (!enabled && status == LoginStatus::Disabled)
     {
+        NSUserDefaults::standardUserDefaults()
+            .setBool_forKey(enabled, ns_string!("LaunchAtLoginEnabled"));
         return Ok(status);
     }
     let service = login_service()?;
@@ -75,6 +138,8 @@ pub fn set_launch_at_login(enabled: bool) -> Result<LoginStatus> {
         }
         bail!("Could not change launch at login");
     }
+    NSUserDefaults::standardUserDefaults()
+        .setBool_forKey(enabled, ns_string!("LaunchAtLoginEnabled"));
     Ok(status)
 }
 
@@ -165,6 +230,65 @@ mod tests {
         apps.set_enabled(&first.application_id(), false);
         assert!(!apps.enabled(first));
         assert!(apps.enabled(second));
+    }
+
+    #[test]
+    fn migration_preserves_choices_and_new_values_without_reimporting_deleted_preferences() {
+        use objc2::AllocAnyThread;
+        let unique = format!(
+            "com.melsomino.ai-agent-monitor.test.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let legacy_name = NSString::from_str(&format!("{unique}.old"));
+        let current_name = NSString::from_str(&format!("{unique}.new"));
+        let legacy =
+            NSUserDefaults::initWithSuiteName(NSUserDefaults::alloc(), Some(&legacy_name)).unwrap();
+        let current =
+            NSUserDefaults::initWithSuiteName(NSUserDefaults::alloc(), Some(&current_name))
+                .unwrap();
+        legacy.setBool_forKey(false, ns_string!("AnimateMenuBar"));
+        legacy.setBool_forKey(true, ns_string!("FirstLaunchSetupCompleted"));
+        // SAFETY: NSStrings are valid preference values.
+        unsafe {
+            legacy.setObject_forKey(
+                Some(ns_string!("saved application filters")),
+                ns_string!("KnownApplications"),
+            );
+            legacy.setObject_forKey(
+                Some(ns_string!("saved shortcut")),
+                ns_string!("MenuShortcut"),
+            );
+        }
+        legacy.synchronize();
+        current.setBool_forKey(true, ns_string!("AnimateMenuBar"));
+        current.synchronize();
+        migrate_preferences(&current, &legacy_name, &current_name);
+        assert!(current.boolForKey(ns_string!("AnimateMenuBar")));
+        assert_eq!(
+            current
+                .stringForKey(ns_string!("KnownApplications"))
+                .unwrap()
+                .to_string(),
+            "saved application filters"
+        );
+        assert_eq!(
+            current
+                .stringForKey(ns_string!("MenuShortcut"))
+                .unwrap()
+                .to_string(),
+            "saved shortcut"
+        );
+        assert!(!current.boolForKey(ns_string!("FirstLaunchSetupCompleted")));
+        current.removeObjectForKey(ns_string!("MenuShortcut"));
+        migrate_preferences(&current, &legacy_name, &current_name);
+        assert!(current.objectForKey(ns_string!("MenuShortcut")).is_none());
+        assert!(!legacy.boolForKey(ns_string!("AnimateMenuBar")));
+        legacy.removePersistentDomainForName(&legacy_name);
+        current.removePersistentDomainForName(&current_name);
     }
 
     #[test]

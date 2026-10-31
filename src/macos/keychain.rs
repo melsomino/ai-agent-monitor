@@ -72,6 +72,7 @@ fn dictionary() -> Owned {
 fn query() -> Result<(Owned, Owned, Owned, Symbols)> {
     let keys = Symbols::load()?;
     let query = dictionary();
+    // Retain the credential namespace across the app's bundle-ID migration.
     let service = string("local.codex.agent-monitor.notify.telegram");
     let account = string("bot-token");
     // The dictionary borrows its values. These owned strings live through each call.

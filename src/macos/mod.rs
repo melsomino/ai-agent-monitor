@@ -14,5 +14,7 @@ pub(crate) mod onboarding;
 pub(crate) mod pointer;
 pub(crate) mod search;
 pub(crate) mod session_layout;
+mod session_robot;
+mod session_thread;
 pub(crate) mod settings;
 pub(crate) mod terminal;

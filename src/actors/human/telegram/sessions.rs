@@ -39,6 +39,12 @@ pub(super) struct Browser {
     staged_agent: Option<(String, String)>,
 }
 impl Browser {
+    pub fn resume(session: String) -> Result<Self> {
+        let mut browser = Self::new()?;
+        browser.selected = Some(session);
+        Ok(browser)
+    }
+
     pub fn new() -> Result<Self> {
         Ok(Self {
             message: None,
