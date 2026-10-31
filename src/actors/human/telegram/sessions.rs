@@ -33,9 +33,6 @@ pub(super) struct Browser {
     outgoing: Option<String>,
     show_info: bool,
     delivered_agent: Option<(String, String)>,
-    delivered_session: Option<String>,
-    delivered_interaction: Option<String>,
-    staged_interaction: Option<String>,
     staged_agent: Option<(String, String)>,
 }
 impl Browser {
@@ -64,9 +61,6 @@ impl Browser {
             outgoing: None,
             show_info: false,
             delivered_agent: None,
-            delivered_session: None,
-            delivered_interaction: None,
-            staged_interaction: None,
             staged_agent: None,
         })
     }
@@ -169,18 +163,8 @@ impl Browser {
                 old_key == key && old != text && !text.is_empty()
             })
     }
-    /// Request-only transitions notify without archiving another copy of the same reply.
-    pub fn replaces_current_message(&self) -> bool {
-        self.needs_new_message() && !self.has_new_agent_text()
-    }
     pub fn needs_new_message(&self) -> bool {
-        let new_request = self.selected.is_some()
-            && self.delivered_session == self.selected
-            && self
-                .staged_request
-                .as_ref()
-                .is_some_and(|(key, _)| self.delivered_interaction.as_ref() != Some(key));
-        self.message.is_some() && (self.has_new_agent_text() || new_request)
+        self.message.is_some() && self.has_new_agent_text()
     }
     pub fn detach_message(&mut self) {
         self.message = None;
@@ -191,8 +175,6 @@ impl Browser {
         self.rendered = content;
         self.active_request = self.staged_request.clone();
         self.delivered_agent = self.staged_agent.clone();
-        self.delivered_session = self.selected.clone();
-        self.delivered_interaction = self.staged_interaction.clone();
     }
     pub fn can_present(&self, pending: &Pending) -> bool {
         self.selected_available
@@ -291,14 +273,13 @@ impl Browser {
                 .approval_key()
                 .and_then(|key| pending.get(&key).map(|p| (key, p.nonce.clone())))
         });
-        self.staged_interaction = pending_request.as_ref().map(|(key, _)| key.clone());
         self.staged_request = if self.show_info {
             None
         } else {
             pending_request.clone()
         };
         if self.needs_new_message() {
-            // New output or a new request must notify, not just silently edit
+            // New agent output must notify, not just silently edit
             // the previous message while Telegram may be in the background.
             let outgoing = self.outgoing.take();
             self.reset_detail();
@@ -922,7 +903,7 @@ mod tests {
         assert_eq!(browser.selected(8), Some("codex:1"));
     }
     #[test]
-    fn a_new_request_posts_a_new_session_message_even_without_new_agent_text() {
+    fn requests_update_the_existing_session_message_without_new_agent_text() {
         let mut state = monitor::State {
             sessions: vec![session("1", "Chat", Client::VSCode)],
             ..Default::default()
@@ -952,16 +933,14 @@ mod tests {
             Pending::new(state.sessions[0].clone()).unwrap(),
         )]);
         let request = browser.content(&state, &pending);
-        assert!(browser.needs_new_message());
-        browser.detach_message();
-        browser.message = Some(8);
+        assert!(!browser.needs_new_message());
         browser.commit(request);
-        assert!(browser.permits_answer(8, &pending[&key]));
+        assert!(browser.permits_answer(7, &pending[&key]));
         browser.open_info();
         let info = browser.content(&state, &pending);
         browser.commit(info);
         browser
-            .navigate(8, &format!("{}:message", browser.nonce))
+            .navigate(7, &format!("{}:message", browser.nonce))
             .unwrap();
         browser.content(&state, &pending);
         assert!(

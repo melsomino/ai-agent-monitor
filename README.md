@@ -253,7 +253,7 @@ Select a session to read its latest message and pending request. Available contr
 - **Info / Message** — show the working folder and Git branch, or return to the conversation.
 - **‹ Sessions** — return to the list. Large lists are paginated.
 
-Views update automatically; there are no Refresh buttons. When new agent output or a new request arrives in the selected session, it is posted at the bottom of the chat. The previous message stays in the conversation with its buttons removed. Status changes update the current message. A request already displayed in the selected session is not sent again as a standalone notification; an earlier standalone copy is removed when the request is shown there.
+Views update automatically; there are no Refresh buttons. New agent output in the selected session is posted at the bottom of the chat. The previous message stays in the conversation with its buttons removed. New requests, resolved requests, and status changes edit the current message in place; these edits do not generate a new Telegram notification. A request already displayed in the selected session is not sent again as a standalone notification; an earlier standalone copy is removed when the request is shown there.
 
 The selected session is stored separately from notification messages and restored after a monitor restart. A request from another session does not change the destination for chat text. Opening **Sessions** or returning to the list clears the destination; text sent without a selection produces a hint instead of being silently ignored.
 

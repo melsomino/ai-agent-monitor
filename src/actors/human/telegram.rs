@@ -194,9 +194,6 @@ fn api_result(method: &str, value: Value) -> Result<Value> {
         {
             return Ok(json!({"unchanged":true}));
         }
-        if method == "deleteMessage" && description == "Bad Request: message can't be deleted" {
-            return Ok(json!({"cannot_delete":true}));
-        }
         if (method == "deleteMessage" && description == "Bad Request: message to delete not found")
             || (matches!(method, "editMessageText" | "editMessageReplyMarkup")
                 && description == "Bad Request: message to edit not found")
@@ -953,30 +950,14 @@ impl Worker {
             return false;
         };
         let content = browser.content(snapshot, &self.pending);
-        // Genuine replies remain in history; request-only transitions replace the
-        // previous card so successive approvals cannot archive duplicate agent text.
-        // Complete cleanup before sending, retaining ownership on transient failures.
+        // Only new agent text advances the chat. Request and status changes edit
+        // the current card, keeping its message ID and answer buttons together.
         if browser.needs_new_message() {
             let old = browser.message.unwrap();
-            let replace = browser.replaces_current_message();
-            let clear_controls = json!({"chat_id":self.config.chat,"message_id":old,"reply_markup":{"inline_keyboard":[]}});
-            let cleanup = if replace {
-                send(
-                    "deleteMessage",
-                    json!({"chat_id":self.config.chat,"message_id":old}),
-                )
-                .and_then(|result| {
-                    // Telegram cannot delete some old messages. Preserve that
-                    // history entry without controls, but still deliver the request.
-                    if result["cannot_delete"] == true {
-                        send("editMessageReplyMarkup", clear_controls)
-                    } else {
-                        Ok(result)
-                    }
-                })
-            } else {
-                send("editMessageReplyMarkup", clear_controls)
-            };
+            let cleanup = send(
+                "editMessageReplyMarkup",
+                json!({"chat_id":self.config.chat,"message_id":old,"reply_markup":{"inline_keyboard":[]}}),
+            );
             match cleanup {
                 Ok(_) => {
                     self.browser.as_mut().unwrap().detach_message();
@@ -1983,10 +1964,6 @@ mod tests {
             worker.flush_browser_with(state, |method, payload| {
                 let id = payload["message_id"].as_i64().unwrap_or(*next);
                 match method {
-                    "deleteMessage" => {
-                        messages.remove(&id);
-                        Ok(json!(true))
-                    }
                     "editMessageReplyMarkup" => {
                         messages.get_mut(&id).unwrap()["reply_markup"] =
                             payload["reply_markup"].clone();
@@ -2028,7 +2005,9 @@ mod tests {
                 .insert(state.sessions[0].approval_key().unwrap(), request);
             let old = worker.browser.as_ref().unwrap().message.unwrap();
             flush(&mut worker, &state, &mut messages, &mut next);
-            assert!(!messages.contains_key(&old));
+            assert!(messages.contains_key(&old));
+            assert_eq!(worker.browser.as_ref().unwrap().message, Some(old));
+            assert_eq!(next, 78, "requests must edit, never send a new message");
             flush(&mut worker, &state, &mut messages, &mut next);
             assert_eq!(messages.len(), 1);
             assert!(
@@ -2072,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_request_card_deletion_keeps_ownership_until_retry() {
+    fn failed_request_card_edit_keeps_ownership_until_retry() {
         let (mut worker, mut state, _, _) = browsing_request(pending(Interaction::allow()));
         state.sessions[0].approval = None;
         worker.pending.clear();
@@ -2089,22 +2068,18 @@ mod tests {
             Pending::new(state.sessions[0].clone()).unwrap(),
         );
         worker.flush_browser_with(&state, |method, _| {
-            assert_eq!(method, "deleteMessage");
+            assert_eq!(method, "editMessageText");
             bail!("offline")
         });
         assert_eq!(worker.browser.as_ref().unwrap().message, Some(77));
         assert!(!worker.pending[&key].delivered());
-        let mut calls = Vec::new();
-        worker.flush_browser_with(&state, |method, _| {
-            calls.push(method.to_owned());
-            api_result(method, json!({"ok":false,"error_code":400,"description":"Bad Request: message can't be deleted"}))
+        worker.flush_browser_with(&state, |method, payload| {
+            assert_eq!(method, "editMessageText");
+            assert_eq!(payload["message_id"], 77);
+            Ok(json!({"message_id":77}))
         });
-        assert_eq!(calls, ["deleteMessage", "editMessageReplyMarkup"]);
-        assert_eq!(
-            worker.browser.as_ref().unwrap().message,
-            Some(77),
-            "a failed fallback must not release the old buttons"
-        );
+        assert_eq!(worker.browser.as_ref().unwrap().message, Some(77));
+        assert!(worker.pending[&key].browser_delivered);
     }
 
     #[test]
