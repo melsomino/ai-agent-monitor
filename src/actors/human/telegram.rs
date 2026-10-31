@@ -30,7 +30,9 @@ pub fn diagnostics(status: &Status) -> Value {
 pub enum Event {
     Connect(String),
     Disconnect,
-    Enable(bool),
+    BeginSetup,
+    CancelSetup,
+    CandidateUpdates(u64, Result<Value>),
     #[cfg(test)]
     Sync(Vec<Session>),
     Observe(Box<Session>),
@@ -68,6 +70,7 @@ pub async fn run(
             worker.flush();
             worker.update_counts();
             worker.poll();
+            worker.poll_candidate();
             std::thread::sleep(Duration::from_millis(50));
             if rx.is_closed() {
                 break;
@@ -394,6 +397,48 @@ fn edit_pending(token: &str, chat: Option<i64>, pending: &Pending) -> Result<()>
     api(token, "editMessageText", payload)?;
     Ok(())
 }
+struct Candidate {
+    token: String,
+    username: String,
+    code: String,
+    deadline: Instant,
+    offset: i64,
+    generation: u64,
+    polling: bool,
+    retry: Instant,
+}
+impl Candidate {
+    fn paired_account(&self, update: &Value, owner: Option<i64>) -> Option<(i64, i64)> {
+        let message = &update["message"];
+        let user = message["from"]["id"].as_i64()?;
+        let chat = message["chat"]["id"].as_i64()?;
+        (owner == Some(user)
+            && pairing_matches(
+                user,
+                chat,
+                message["chat"]["type"].as_str()?,
+                message["text"].as_str()?,
+                &self.code,
+                Instant::now() < self.deadline,
+            ))
+        .then_some((user, chat))
+    }
+}
+
+// Save both pieces before retiring the running connection. On preference-write
+// failure, restore the previous credential and keep the in-memory bot untouched.
+fn store_replacement(token: &str, config: &Config, old_token: &str) -> Result<()> {
+    crate::macos::keychain::save(token)?;
+    if let Err(error) = persist(config) {
+        crate::macos::keychain::save(old_token)
+            .context("Could not restore the previous bot credential")?;
+        return Err(
+            error.context("Could not save the new bot; the previous connection is retained")
+        );
+    }
+    Ok(())
+}
+
 struct Worker {
     monitor: monitor::Handle,
     tx: tokio::sync::mpsc::Sender<Event>,
@@ -413,6 +458,9 @@ struct Worker {
     commands_retry: Instant,
     outbox: VecDeque<String>,
     browser: Option<sessions::Browser>,
+    changing: bool,
+    candidate: Option<Candidate>,
+    candidate_generation: u64,
 }
 impl Worker {
     fn load(monitor: monitor::Handle, tx: tokio::sync::mpsc::Sender<Event>) -> Self {
@@ -444,6 +492,9 @@ impl Worker {
             commands_retry: Instant::now(),
             outbox: VecDeque::new(),
             browser: None,
+            changing: false,
+            candidate: None,
+            candidate_generation: 0,
         };
         worker.publish();
         if let Err(error) = credential {
@@ -464,12 +515,21 @@ impl Worker {
     fn publish(&self) {
         *self.status.borrow_mut() = Status {
             connected: !self.token.is_empty(),
+            bot_username: self.config.username.clone(),
+            setting_up: self.changing,
             enabled: self.config.enabled,
             paired: self.config.user.is_some(),
-            text: if self.token.is_empty() {
-                "Not connected".into()
+            text: if let Some(candidate) = &self.candidate {
+                format!(
+                    "Press Start in @{} to finish connecting. Your current bot stays connected.",
+                    candidate.username
+                )
+            } else if self.changing && !self.token.is_empty() && self.config.user.is_some() {
+                "Your current bot stays connected until you start the new bot.".into()
+            } else if self.token.is_empty() {
+                String::new()
             } else if self.pair.is_some() {
-                "Open the bot using the pairing link below, then press Start.".into()
+                "Press Start in Telegram to finish connecting. Use Open bot if needed.".into()
             } else if self.config.user.is_some() {
                 format!(
                     "@{} · {}",
@@ -481,7 +541,7 @@ impl Worker {
                     }
                 )
             } else {
-                "Reconnect to pair your Telegram account.".into()
+                "Click Connect, then press Start in Telegram.".into()
             },
             command_menu_ready: self.commands_ready,
             snapshot_pending: 0,
@@ -489,9 +549,19 @@ impl Worker {
             queued: self.pending.values().filter(|p| !p.delivered()).count(),
             delivered: self.pending.values().filter(|p| p.delivered()).count(),
             link: self
-                .pair
+                .candidate
                 .as_ref()
-                .map(|(code, _)| format!("https://t.me/{}?start={code}", self.config.username)),
+                .map(|candidate| {
+                    format!(
+                        "https://t.me/{}?start={}",
+                        candidate.username, candidate.code
+                    )
+                })
+                .or_else(|| {
+                    self.pair.as_ref().map(|(code, _)| {
+                        format!("https://t.me/{}?start={code}", self.config.username)
+                    })
+                }),
         };
         self.emit();
     }
@@ -519,6 +589,148 @@ impl Worker {
             let _ = tx.blocking_send(Event::Updates(generation, updates));
         });
     }
+    fn poll_candidate(&mut self) {
+        if self
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| Instant::now() >= candidate.deadline)
+        {
+            self.candidate = None;
+            self.publish();
+            self.note(
+                "New bot pairing expired. Reconnect to try again; your current bot is unchanged.",
+            );
+        }
+        let Some(candidate) = self.candidate.as_mut() else {
+            return;
+        };
+        if candidate.polling || Instant::now() < candidate.retry {
+            return;
+        }
+        candidate.polling = true;
+        let (token, offset, generation) = (
+            candidate.token.clone(),
+            candidate.offset,
+            candidate.generation,
+        );
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = api(
+                &token,
+                "getUpdates",
+                json!({"offset":offset,"timeout":5,"allowed_updates":["message"]}),
+            );
+            let _ = tx.blocking_send(Event::CandidateUpdates(generation, result));
+        });
+    }
+    fn stage_candidate(&mut self, token: &str, username: String, code: String) {
+        self.candidate_generation = self.candidate_generation.wrapping_add(1);
+        self.candidate = Some(Candidate {
+            token: token.into(),
+            username,
+            code,
+            deadline: Instant::now() + Duration::from_secs(600),
+            offset: 0,
+            generation: self.candidate_generation,
+            polling: false,
+            retry: Instant::now(),
+        });
+        self.changing = true;
+        self.publish();
+    }
+    fn install_candidate_with(
+        &mut self,
+        generation: u64,
+        user: i64,
+        chat: i64,
+        store: impl FnOnce(&str, &Config, &str) -> Result<()>,
+    ) -> Result<()> {
+        let candidate = self
+            .candidate
+            .as_ref()
+            .filter(|candidate| candidate.generation == generation)
+            .context("The new bot setup was cancelled")?;
+        let token = candidate.token.clone();
+        let config = Config {
+            enabled: true,
+            user: Some(user),
+            chat: Some(chat),
+            username: candidate.username.clone(),
+            offset: candidate.offset,
+            selected_session: self.config.selected_session.clone(),
+            ..Config::default()
+        };
+        store(&token, &config, &self.token)?;
+        // Old bot controls become inert only after the new pairing and storage succeeded.
+        self.retire_all("Bot changed. Use the newly paired bot for requests.");
+        for message in self.config.messages.clone() {
+            let _ = retire_message(
+                self.config.chat,
+                message,
+                "Bot changed.",
+                |method, payload| self.api(method, payload),
+            );
+        }
+        self.token = token;
+        self.config = config;
+        self.candidate = None;
+        self.changing = false;
+        self.pair = None;
+        self.generation = self.generation.wrapping_add(1);
+        self.polling = false;
+        self.poll_retry = Instant::now();
+        self.retry = Instant::now();
+        self.commands_ready = false;
+        self.commands_retry = Instant::now();
+        self.cleanup = Default::default();
+        self.outbox.clear();
+        self.outbox
+            .push_back("Connected to AI Agent Monitor. Use Sessions to open your agents.".into());
+        if let Err(error) = self.restore_browser() {
+            self.note(&error.to_string());
+        }
+        self.publish();
+        Ok(())
+    }
+    fn candidate_updates(&mut self, generation: u64, result: Result<Value>) {
+        let Some(candidate) = self
+            .candidate
+            .as_mut()
+            .filter(|candidate| candidate.generation == generation)
+        else {
+            return;
+        };
+        candidate.polling = false;
+        let updates = match result {
+            Ok(updates) => updates,
+            Err(error) => {
+                candidate.retry = Instant::now() + Duration::from_secs(15);
+                self.note(&error.to_string());
+                return;
+            }
+        };
+        for update in updates.as_array().into_iter().flatten() {
+            let Some(candidate) = self.candidate.as_mut() else {
+                break;
+            };
+            let Some(id) = update["update_id"]
+                .as_i64()
+                .filter(|id| *id >= candidate.offset)
+            else {
+                continue;
+            };
+            candidate.offset = id + 1;
+            if let Some((user, chat)) = candidate.paired_account(update, self.config.user) {
+                if let Err(error) =
+                    self.install_candidate_with(generation, user, chat, store_replacement)
+                {
+                    self.note(&error.to_string());
+                }
+                break;
+            }
+        }
+    }
+
     fn update_counts(&self) {
         let mut status = self.status.borrow_mut();
         status.command_menu_ready = self.commands_ready;
@@ -666,11 +878,23 @@ impl Worker {
     }
     fn event(&mut self, event: Event) {
         match event {
+            Event::BeginSetup => {
+                self.changing = true;
+                self.publish();
+            }
+            Event::CancelSetup => {
+                self.candidate = None;
+                self.changing = false;
+                self.publish();
+            }
+            Event::CandidateUpdates(generation, result) => {
+                self.candidate_updates(generation, result)
+            }
             Event::Updates(generation, updates) => {
-                self.polling = false;
                 if generation != self.generation {
                     return;
                 }
+                self.polling = false;
                 match updates {
                     Ok(updates) => {
                         let previous = self.config.offset;
@@ -694,14 +918,17 @@ impl Worker {
             }
 
             Event::Connect(token) => {
-                self.note("Connecting…");
+                self.note("Checking token…");
                 let result = self.connect(token.trim());
                 if let Err(error) = result {
                     self.note(&error.to_string());
                 }
             }
             Event::Disconnect => {
+                self.candidate = None;
+                self.changing = false;
                 self.generation += 1;
+                self.polling = false;
                 self.retire_all(
                     "Telegram disconnected. This request can no longer be answered here.",
                 );
@@ -724,15 +951,6 @@ impl Worker {
                         self.note(&error.to_string());
                     }
                 }
-            }
-            Event::Enable(enabled) => {
-                self.generation += 1;
-                self.config.enabled = enabled && self.config.user.is_some();
-                if !self.config.enabled {
-                    self.retire_all("Telegram notifications paused. Respond in the agent app.");
-                }
-                self.save();
-                self.publish();
             }
             Event::Observe(session) => {
                 if self.config.enabled
@@ -778,11 +996,20 @@ impl Worker {
             "This bot uses a webhook. Use a dedicated bot without a webhook."
         );
         let code = nonce()?;
+        if !self.token.is_empty() && self.config.user.is_some() {
+            anyhow::ensure!(
+                token != self.token,
+                "This bot is already connected. Cancel to keep using it."
+            );
+            self.stage_candidate(token, username, code);
+            return Ok(());
+        }
         crate::macos::keychain::save(token)?;
         self.retire_all("Bot reconnected. Use the latest request message.");
         self.cleanup_before_disconnect();
         self.cleanup = Default::default();
         self.generation += 1;
+        self.polling = false;
         self.token = token.to_owned();
         self.outbox.clear();
         self.commands_ready = false;
@@ -1092,7 +1319,7 @@ impl Worker {
                 self.pair = None;
                 self.save();
                 self.publish();
-                let _=self.api("sendMessage",json!({"chat_id":chat,"text":"Paired with AI Agent Monitor. Use /sessions to list open sessions, or the command buttons below.","reply_markup":command_keyboard()}));
+                let _=self.api("sendMessage",json!({"chat_id":chat,"text":"Connected to AI Agent Monitor. Use /sessions to list open sessions, or the command buttons below.","reply_markup":command_keyboard()}));
                 return;
             }
             if !self.paired(user, chat, kind) {
@@ -1406,6 +1633,9 @@ mod tests {
             commands_retry: Instant::now(),
             outbox: VecDeque::new(),
             browser: None,
+            changing: false,
+            candidate: None,
+            candidate_generation: 0,
         }
     }
     fn question(id: &str, freeform: bool) -> Question {
@@ -1426,6 +1656,146 @@ mod tests {
             secret: false,
         }
     }
+    fn connected_worker() -> Worker {
+        let mut worker = worker();
+        worker.token = "old-token".into();
+        worker.config.username = "old_bot".into();
+        worker.config.selected_session = Some(session().key());
+        worker
+            .pending
+            .insert("old-request".into(), pending(Interaction::allow()));
+        worker.publish();
+        worker
+    }
+
+    #[test]
+    fn current_bot_hint_is_only_shown_for_an_existing_connection() {
+        let mut initial = worker();
+        initial.config.user = None;
+        initial.config.chat = None;
+        initial.event(Event::BeginSetup);
+        assert!(!initial.status.borrow().text.contains("current bot"));
+        let mut existing = connected_worker();
+        existing.event(Event::BeginSetup);
+        assert!(existing.status.borrow().text.contains("current bot"));
+    }
+
+    #[test]
+    fn staging_and_cancelling_a_replacement_keep_the_current_bot_and_requests() {
+        let mut worker = connected_worker();
+        worker.event(Event::BeginSetup);
+        worker.stage_candidate("new-token", "new_bot".into(), "pair-code".into());
+        let generation = worker.candidate.as_ref().unwrap().generation;
+        assert_eq!(worker.token, "old-token");
+        assert_eq!(worker.config.username, "old_bot");
+        assert!(worker.config.enabled);
+        assert!(worker.pending.contains_key("old-request"));
+        assert_eq!(worker.status.borrow().bot_username, "old_bot");
+        assert!(worker.status.borrow().setting_up);
+        assert!(
+            worker
+                .status
+                .borrow()
+                .link
+                .as_ref()
+                .unwrap()
+                .contains("new_bot")
+        );
+        worker.event(Event::CancelSetup);
+        worker.event(Event::CandidateUpdates(generation, Ok(json!([]))));
+        assert!(worker.candidate.is_none());
+        assert!(!worker.status.borrow().setting_up);
+        assert_eq!(worker.token, "old-token");
+        assert!(worker.authorized(42, 42, "private"));
+        assert!(worker.pending.contains_key("old-request"));
+    }
+
+    #[test]
+    fn new_pairing_requires_the_current_private_account_and_exact_unexpired_code() {
+        let mut worker = connected_worker();
+        worker.stage_candidate("new-token", "new_bot".into(), "pair-code".into());
+        let message = |user, chat, kind, code| json!({"message":{"from":{"id":user},"chat":{"id":chat,"type":kind},"text":code}});
+        let candidate = worker.candidate.as_mut().unwrap();
+        assert_eq!(
+            candidate.paired_account(&message(42, 42, "private", "/start pair-code"), Some(42)),
+            Some((42, 42))
+        );
+        for update in [
+            message(43, 43, "private", "/start pair-code"),
+            message(42, -7, "group", "/start pair-code"),
+            message(42, 42, "private", "/start wrong"),
+        ] {
+            assert!(candidate.paired_account(&update, Some(42)).is_none());
+        }
+        candidate.deadline = Instant::now() - Duration::from_secs(1);
+        assert!(
+            candidate
+                .paired_account(&message(42, 42, "private", "/start pair-code"), Some(42))
+                .is_none()
+        );
+        worker.poll_candidate();
+        assert!(worker.candidate.is_none());
+        assert_eq!(worker.token, "old-token");
+        assert!(worker.pending.contains_key("old-request"));
+    }
+
+    #[test]
+    fn replacement_storage_or_network_failure_does_not_disconnect_the_old_bot() {
+        let mut worker = connected_worker();
+        worker.stage_candidate("new-token", "new_bot".into(), "pair-code".into());
+        let generation = worker.candidate.as_ref().unwrap().generation;
+        worker.event(Event::CandidateUpdates(
+            generation,
+            Err(anyhow::anyhow!("offline")),
+        ));
+        assert_eq!(worker.token, "old-token");
+        assert!(worker.pending.contains_key("old-request"));
+        let result = worker.install_candidate_with(generation, 42, 42, |new, config, old| {
+            assert_eq!((new, old), ("new-token", "old-token"));
+            assert_eq!(config.username, "new_bot");
+            bail!("Keychain unavailable")
+        });
+        assert!(result.is_err());
+        assert_eq!(worker.token, "old-token");
+        assert_eq!(worker.config.username, "old_bot");
+        assert_eq!(worker.config.selected_session, Some(session().key()));
+        assert!(worker.pending.contains_key("old-request"));
+        assert!(worker.candidate.is_some());
+    }
+
+    #[test]
+    fn successful_replacement_commits_once_and_ignores_old_poll_completions() {
+        let mut worker = connected_worker();
+        let old_generation = worker.generation;
+        worker.stage_candidate("new-token", "new_bot".into(), "pair-code".into());
+        let generation = worker.candidate.as_ref().unwrap().generation;
+        worker
+            .install_candidate_with(generation, 42, 42, |_, _, _| Ok(()))
+            .unwrap();
+        assert_eq!(worker.token, "new-token");
+        assert_eq!(worker.config.username, "new_bot");
+        assert!(worker.config.enabled);
+        assert_eq!(worker.config.user, Some(42));
+        assert_eq!(worker.config.selected_session, Some(session().key()));
+        assert!(worker.pending.is_empty());
+        assert!(worker.candidate.is_none());
+        assert!(!worker.status.borrow().setting_up);
+        assert_eq!(worker.status.borrow().bot_username, "new_bot");
+        worker.polling = true;
+        worker.event(Event::Updates(old_generation, Ok(json!([]))));
+        assert!(
+            worker.polling,
+            "the previous bot's completion must not unlock the new poll"
+        );
+        assert!(
+            worker
+                .install_candidate_with(generation, 42, 42, |_, _, _| panic!(
+                    "must not commit twice"
+                ))
+                .is_err()
+        );
+    }
+
     #[test]
     fn already_removed_messages_and_unchanged_edits_complete_successfully() {
         for (method, description) in [
@@ -2353,9 +2723,11 @@ mod tests {
         worker.event(Event::Sync(vec![]));
         assert!(!worker.pending.contains_key(&key));
         assert!(worker.polling);
-        // Results of a poll from an old pairing/enable generation have no authority.
+        // Results from an old bot have no authority over the current poll.
         worker.event(Event::Updates(99, Ok(json!([{"update_id":1000}]))));
         assert_eq!(worker.config.offset, 0);
+        assert!(worker.polling);
+        worker.event(Event::Updates(worker.generation, Ok(json!([]))));
         assert!(!worker.polling);
     }
     #[test]

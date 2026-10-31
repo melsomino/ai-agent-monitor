@@ -158,17 +158,33 @@ pub struct State {
     status_eye_animation: RefCell<motion::WorkingEyes>,
     status_timer: RefCell<Option<Retained<NSTimer>>>,
     settings_window: OnceCell<Retained<NSWindow>>,
+    settings_tabs: OnceCell<Retained<PreferencesTabs>>,
     applications: RefCell<settings::Applications>,
     applications_list: OnceCell<Retained<SessionListView>>,
+    applications_controller: OnceCell<Retained<NSViewController>>,
+    applications_scroll: OnceCell<Retained<NSScrollView>>,
+    applications_heading: OnceCell<Retained<NSTextField>>,
+    integrations_controller: OnceCell<Retained<NSViewController>>,
+    integrations_scroll: OnceCell<Retained<NSScrollView>>,
+    integrations_heading: OnceCell<Retained<NSTextField>>,
     integrations_list: OnceCell<Retained<SessionListView>>,
     integrations_button: OnceCell<Retained<NSButton>>,
     integrations_note: OnceCell<Retained<NSTextField>>,
     integrations_snapshot: RefCell<Option<Vec<crate::macos::onboarding::Row>>>,
+    telegram_username: OnceCell<Retained<NSTextField>>,
+    telegram_auto_open: RefCell<crate::macos::telegram_setup::AutoOpen>,
+    telegram_setup_view: OnceCell<Retained<NSView>>,
+    telegram_connected_view: OnceCell<Retained<NSView>>,
+    telegram_controller: OnceCell<Retained<NSViewController>>,
+    telegram_tab_item: OnceCell<Retained<NSTabViewItem>>,
+    telegram_bot_label: OnceCell<Retained<NSTextField>>,
+    telegram_connected_title: OnceCell<Retained<NSTextField>>,
+    telegram_connected_status: OnceCell<Retained<NSTextField>>,
+    telegram_connected_test: OnceCell<Retained<NSButton>>,
+    telegram_connected_open: OnceCell<Retained<NSButton>>,
     telegram_token: OnceCell<Retained<NSSecureTextField>>,
-    telegram_enabled: OnceCell<Retained<NSButton>>,
     telegram_status: OnceCell<Retained<NSTextField>>,
     telegram_pair: OnceCell<Retained<NSButton>>,
-    telegram_test: OnceCell<Retained<NSButton>>,
     telegram_disconnect: OnceCell<Retained<NSButton>>,
     login_switch: OnceCell<Retained<NSButton>>,
     animation_switch: OnceCell<Retained<NSButton>>,
@@ -461,24 +477,75 @@ define_class!(
             if let Some(field) = self.ivars().telegram_token.get() {
                 let token = field.stringValue().to_string();
                 field.setStringValue(ns_string!(""));
+                self.ivars().telegram_auto_open.borrow_mut().request(self.monitor().snapshot().telegram.link.clone());
                 let _=self.monitor().send(crate::actors::monitor::Command::Telegram(crate::actors::human::telegram::Event::Connect(token)));
                 self.refresh_telegram_settings();
             }
         }
+        #[unsafe(method(pasteTelegramToken:))]
+        fn paste_telegram_token(&self, _sender: Option<&AnyObject>) {
+            if let Some(field) = self.ivars().telegram_token.get() {
+                // Read only plain text; never log or persist clipboard contents.
+                if let Some(text) = NSPasteboard::generalPasteboard().stringForType(unsafe { NSPasteboardTypeString }) {
+                    field.setStringValue(&text);
+                    if let Some(window) = field.window() { window.makeFirstResponder(Some(field)); }
+                }
+            }
+        }
         #[unsafe(method(disconnectTelegram:))]
         fn disconnect_telegram(&self, _sender: Option<&AnyObject>) {
-            let _=self.monitor().send(crate::actors::monitor::Command::Telegram(crate::actors::human::telegram::Event::Disconnect));
+            self.ivars().telegram_auto_open.borrow_mut().cancel();
+            if let Some(field) = self.ivars().telegram_token.get() { field.setStringValue(ns_string!("")); }
+            let status = self.monitor().snapshot().telegram.clone();
+            let event = if status.paired && status.setting_up { crate::actors::human::telegram::Event::CancelSetup } else { crate::actors::human::telegram::Event::Disconnect };
+            let _=self.monitor().send(crate::actors::monitor::Command::Telegram(event));
         }
-        #[unsafe(method(toggleTelegram:))]
-        fn toggle_telegram(&self, sender: &NSButton) {
-            let _=self.monitor().send(crate::actors::monitor::Command::Telegram(crate::actors::human::telegram::Event::Enable(sender.state() == NSControlStateValueOn)));
+        #[unsafe(method(removeTelegram:))]
+        fn remove_telegram(&self, _sender: Option<&AnyObject>) {
+            self.ivars().telegram_auto_open.borrow_mut().cancel();
+            let _ = self.monitor().send(crate::actors::monitor::Command::Telegram(crate::actors::human::telegram::Event::Disconnect));
+        }
+        #[unsafe(method(changeTelegram:))]
+        fn change_telegram(&self, _sender: Option<&AnyObject>) {
+            self.ivars().telegram_auto_open.borrow_mut().cancel();
+            let _ = self.monitor().send(crate::actors::monitor::Command::Telegram(crate::actors::human::telegram::Event::BeginSetup));
+        }
+        #[unsafe(method(openBotFather:))]
+        fn open_bot_father(&self, _sender: Option<&AnyObject>) {
+            let workspace = NSWorkspace::sharedWorkspace();
+            if let Some(url) = NSURL::URLWithString(ns_string!("tg://resolve?domain=BotFather&text=%2Fnewbot"))
+                && workspace.openURL(&url) {
+                return;
+            }
+            if let Some(url) = NSURL::URLWithString(ns_string!("https://t.me/BotFather?text=%2Fnewbot")) {
+                workspace.openURL(&url);
+            }
+        }
+        #[unsafe(method(copyBotValue:))]
+        fn copy_bot_value(&self, sender: &NSButton) {
+            let text = if sender.tag() == 0 {
+                NSString::from_str("AI Agent Monitor")
+            } else if let Some(field) = self.ivars().telegram_username.get() {
+                field.stringValue()
+            } else { return; };
+            let pasteboard = NSPasteboard::generalPasteboard();
+            pasteboard.clearContents();
+            // SAFETY: AppKit's standard string pasteboard type is a valid constant.
+            pasteboard.setString_forType(&text, unsafe { NSPasteboardTypeString });
+        }
+        #[unsafe(method(regenerateBotUsername:))]
+        fn regenerate_bot_username(&self, _sender: Option<&AnyObject>) {
+            if let Some(field) = self.ivars().telegram_username.get() {
+                let value = NSString::from_str(&crate::macos::telegram_setup::username(true));
+                field.setStringValue(&value);
+                field.setToolTip(Some(&value));
+            }
         }
         #[unsafe(method(pairTelegram:))]
         fn pair_telegram(&self, _sender: Option<&AnyObject>) {
-            if let Some(link) = self.monitor().snapshot().telegram.clone().link
-                && let Some(url) = NSURL::URLWithString(&NSString::from_str(&link)) {
-                NSWorkspace::sharedWorkspace().openURL(&url);
-            }
+            let status = self.monitor().snapshot().telegram.clone();
+            let link = status.link.or_else(|| (!status.bot_username.is_empty()).then(|| format!("https://t.me/{}", status.bot_username)));
+            if let Some(link) = link { open_telegram_bot(&link); }
         }
         #[unsafe(method(testTelegram:))]
         fn test_telegram(&self, _sender: Option<&AnyObject>) {
@@ -523,6 +590,78 @@ define_class!(
         fn quit(&self, _sender: Option<&AnyObject>) {let _=self.monitor().send(crate::actors::monitor::Command::Shutdown);}
     }
 
+);
+
+fn open_telegram_bot(link: &str) {
+    let workspace = NSWorkspace::sharedWorkspace();
+    if let Ok(web) = url::Url::parse(link)
+        && web.host_str() == Some("t.me")
+        && !web.path().trim_matches('/').is_empty()
+    {
+        let mut native = url::Url::parse("tg://resolve").expect("valid Telegram scheme");
+        native
+            .query_pairs_mut()
+            .append_pair("domain", web.path().trim_matches('/'));
+        for (key, value) in web.query_pairs().filter(|(key, _)| key == "start") {
+            native.query_pairs_mut().append_pair(&key, &value);
+        }
+        if let Some(url) = NSURL::URLWithString(&NSString::from_str(native.as_str()))
+            && workspace.openURL(&url)
+        {
+            return;
+        }
+    }
+    if let Some(url) = NSURL::URLWithString(&NSString::from_str(link)) {
+        workspace.openURL(&url);
+    }
+}
+
+fn settings_note(
+    view: &NSView,
+    text: &str,
+    frame: NSRect,
+    mtm: MainThreadMarker,
+) -> Retained<NSTextField> {
+    let label = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
+    label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    label.setMaximumNumberOfLines(0);
+    label.setFrame(frame);
+    if let Some(cell) = label.cell() {
+        cell.setUsesSingleLineMode(false);
+        cell.setScrollable(false);
+        cell.setWraps(true);
+        cell.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+    }
+    view.addSubview(&label);
+    label
+}
+
+fn resize_preferences_window(window: &NSWindow, size: NSSize) {
+    crate::macos::settings_pane::resize(window, size);
+}
+
+define_class!(
+    // SAFETY: Native tab controller; selection and window sizing stay on the main thread.
+    #[unsafe(super(NSTabViewController))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AAMPreferencesTabs"]
+    #[derive(Debug)]
+    struct PreferencesTabs;
+    unsafe impl NSObjectProtocol for PreferencesTabs {}
+    impl PreferencesTabs {
+        #[unsafe(method(tabView:didSelectTabViewItem:))]
+        fn did_select(&self, tab: &NSTabView, item: Option<&NSTabViewItem>) {
+            // SAFETY: Preserve the superclass's tab-selection and view-controller lifecycle.
+            unsafe { let _: () = msg_send![super(self), tabView: tab, didSelectTabViewItem: item]; }
+            if let Some(controller) = item.and_then(|item| item.viewController(self.mtm()))
+                && let Some(window) = self.view().window() {
+                let size = controller.preferredContentSize();
+                self.setPreferredContentSize(size);
+                resize_preferences_window(&window, size);
+            }
+        }
+    }
 );
 
 #[derive(Debug)]
@@ -1440,7 +1579,7 @@ impl MenuController {
             let window = unsafe {
                 let window = NSWindow::initWithContentRect_styleMask_backing_defer(
                     NSWindow::alloc(self.mtm()),
-                    rect(0.0, 0.0, 460.0, 304.0),
+                    rect(0.0, 0.0, 460.0, 244.0),
                     NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
                     NSBackingStoreType::Buffered,
                     false,
@@ -1453,36 +1592,36 @@ impl MenuController {
             window.setHidesOnDeactivate(false);
             window.setDelegate(Some(ProtocolObject::from_ref(self)));
             let view =
-                NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 304.0));
+                NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 244.0));
             let note = self.label(
                 &view,
                 "Open AI Agent Monitor automatically",
-                rect(44.0, 232.0, 392.0, 18.0),
+                rect(44.0, 190.0, 392.0, 18.0),
                 11.0,
                 0.0,
                 true,
             );
             let separator =
-                NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(24.0, 214.0, 412.0, 1.0));
+                NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(24.0, 176.0, 412.0, 1.0));
             separator.setBoxType(NSBoxType::Separator);
             view.addSubview(&separator);
             self.label(
                 &view,
                 "Animate the eyes while an agent is working",
-                rect(44.0, 154.0, 392.0, 18.0),
+                rect(44.0, 118.0, 392.0, 18.0),
                 11.0,
                 0.0,
                 true,
             );
             for (y, action, storage, title) in [
                 (
-                    251.0,
+                    209.0,
                     sel!(toggleLogin:),
                     &state.login_switch,
                     ns_string!("Launch at login"),
                 ),
                 (
-                    173.0,
+                    137.0,
                     sel!(toggleMenuAnimation:),
                     &state.animation_switch,
                     ns_string!("Menu bar animation"),
@@ -1519,54 +1658,58 @@ impl MenuController {
                 .login_note
                 .set(note)
                 .expect("login note initialized once");
-            let separator = NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(24.0, 136.0, 412.0, 1.0));
+            let separator = NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(24.0, 104.0, 412.0, 1.0));
             separator.setBoxType(NSBoxType::Separator);
             view.addSubview(&separator);
-            self.label(&view, "Keyboard shortcut", rect(24.0, 98.0, 220.0, 22.0), 13.0, 0.23, false);
-            let note = self.label(&view, "Open the sessions menu from any app", rect(24.0, 76.0, 412.0, 18.0), 11.0, 0.0, true);
+            self.label(&view, "Keyboard shortcut", rect(24.0, 70.0, 220.0, 22.0), 13.0, 0.23, false);
+            let note = self.label(&view, "Open the sessions menu from any app", rect(24.0, 48.0, 412.0, 18.0), 11.0, 0.0, true);
             state.shortcut_note.set(note).expect("shortcut note initialized once");
             // SAFETY: Both action selectors are implemented by this retained controller.
             let record = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Record shortcut"), Some(self), Some(sel!(recordShortcut:)), self.mtm()) };
-            record.setFrame(rect(264.0, 94.0, 140.0, 28.0));
+            record.setFrame(rect(264.0, 66.0, 140.0, 28.0));
             record.setToolTip(Some(ns_string!("Click, then press a shortcut. Escape cancels.")));
             view.addSubview(&record);
             state.shortcut_button.set(record).expect("shortcut recorder initialized once");
             // SAFETY: The clear action's target remains valid for the window's lifetime.
             let clear = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("×"), Some(self), Some(sel!(clearShortcut:)), self.mtm()) };
-            clear.setFrame(rect(408.0, 94.0, 28.0, 28.0));
+            clear.setFrame(rect(408.0, 66.0, 28.0, 28.0));
             clear.setToolTip(Some(ns_string!("Clear keyboard shortcut")));
             // SAFETY: NSButton supports the accessibility label property.
             unsafe { let _: () = msg_send![&*clear, setAccessibilityLabel: ns_string!("Clear keyboard shortcut")]; }
             view.addSubview(&clear);
             state.shortcut_clear.set(clear).expect("shortcut clear button initialized once");
             let applications_view = NSView::initWithFrame(
-                NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 304.0),
+                NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 200.0),
             );
-            self.label(&applications_view, "Show sessions in the menu", rect(24.0, 264.0, 412.0, 22.0), 13.0, 0.0, false);
+            let heading = self.label(&applications_view, "Show sessions in the menu", rect(24.0, 166.0, 412.0, 22.0), 13.0, 0.0, false);
+            state.applications_heading.set(heading).expect("applications heading initialized once");
             // SAFETY: Ivar-free flipped NSView, initialized on the UI thread.
-            let list: Retained<SessionListView> = unsafe { msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 412.0, 224.0)] };
-            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(self.mtm()), rect(24.0, 20.0, 412.0, 224.0));
+            let list: Retained<SessionListView> = unsafe { msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 412.0, 140.0)] };
+            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(self.mtm()), rect(24.0, 16.0, 412.0, 140.0));
             scroll.setDrawsBackground(false);
             scroll.setHasVerticalScroller(true);
             scroll.setAutohidesScrollers(true);
             scroll.setHasHorizontalScroller(false);
             scroll.setDocumentView(Some(&list));
             applications_view.addSubview(&scroll);
+            state.applications_scroll.set(scroll).expect("applications scroll initialized once");
             state.applications_list.set(list).expect("application settings initialized once");
 
-            let integrations_view = NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 304.0));
-            self.label(&integrations_view, "Detected agents and hook setup", rect(24.0, 264.0, 412.0, 22.0), 13.0, 0.0, false);
+            let integrations_view = NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 280.0));
+            let heading = self.label(&integrations_view, "Detected agents and hook setup", rect(24.0, 246.0, 412.0, 22.0), 13.0, 0.0, false);
+            state.integrations_heading.set(heading).expect("integrations heading initialized once");
             // SAFETY: Flipped, ivar-free document view on the UI thread.
-            let integrations: Retained<SessionListView> = unsafe { msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 412.0, 184.0)] };
-            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(self.mtm()), rect(24.0, 64.0, 412.0, 184.0));
+            let integrations: Retained<SessionListView> = unsafe { msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 412.0, 172.0)] };
+            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(self.mtm()), rect(24.0, 64.0, 412.0, 172.0));
             scroll.setDrawsBackground(false);
             scroll.setHasVerticalScroller(true);
             scroll.setAutohidesScrollers(true);
             scroll.setHasHorizontalScroller(false);
             scroll.setDocumentView(Some(&integrations));
             integrations_view.addSubview(&scroll);
+            state.integrations_scroll.set(scroll).expect("integrations scroll initialized once");
             state.integrations_list.set(integrations).expect("integrations initialized once");
-            let note = self.label(&integrations_view, "", rect(24.0, 12.0, 228.0, 40.0), 10.0, 0.0, true);
+            let note = settings_note(&integrations_view, "", rect(24.0, 12.0, 228.0, 40.0), self.mtm());
             note.setUsesSingleLineMode(false);
             note.setMaximumNumberOfLines(2);
             state.integrations_note.set(note).expect("integration note initialized once");
@@ -1576,58 +1719,136 @@ impl MenuController {
             integrations_view.addSubview(&setup);
             state.integrations_button.set(setup).expect("integration setup button initialized once");
 
-            let telegram_view = NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 304.0));
-            let instructions = self.label(&telegram_view,
-                "Create your own bot with @BotFather using /newbot.\nPaste its token, connect, then open the pairing link and press Start.\nQuestions are sent directly from this Mac while the monitor is running.",
-                rect(24.0, 234.0, 412.0, 54.0), 11.0, 0.0, true);
-            instructions.setUsesSingleLineMode(false);
-            instructions.setMaximumNumberOfLines(3);
-            self.label(&telegram_view, "Bot token · stored in macOS Keychain", rect(24.0, 207.0, 412.0, 20.0), 12.0, 0.0, false);
-            let token = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(self.mtm()), rect(24.0, 176.0, 300.0, 26.0));
-            token.setPlaceholderString(Some(ns_string!("Token from @BotFather")));
+            let telegram_view = NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 494.0));
+            self.label(&telegram_view, "Set up Telegram integration", rect(24.0, 454.0, 412.0, 24.0), 15.0, 0.3, false);
+            self.label(&telegram_view, "Set up your personal Telegram bot in a few simple steps.", rect(24.0, 430.0, 412.0, 18.0), 11.0, 0.0, true);
+            settings_note(&telegram_view, "We chose personal Telegram bots over shared ones to protect your privacy. Your bot connects directly to the app running on your Mac, so your conversations never pass through our servers — only Telegram's.", rect(24.0, 366.0, 412.0, 56.0), self.mtm());
+            self.label(&telegram_view, "Already have a bot? Just paste its token below.", rect(24.0, 342.0, 412.0, 18.0), 11.0, 0.0, true);
+            self.label(&telegram_view, "1. Open BotFather and send /newbot.", rect(24.0, 310.0, 336.0, 20.0), 12.0, 0.3, false);
+            // SAFETY: Every selector is implemented by this retained settings controller.
+            let bot_father = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Open"), Some(self), Some(sel!(openBotFather:)), self.mtm()) };
+            bot_father.setFrame(rect(374.0, 306.0, 62.0, 28.0));
+            bot_father.setToolTip(Some(ns_string!("Open Telegram with /newbot ready to send")));
+            telegram_view.addSubview(&bot_father);
+            self.label(&telegram_view, "2. Choose your bot’s name and username", rect(24.0, 276.0, 412.0, 20.0), 12.0, 0.3, false);
+            for (tag, title, value, y, width) in [(0, "Bot name:", "AI Agent Monitor".to_owned(), 244.0, 254.0), (1, "Bot username:", crate::macos::telegram_setup::username(false), 212.0, 220.0)] {
+                let label = self.label(&telegram_view, title, rect(24.0, y + 2.0, 82.0, 20.0), 11.0, 0.0, false);
+                center_label(&label, y + 12.0);
+                let field = NSTextField::textFieldWithString(&NSString::from_str(&value), self.mtm());
+                field.setEditable(false);
+                field.setSelectable(true);
+                field.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(11.0, 0.0)));
+                field.setToolTip(Some(&NSString::from_str(&value)));
+                field.setFrame(rect(112.0, y, width, 24.0));
+                telegram_view.addSubview(&field);
+                if tag == 1 { state.telegram_username.set(field).expect("suggested username initialized once"); }
+                let copy = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Copy"), Some(self), Some(sel!(copyBotValue:)), self.mtm()) };
+                copy.setTag(tag);
+                copy.setFrame(rect(374.0, y - 1.0, 62.0, 26.0));
+                copy.setToolTip(Some(if tag == 0 { ns_string!("Copy bot name") } else { ns_string!("Copy bot username") }));
+                telegram_view.addSubview(&copy);
+            }
+            let regenerate = unsafe { NSButton::buttonWithTitle_target_action(ns_string!(""), Some(self), Some(sel!(regenerateBotUsername:)), self.mtm()) };
+            regenerate.setFrame(rect(338.0, 211.0, 28.0, 26.0));
+            let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(ns_string!("arrow.clockwise"), Some(ns_string!("Generate another bot username")));
+            regenerate.setImage(image.as_deref());
+            regenerate.setToolTip(Some(ns_string!("Generate another username if this one is taken")));
+            telegram_view.addSubview(&regenerate);
+            self.label(&telegram_view, "Must be unique. Regenerate if the username is taken.", rect(24.0, 190.0, 412.0, 18.0), 11.0, 0.0, true);
+            self.label(&telegram_view, "3. Copy the token from BotFather and paste it below.", rect(24.0, 162.0, 412.0, 20.0), 12.0, 0.3, false);
+            self.label(&telegram_view, "Find it in BotFather’s last message.", rect(24.0, 140.0, 412.0, 20.0), 11.0, 0.0, true);
+            self.label(&telegram_view, "Your bot token will be stored securely in macOS Keychain.", rect(24.0, 88.0, 412.0, 18.0), 11.0, 0.0, true);
+            let token = NSSecureTextField::initWithFrame(NSSecureTextField::alloc(self.mtm()), rect(24.0, 110.0, 342.0, 26.0));
+            token.setPlaceholderString(Some(ns_string!("Paste the entire token from BotFather")));
             token.setEditable(true);
             token.setSelectable(true);
+            token.setUsesSingleLineMode(true);
+            token.setMaximumNumberOfLines(1);
+            if let Some(cell) = token.cell() {
+                cell.setWraps(false);
+                cell.setScrollable(true);
+                cell.setUsesSingleLineMode(true);
+            }
             telegram_view.addSubview(&token);
             state.telegram_token.set(token).expect("Telegram token initialized once");
-            // SAFETY: Selectors are implemented by this retained controller.
             let connect = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Connect"), Some(self), Some(sel!(connectTelegram:)), self.mtm()) };
-            connect.setFrame(rect(332.0, 175.0, 104.0, 28.0));
+            connect.setFrame(rect(24.0, 8.0, 104.0, 28.0));
             telegram_view.addSubview(&connect);
-            // SAFETY: Selector and retained target are valid for the settings lifetime.
-            let enabled = unsafe { NSButton::checkboxWithTitle_target_action(ns_string!("Send questions to Telegram"), Some(self), Some(sel!(toggleTelegram:)), self.mtm()) };
-            enabled.setFrame(rect(24.0, 136.0, 412.0, 24.0));
-            telegram_view.addSubview(&enabled);
-            state.telegram_enabled.set(enabled).expect("Telegram toggle initialized once");
-            let status = self.label(&telegram_view, "Not connected", rect(24.0, 70.0, 412.0, 54.0), 11.0, 0.0, true);
+            let paste = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Paste"), Some(self), Some(sel!(pasteTelegramToken:)), self.mtm()) };
+            paste.setFrame(rect(374.0, 109.0, 62.0, 28.0));
+            telegram_view.addSubview(&paste);
+            let status = settings_note(&telegram_view, "", rect(24.0, 42.0, 412.0, 42.0), self.mtm());
             status.setUsesSingleLineMode(false);
             status.setMaximumNumberOfLines(3);
             state.telegram_status.set(status).expect("Telegram status initialized once");
             for (title, action, x, width, storage) in [
-                ("Open pairing link", sel!(pairTelegram:), 24.0, 132.0, &state.telegram_pair),
-                ("Send test", sel!(testTelegram:), 164.0, 116.0, &state.telegram_test),
-                ("Disconnect", sel!(disconnectTelegram:), 312.0, 124.0, &state.telegram_disconnect),
+                ("Open bot", sel!(pairTelegram:), 136.0, 132.0, &state.telegram_pair),
+                ("Cancel", sel!(disconnectTelegram:), 312.0, 124.0, &state.telegram_disconnect),
             ] {
-                // SAFETY: Every selector is implemented by this retained controller.
                 let button = unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(title), Some(self), Some(action), self.mtm()) };
-                button.setFrame(rect(x, 24.0, width, 28.0));
+                button.setFrame(rect(x, 8.0, width, 28.0));
                 telegram_view.addSubview(&button);
                 storage.set(button).expect("Telegram control initialized once");
             }
 
+            let telegram_root = NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 200.0));
+            telegram_root.setAutoresizesSubviews(false);
+            telegram_view.setAutoresizesSubviews(false);
+            telegram_root.addSubview(&telegram_view);
+            state.telegram_setup_view.set(telegram_view.clone()).expect("Telegram setup initialized once");
+            let connected = NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 200.0));
+            let connected_title = self.label(&connected, "Telegram is connected", rect(24.0, 152.0, 412.0, 24.0), 15.0, 0.3, false);
+            state.telegram_connected_title.set(connected_title).expect("connected title initialized once");
+            let bot = self.label(&connected, "", rect(24.0, 124.0, 240.0, 24.0), 13.0, 0.0, false);
+            bot.setSelectable(true);
+            state.telegram_bot_label.set(bot).expect("connected bot label initialized once");
+            let connected_status = settings_note(&connected, "", rect(24.0, 70.0, 412.0, 40.0), self.mtm());
+            connected_status.setUsesSingleLineMode(false);
+            connected_status.setMaximumNumberOfLines(3);
+            state.telegram_connected_status.set(connected_status).expect("Telegram status initialized once");
+            let test = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Test"), Some(self), Some(sel!(testTelegram:)), self.mtm()) };
+            let open_bot = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Open bot"), Some(self), Some(sel!(pairTelegram:)), self.mtm()) };
+            open_bot.setTitle(ns_string!("Open"));
+            open_bot.setFrame(rect(366.0, 123.0, 70.0, 26.0));
+            connected.addSubview(&open_bot);
+            state.telegram_connected_open.set(open_bot).expect("connected open button initialized once");
+            test.setFrame(rect(280.0, 123.0, 78.0, 26.0));
+            connected.addSubview(&test);
+            state.telegram_connected_test.set(test).expect("connected test initialized once");
+            let change = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Change bot"), Some(self), Some(sel!(changeTelegram:)), self.mtm()) };
+            change.setFrame(rect(24.0, 10.0, 116.0, 28.0));
+            change.setToolTip(Some(ns_string!("Set up another bot; keep the current bot until pairing is complete")));
+            connected.addSubview(&change);
+            let remove = unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Unlink bot"), Some(self), Some(sel!(removeTelegram:)), self.mtm()) };
+            remove.setFrame(rect(152.0, 10.0, 116.0, 28.0));
+            remove.setToolTip(Some(ns_string!("Disconnect and remove this bot from AI Agent Monitor")));
+            connected.addSubview(&remove);
+            connected.setAutoresizesSubviews(false);
+            telegram_root.addSubview(&connected);
+            state.telegram_connected_view.set(connected).expect("connected Telegram view initialized once");
+
             // AppKit owns the preferences toolbar, selection, and tab transitions.
-            let tabs = NSTabViewController::new(self.mtm());
+            // SAFETY: NSTabViewController's initializer is valid for this ivar-free subclass.
+            let tabs: Retained<PreferencesTabs> = unsafe { msg_send![PreferencesTabs::alloc(self.mtm()), init] };
+            state.settings_tabs.set(tabs.clone()).expect("settings tabs initialized once");
             tabs.setTabStyle(NSTabViewControllerTabStyle::Toolbar);
             tabs.setTitle(Some(ns_string!("AI Agent Monitor Settings")));
             for (title, symbol, content) in [
                 ("General", "gearshape", &view),
                 ("Applications", "square.stack.3d.up", &applications_view),
                 ("Integrations", "puzzlepiece.extension", &integrations_view),
-                ("Telegram", "paperplane", &telegram_view),
+                ("Telegram", "paperplane", &telegram_root),
             ] {
                 let controller = NSViewController::new(self.mtm());
                 controller.setTitle(Some(&NSString::from_str(title)));
+                content.setAutoresizesSubviews(false);
+                controller.setPreferredContentSize(content.frame().size);
                 controller.setView(content);
+                if title == "Applications" { state.applications_controller.set(controller.clone()).expect("applications controller initialized once"); }
+                if title == "Integrations" { state.integrations_controller.set(controller.clone()).expect("integrations controller initialized once"); }
+                if title == "Telegram" { state.telegram_controller.set(controller.clone()).expect("Telegram controller initialized once"); }
                 let item = NSTabViewItem::tabViewItemWithViewController(&controller);
+                if title == "Telegram" { state.telegram_tab_item.set(item.clone()).expect("Telegram item initialized once"); }
                 item.setLabel(&NSString::from_str(title));
                 let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
                     &NSString::from_str(symbol), Some(&NSString::from_str(title)),
@@ -1638,7 +1859,7 @@ impl MenuController {
             tabs.setSelectedTabViewItemIndex(0);
             window.setToolbarStyle(NSWindowToolbarStyle::Preference);
             window.setContentViewController(Some(&tabs));
-            window.setContentSize(NSSize::new(460.0, 304.0));
+            window.setContentSize(NSSize::new(460.0, 244.0));
             if let Some(toolbar) = window.toolbar() {
                 toolbar.setDisplayMode(NSToolbarDisplayMode::IconAndLabel);
                 toolbar.setAllowsUserCustomization(false);
@@ -1661,28 +1882,111 @@ impl MenuController {
         window.makeKeyAndOrderFront(None);
     }
 
+    fn size_settings_panel(&self, controller: &NSViewController, height: f64) {
+        let size = NSSize::new(460.0, height);
+        controller.view().setAutoresizesSubviews(false);
+        controller.setPreferredContentSize(size);
+        if let Some(tabs) = self.ivars().settings_tabs.get()
+            && tabs
+                .tabView()
+                .selectedTabViewItem()
+                .and_then(|item| item.viewController(self.mtm()))
+                .is_some_and(|selected| std::ptr::eq(&*selected, controller))
+        {
+            tabs.setPreferredContentSize(size);
+            if let Some(window) = self.ivars().settings_window.get() {
+                resize_preferences_window(window, size);
+            }
+        }
+    }
+
     fn refresh_telegram_settings(&self) {
         let status = self.monitor().snapshot().telegram.clone();
         let state = self.ivars();
+        let auto_link = state
+            .telegram_auto_open
+            .borrow_mut()
+            .take_link(status.link.as_deref());
+        if let Some(link) = auto_link {
+            open_telegram_bot(&link);
+        }
+        let configured = status.connected && status.paired && !status.setting_up;
+        if let Some(label) = state.telegram_bot_label.get() {
+            label.setStringValue(&NSString::from_str(&format!("@{}", status.bot_username)));
+        }
+        if let Some(label) = state.telegram_connected_status.get() {
+            let text = if status.text.starts_with('@') {
+                ""
+            } else {
+                &status.text
+            };
+            label.setStringValue(&NSString::from_str(text));
+        }
+        if let Some(button) = state.telegram_connected_test.get() {
+            button.setEnabled(status.enabled);
+        }
+        let note = if status.text.starts_with('@') {
+            ""
+        } else {
+            &status.text
+        };
+        let connected_height = if note.is_empty() { 116.0 } else { 160.0 };
+        if let Some(view) = state.telegram_connected_view.get() {
+            view.setFrame(rect(0.0, 0.0, 460.0, connected_height));
+        }
+        if let Some(view) = state.telegram_setup_view.get() {
+            view.setFrame(rect(0.0, 0.0, 460.0, 494.0));
+        }
+        if let Some(label) = state.telegram_connected_title.get() {
+            label.setFrameOrigin(NSPoint::new(24.0, connected_height - 40.0));
+        }
+        let center_y = connected_height - 54.0;
+        if let Some(label) = state.telegram_bot_label.get() {
+            let name_width = label
+                .cell()
+                .map(|cell| cell.cellSize().width.ceil())
+                .unwrap_or(220.0)
+                .min(268.0);
+            label.setFrame(rect(24.0, center_y - 12.0, name_width, 24.0));
+            label.setToolTip(Some(&label.stringValue()));
+            center_label(label, center_y);
+            let test_x = 24.0 + name_width + 12.0;
+            if let Some(button) = state.telegram_connected_test.get() {
+                button.setFrame(rect(test_x, center_y - 13.0, 62.0, 26.0));
+            }
+            if let Some(button) = state.telegram_connected_open.get() {
+                button.setFrame(rect(test_x + 70.0, center_y - 13.0, 62.0, 26.0));
+            }
+        }
+        if let Some(label) = state.telegram_connected_status.get() {
+            label.setHidden(note.is_empty());
+            label.setFrame(rect(24.0, 48.0, 412.0, 36.0));
+        }
+        if let Some(controller) = state.telegram_controller.get()
+            && let Some(item) = state.telegram_tab_item.get()
+            && let Some(pane) = if configured {
+                state.telegram_connected_view.get()
+            } else {
+                state.telegram_setup_view.get()
+            }
+        {
+            crate::macos::settings_pane::replace(controller, item, pane, self.mtm());
+            self.size_settings_panel(
+                controller,
+                if configured { connected_height } else { 494.0 },
+            );
+        }
         if let Some(label) = state.telegram_status.get() {
             label.setStringValue(&NSString::from_str(&status.text));
         }
-        if let Some(button) = state.telegram_enabled.get() {
-            button.setState(if status.enabled {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
-            button.setEnabled(status.connected && status.paired);
-        }
         if let Some(button) = state.telegram_pair.get() {
-            button.setEnabled(status.link.is_some());
-        }
-        if let Some(button) = state.telegram_test.get() {
-            button.setEnabled(status.enabled && status.paired);
+            let ready = status.link.is_some();
+            button.setHidden(!ready);
+            button.setEnabled(ready);
         }
         if let Some(button) = state.telegram_disconnect.get() {
-            button.setEnabled(status.connected);
+            button.setHidden(!status.connected && !status.setting_up);
+            button.setEnabled(status.connected || status.setting_up);
         }
     }
 
@@ -1713,6 +2017,7 @@ impl MenuController {
         if state.integrations_snapshot.borrow().as_ref() == Some(&rows) {
             return;
         }
+        list.setAutoresizesSubviews(false);
         let old = list.subviews();
         for index in 0..old.count() {
             old.objectAtIndex(index).removeFromSuperview();
@@ -1731,7 +2036,7 @@ impl MenuController {
         }
         let mut y = 0.0;
         for row in &rows {
-            self.label(
+            let provider = self.label(
                 list,
                 row.agent.name(),
                 rect(0.0, y + 4.0, 166.0, 22.0),
@@ -1751,15 +2056,20 @@ impl MenuController {
                 ),
                 Phase::Detected => ("circle", NSColor::secondaryLabelColor()),
             };
+            let status_x = provider
+                .cell()
+                .map(|cell| cell.cellSize().width.ceil())
+                .unwrap_or(90.0)
+                + 12.0;
             let status = self.label(
                 list,
                 row.status(),
-                rect(170.0, y + 6.0, 202.0, 18.0),
+                rect(status_x, y + 6.0, 210.0, 18.0),
                 11.0,
                 0.0,
                 false,
             );
-            status.setAlignment(NSTextAlignment::Right);
+            status.setAlignment(NSTextAlignment::Left);
             status.setTextColor(Some(&color));
             if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
                 &NSString::from_str(symbol),
@@ -1767,7 +2077,13 @@ impl MenuController {
             ) {
                 image.setTemplate(true);
                 let icon = NSImageView::imageViewWithImage(&image, self.mtm());
-                icon.setFrame(rect(380.0, y + 7.0, 14.0, 14.0));
+                let icon_x = status_x
+                    + status
+                        .cell()
+                        .map(|cell| cell.cellSize().width.ceil())
+                        .unwrap_or(140.0)
+                    + 6.0;
+                icon.setFrame(rect(icon_x, y + 7.0, 14.0, 14.0));
                 icon.setContentTintColor(Some(&color));
                 list.addSubview(&icon);
             }
@@ -1789,11 +2105,27 @@ impl MenuController {
                 })
                 .unwrap_or(32.0)
                 .max(16.0);
-            detail.setFrame(rect(0.0, y + 30.0, 396.0, height));
+            detail.setFrame(rect(0.0, y + 26.0, 396.0, height));
             list.addSubview(&detail);
-            y += height + 46.0;
+            y += height + 32.0;
         }
-        list.setFrameSize(NSSize::new(412.0, y.max(184.0)));
+        let content = if rows.is_empty() {
+            72.0
+        } else {
+            (y - 6.0).max(32.0)
+        };
+        let viewport = content.min(240.0);
+        let height = viewport + 88.0;
+        list.setFrameSize(NSSize::new(412.0, content));
+        if let Some(scroll) = state.integrations_scroll.get() {
+            scroll.setFrame(rect(24.0, 52.0, 412.0, viewport));
+        }
+        if let Some(heading) = state.integrations_heading.get() {
+            heading.setFrameOrigin(NSPoint::new(24.0, height - 32.0));
+        }
+        if let Some(controller) = state.integrations_controller.get() {
+            self.size_settings_panel(controller, height);
+        }
         *state.integrations_snapshot.borrow_mut() = Some(rows);
     }
 
@@ -1802,6 +2134,7 @@ impl MenuController {
         let Some(list) = state.applications_list.get() else {
             return;
         };
+        list.setAutoresizesSubviews(false);
         let old = list.subviews();
         for index in 0..old.count() {
             old.objectAtIndex(index).removeFromSuperview();
@@ -1819,7 +2152,7 @@ impl MenuController {
             );
         }
         for (index, app) in apps.iter().enumerate() {
-            let y = index as f64 * 32.0;
+            let y = index as f64 * 36.0;
             let image = app
                 .icon_path
                 .as_ref()
@@ -1833,21 +2166,21 @@ impl MenuController {
                 });
             if let Some(image) = image {
                 let icon = NSImageView::imageViewWithImage(&image, self.mtm());
-                icon.setFrame(rect(0.0, y + 5.0, 22.0, 22.0));
+                icon.setFrame(rect(0.0, y + 7.0, 22.0, 22.0));
                 list.addSubview(&icon);
             }
             let title = self.label(
                 list,
                 &app.name,
-                rect(32.0, y + 6.0, 312.0, 20.0),
+                rect(32.0, y + 8.0, 312.0, 20.0),
                 13.0,
                 0.0,
                 false,
             );
-            center_label(&title, y + 16.0);
+            center_label(&title, y + 18.0);
             let checkbox = NSSwitch::initWithFrame(
                 NSSwitch::alloc(self.mtm()),
-                rect(356.0, y + 4.0, 40.0, 24.0),
+                rect(356.0, y + 6.0, 40.0, 24.0),
             );
             // SAFETY: Implemented selector; this controller outlives its weak target.
             unsafe {
@@ -1871,7 +2204,19 @@ impl MenuController {
             }
             list.addSubview(&checkbox);
         }
-        list.setFrameSize(NSSize::new(412.0, (apps.len() as f64 * 32.0).max(224.0)));
+        let content = (apps.len() as f64 * 36.0).max(36.0);
+        let viewport = content.min(216.0);
+        let height = viewport + 52.0;
+        list.setFrameSize(NSSize::new(412.0, content));
+        if let Some(scroll) = state.applications_scroll.get() {
+            scroll.setFrame(rect(24.0, 12.0, 412.0, viewport));
+        }
+        if let Some(heading) = state.applications_heading.get() {
+            heading.setFrameOrigin(NSPoint::new(24.0, height - 34.0));
+        }
+        if let Some(controller) = state.applications_controller.get() {
+            self.size_settings_panel(controller, height);
+        }
     }
 
     fn refresh_settings(&self) {
@@ -4725,6 +5070,33 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<Option<Resident>> {
         return Ok(None);
     }
     let (ui, incoming) = tokio::sync::mpsc::channel(128);
+    // Standard edit key equivalents dispatch to the field editor through the
+    // responder chain, including secure text fields in the settings window.
+    let app = NSApplication::sharedApplication(mtm);
+    let main_menu = app.mainMenu().unwrap_or_else(|| NSMenu::new(mtm));
+    let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
+    for (title, action, key) in [
+        ("Cut", sel!(cut:), "x"),
+        ("Copy", sel!(copy:), "c"),
+        ("Paste", sel!(paste:), "v"),
+        ("Select All", sel!(selectAll:), "a"),
+    ] {
+        // SAFETY: Standard AppKit actions, with nil target for responder routing.
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        edit.addItem(&item);
+    }
+    let item = NSMenuItem::new(mtm);
+    item.setTitle(ns_string!("Edit"));
+    item.setSubmenu(Some(&edit));
+    main_menu.addItem(&item);
+    app.setMainMenu(Some(&main_menu));
     let actors = crate::app::actor_system::ActorSystem::start(ui.clone())?;
     let notifications = actors.start_notifications(ui.clone());
     let ipc = actors.start_ipc()?;

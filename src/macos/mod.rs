@@ -17,4 +17,6 @@ pub(crate) mod session_layout;
 mod session_robot;
 mod session_thread;
 pub(crate) mod settings;
+mod settings_pane;
+mod telegram_setup;
 pub(crate) mod terminal;

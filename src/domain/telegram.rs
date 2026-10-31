@@ -1,6 +1,8 @@
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Status {
     pub connected: bool,
+    pub bot_username: String,
+    pub setting_up: bool,
     pub enabled: bool,
     pub paired: bool,
     pub text: String,

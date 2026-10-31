@@ -5,7 +5,7 @@
   <!-- Add a real demo GIF here once recorded: open sessions → permission request → Allow → project. -->
 
   <p><strong>Your coding agents, one menu away.</strong></p>
-  <p>A native macOS menu bar app for your Codex sessions.<br>See what’s working, answer approval requests, and jump back to the right project.<br>Experimental support for Claude Code and Cline.</p>
+  <p>A native macOS menu bar app for your Codex sessions.<br>See what’s working, review commands, answer requests, and return to the right project.<br>Use the menu, macOS notifications, or your own Telegram bot.<br>Experimental support for Claude Code and Cline.</p>
 
   <p>
     <img src="https://img.shields.io/badge/macOS-13%2B-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 13 or later">
@@ -23,11 +23,11 @@
 
 - **All open sessions in one place.** See your Codex sessions across VS Code, terminal apps, and the desktop client, arranged by application and sorted by name, with pinned application icons.
 - **Status at a glance.** A green number counts working sessions, green robot eyes show activity, and an orange counter beside the icon counts requests waiting for a response.
-- **Answer from the menu or a notification.** Read approval requests and questions, choose an offered answer, or enter a custom reply without switching windows.
+- **Review and answer requests.** Inspect the command and permission scope, choose an action offered by Codex, or answer single and multiple questions from the menu or macOS notifications.
 - **Return to the right project.** Jump to a VS Code workspace or the session’s terminal app, with matching-tab selection in Terminal and iTerm.
-- **Take questions to Telegram.** Connect your own bot, browse sessions and message history, answer questions, and send messages to a live Codex session. Resolved standalone question notifications are removed automatically.
+- **Continue in Telegram.** Connect your own bot, browse sessions and history, answer requests, and send messages to a live Codex session. Requests update the current session message in place, keeping the conversation calm.
 
-One Rust executable, native AppKit controls, and macOS notifications. No Python or Swift runtime is needed.
+Codex connects directly through its local client protocol; no Codex approval hook or hook trust prompt is required. One Rust executable provides native AppKit controls and macOS notifications. No Python or Swift runtime is needed.
 
 ## Supported agents
 
@@ -92,7 +92,7 @@ Normal launches keep only the robot icon in the menu bar. Click it to see your s
 - **Local session data.** Discovery, message history, Git metadata, and Codex quota are read on your Mac. Passive monitoring does not start model turns. Answers and chat messages are sent to the existing agent only after you explicitly choose or submit them.
 - **Hook configuration.** Codex connects directly without modifying its hook configuration. First-launch setup connects Claude Code and Cline through hooks. Modified Claude configuration is backed up; unrelated hooks are preserved, and existing third-party Cline hook files are not overwritten. Review the result in **Settings → Integrations**.
 - **macOS permissions.** Notification permission enables banners and answer buttons. macOS may request Automation permission to select tabs in Terminal or iTerm. Launch at login is optional and controlled in settings.
-- **Optional Telegram delivery.** The monitor connects directly to your bot; there is no project-hosted relay. Once paired and enabled, session titles, question text, approval commands, permission scopes, and answer choices are sent to Telegram, and replies return through the bot. The bot token is stored in macOS Keychain. Browsing sessions and opening **Info** also sends the requested message history or folder/branch metadata. Pausing question delivery still allows read-only commands from the paired account.
+- **Optional Telegram delivery.** The monitor connects directly to your bot; there is no project-hosted relay. Once paired and enabled, session titles, question text, approval commands, permission scopes, and answer choices are sent to Telegram, and replies return through the bot. The bot token is stored in macOS Keychain. Browsing sessions and opening **Info** also sends the requested message history or folder/branch metadata. Disconnect the bot in settings to stop Telegram delivery.
 
 ## Price & license
 
@@ -160,7 +160,7 @@ Click the robot icon, or use your configured shortcut, to open the menu. Idle se
 - **Click outside**, press **Escape**, or use the shortcut again to close the menu.
 - Use **gear** in the footer to open settings, or **power** to quit the resident monitor.
 
-Closing the menu clears the filter and collapses the sessions. On the next opening, working sessions and requests needing a response expand again. Quitting the resident monitor does not remove installed hooks. A later hook starts the installed monitor in the background when needed.
+Closing the menu clears the filter and collapses the sessions. On the next opening, working sessions and requests needing a response expand again. Keep the monitor running to receive Codex requests. Quitting does not remove Claude Code or Cline hooks; a later hook can start the installed monitor in the background.
 
 Project navigation opens the workspace in VS Code; it does not select a particular chat. If the project folder no longer exists, the monitor switches to VS Code without trying to open the missing path. If the same project is open in several windows, VS Code chooses the window.
 
@@ -192,7 +192,7 @@ Filtering ignores case and splits the query on spaces. Every word must appear in
 
 ### Approvals and questions
 
-Command approvals show the command in a selectable monospaced block below the question. When Codex offers **Allow similar commands**, its allowed command prefix is shown separately from the full command. Telegram includes the command and readable permission scope too.
+Command approvals show the question first, then the command in a monospaced block, followed by the action buttons. Long commands wrap; select the text and press **⌘C** to copy it. When Codex offers **Allow similar commands**, a separate block shows the allowed command prefix, which can differ from the full command. Telegram includes the command and readable permission scope too. Commands are shown when supplied by the agent; the monitor does not infer them from the question.
 
 Expand a pending request to read it and see its available actions beneath the message. Buttons follow the choices offered by the agent. When they fit, they share one row; otherwise they form a column.
 
@@ -202,7 +202,7 @@ The monitor rechecks that the request is still current before sending a response
 
 macOS notifications use actions specific to the request. Depending on the notification layout, these may appear in an actions menu. **Answer questions** and **More answers** open the sessions menu with the request expanded. macOS controls how many actions and text lines are visible.
 
-**Hook-based approvals:** hooks forward their events to the resident monitor and wait up to 60 seconds for a one-time **Allow**. The monitor owns the request, notification, and response to the agent. The same response handler serves notification buttons and the session menu. Dismissing a notification leaves the request in the monitor; expiry, disconnection, or restarting the monitor returns control without approval. A stale notification cannot approve a later request. Errors never grant permission automatically.
+**Claude Code hook approvals (experimental):** hooks forward their events to the resident monitor and wait up to 60 seconds for a one-time **Allow**. The monitor owns the request, notification, and response to the agent. The same response handler serves notification buttons and the session menu. Dismissing a notification leaves the request in the monitor; expiry, disconnection, or restarting the monitor returns control without approval. A stale notification cannot approve a later request. Errors never grant permission automatically.
 
 ### Codex quota
 
@@ -218,10 +218,10 @@ Settings use a native preferences toolbar with four sections: **General**, **App
 | --- | --- | --- |
 | **General** | Launch at login | Registers a macOS Login Item; disabled by default |
 | **General** | Menu bar animation | Animates green robot eyes while agents work; when disabled, working eyes stay green |
-| **Integrations** | Check & set up | Inspect detected agents, hook status and errors, or retry setup |
 | **General** | Keyboard shortcut | Records a global shortcut using ⌘, ⌥, or ⌃; **Escape** cancels recording and **×** clears it |
 | **Applications** | Application switches | Show or hide that application's sessions in the menu |
-| **Telegram** | Personal bot | Connect and pair your bot, pause or resume questions, send a test, or disconnect |
+| **Integrations** | Check & set up | Detect Codex; inspect and set up Claude Code and Cline hooks |
+| **Telegram** | Personal bot | Follow the setup steps, connect and pair your bot, send a test, or disconnect |
 
 The Integrations section shows Codex as **No setup required**. Claude Code and Cline show **Needs setup**, **Setting up…**, **Hooks installed**, or **Needs attention**. Hook status is checked against the current configuration; **Hooks installed** does not confirm Cline’s Enable Hooks setting. Required next steps appear beneath each agent. Setup runs in the background without a separate results window.
 
@@ -235,12 +235,13 @@ Connect your own bot to receive questions, browse sessions, and reply away from 
 
 ### Connect your bot
 
-1. Open [@BotFather](https://t.me/BotFather), send `/newbot`, and create a dedicated bot.
-2. In **Settings → Telegram**, paste its token and click **Connect**. The token is stored in macOS Keychain.
-3. Click **Open pairing link**, then press **Start** in your bot. The one-time link expires after 10 minutes.
-4. Click **Send test** to verify delivery.
+1. Open **Settings → Telegram** and click **Open** beside step 1 under **Set up Telegram integration**. Telegram opens BotFather with `/newbot` ready to send; press **Send**.
+2. When BotFather asks for a name, copy **AI Agent Monitor** using the first **Copy** button. Then copy the suggested username, based on your macOS full name, such as `aiagmon_alex_morgan_bot`, using the second **Copy** button. Names are transliterated to Latin characters and limited to 32 characters. If the username is taken, click the refresh icon to add a short random suffix, such as `aiagmon_alex_morgan_7ab4_bot`.
+3. Copy the API token from BotFather’s last message, paste it below, and click **Connect**. If you already have a bot, just paste its token. The token is stored in macOS Keychain.
+4. The bot opens automatically in Telegram after **Connect**. Press **Start** to finish connecting. Use **Open bot** to return to it at any time. The start link expires after 10 minutes.
+5. On the connected-bot screen, click **Test** to verify delivery.
 
-**Send questions to Telegram** pauses or resumes question delivery. **Disconnect** removes the saved token and pairing. Use a separate bot for each monitor instance: another polling client or an active webhook cannot share the bot connection.
+After pairing, the setup guide is replaced by the connected bot’s username, with **Test** and **Open** beside it. **Change bot** and **Unlink bot** appear below. **Unlink bot** disconnects the bot and deletes the saved token and pairing. **Change bot** opens setup in the same settings window while the current bot keeps working. The monitor switches only after the new bot is paired successfully; **Cancel** keeps the current connection. Question delivery starts after pairing; there is no separate switch to enable. Disconnecting removes the saved token and pairing. Use a separate bot for each monitor instance: another polling client or an active webhook cannot share the bot connection.
 
 ### Browse and chat
 
@@ -253,7 +254,18 @@ Select a session to read its latest message and pending request. Available contr
 - **Info / Message** — show the working folder and Git branch, or return to the conversation.
 - **‹ Sessions** — return to the list. Large lists are paginated.
 
-Views update automatically; there are no Refresh buttons. New agent output in the selected session is posted at the bottom of the chat. The previous message stays in the conversation with its buttons removed. New requests, resolved requests, and status changes edit the current message in place; these edits do not generate a new Telegram notification. A request already displayed in the selected session is not sent again as a standalone notification; an earlier standalone copy is removed when the request is shown there.
+Views update automatically; there are no Refresh buttons. In the selected session:
+
+| Event | What happens in Telegram |
+| --- | --- |
+| New agent message | Posted at the bottom of the chat; the previous message keeps its text and loses its buttons |
+| Approval or question arrives | Added to the current message with the agent's available answer buttons |
+| Request is answered, including in the editor | Removed from the current message; the agent's text stays |
+| Status changes | The current message is edited |
+
+Request and status updates keep the same message ID, without deleting and reposting the session card. Telegram does not send a new notification for these edits. Two consecutive approvals therefore do not leave extra copies of the same agent message in the history.
+
+A request already visible in the selected session is not sent again as a standalone notification. Requests from other sessions still arrive separately. If you open a session whose request was already sent separately, that standalone copy is removed.
 
 The selected session is stored separately from notification messages and restored after a monitor restart. A request from another session does not change the destination for chat text. Opening **Sessions** or returning to the list clears the destination; text sent without a selection produces a hint instead of being silently ignored.
 
@@ -271,13 +283,13 @@ The persistent button keyboard contains **Sessions** and **Help**, without slash
 | `/info` | Show the selected session's working folder and Git branch |
 | `/help` | Show available commands and usage |
 
-`/status` is also accepted when typed manually and reports the monitor version and notification state; it is not listed in the main menu. Read-only commands remain available while question delivery is paused. After an update, press **Help** to replace a previously saved button keyboard.
+`/status` is also accepted when typed manually and reports the monitor version and notification state; it is not listed in the main menu. Commands require the paired private account. After an update, press **Help** to replace a previously saved button keyboard.
 
 ### Answers and cleanup
 
 Only the paired private Telegram account can reply. Every answer goes through the monitor's shared request validation, just like an answer from the Mac menu or a macOS notification.
 
-When a request is resolved, including in the editor, the monitor deletes its standalone question notification. If deletion is unavailable, it replaces the text and removes the answer buttons; temporary cleanup failures are retried. Session conversation messages are retained, with their controls updated or removed as appropriate.
+When a request is resolved, including in the editor, it disappears from the selected session message. If it was sent as a standalone question notification, the monitor deletes that notification instead. If Telegram refuses deletion, it replaces the text and removes the answer buttons; temporary cleanup failures are retried. Genuine agent messages remain in the conversation history.
 
 Telegram is opt-in. Session titles, questions, and answer choices are sent through your bot; browsing sends the requested messages, and **Info** sends the working folder and Git branch. See [Privacy & permissions](#privacy--permissions).
 
@@ -295,7 +307,7 @@ The app now uses `com.melsomino.ai-agent-monitor` as its macOS bundle identifier
 
 Check that the agent runs locally. For Claude Code, restart after hook installation; for Cline, enable hooks and reopen the task. Codex uses a direct local connection; restart its client if live requests are unavailable.
 
-Open **Settings → Integrations** to inspect agent status and errors, then use **Check & set up** to retry setup. No terminal commands are required.
+Open **Settings → Integrations** to inspect detected agents. **Check & set up** retries Claude Code and Cline hook setup. Codex needs no setup; restart the monitor if its live connection stops updating. No terminal commands are required.
 
 Codex's local client protocol is version-dependent. If a live request cannot be read or answered, use the agent's own interface. Logs can still supply session activity and messages; approvals require the direct connection. Historical chats are not added as substitutes for unavailable session data. If an agent adapter stops, its sessions are marked unavailable and replies are disabled; restart the monitor to reconnect.
 
