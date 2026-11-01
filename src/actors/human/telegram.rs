@@ -287,7 +287,7 @@ impl Pending {
             text.markdown(body, 2200);
             if let Some(command) = &self.interaction.command {
                 text.plain("\n\n");
-                text.code(&short(command, 1600));
+                text.code_block(&short(command, 1600), Some("bash"));
             }
             if let Some(question) = question {
                 text.plain(&format!(
@@ -310,8 +310,11 @@ impl Pending {
                 for (index, action) in self.interaction.actions.iter().enumerate().take(90) {
                     rows.push(json!([{"text":short(&action.label,80),"callback_data":format!("{}:{index}",self.nonce)}]));
                     if !action.detail.is_empty() {
-                        text.plain(&format!("\n\n{}: ", action.label));
-                        text.markdown(&action.detail, 300);
+                        text.plain(&format!("\n\n{}:\n", action.label));
+                        text.code_block(
+                            &short(&action.detail, 300),
+                            (action.label == "Allow similar commands").then_some("bash"),
+                        );
                     }
                 }
                 if rows.is_empty() {
@@ -2639,7 +2642,9 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|entity| {
-                    entity["type"] == "code" && entity["length"] == command.encode_utf16().count()
+                    entity["type"] == "pre"
+                        && entity["language"] == "bash"
+                        && entity["length"] == command.encode_utf16().count()
                 })
         );
     }

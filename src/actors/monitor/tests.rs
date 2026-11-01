@@ -84,6 +84,134 @@ impl Drop for Harness {
         self.task.abort();
     }
 }
+fn active_session(id: &str, activity: Activity) -> Session {
+    let mut value = session(id, "");
+    value.approval = None;
+    value.interaction_data = Interaction::default();
+    value.activity = activity;
+    value
+}
+
+#[tokio::test]
+async fn finished_sessions_stay_unseen_until_acknowledged() {
+    let h = Harness::new();
+    let idle = active_session("one", Activity::Idle);
+    h.observe(vec![idle.clone()]).await;
+    let initial = h.wait(|state| state.sessions.len() == 1).await;
+    assert!(
+        initial.unseen_finished.is_empty(),
+        "initial idle discovery is not a completion"
+    );
+    h.observe(vec![active_session("one", Activity::Working)])
+        .await;
+    h.wait(|state| state.sessions[0].activity == Activity::Working)
+        .await;
+    h.observe(vec![idle.clone()]).await;
+    let finished = h.wait(|state| state.unseen_finished.len() == 1).await;
+    let generation = finished.unseen_finished[&idle.key()];
+    h.handle.enqueue(Command::Refresh).await.unwrap();
+    let refreshed = h.wait(|state| state.revision > finished.revision).await;
+    assert_eq!(refreshed.unseen_finished[&idle.key()], generation);
+    h.handle
+        .enqueue(Command::FinishedSeen {
+            completions: refreshed.unseen_finished.clone(),
+        })
+        .await
+        .unwrap();
+    h.wait(|state| state.unseen_finished.is_empty()).await;
+    h.observe(vec![idle]).await;
+    assert!(h.handle.snapshot().unseen_finished.is_empty());
+}
+
+#[tokio::test]
+async fn stale_seen_acknowledgement_cannot_clear_a_new_completion_or_running_session() {
+    let h = Harness::new();
+    let idle = active_session("one", Activity::Idle);
+    let working = active_session("one", Activity::Working);
+    h.observe(vec![working.clone()]).await;
+    h.wait(|state| state.sessions.len() == 1).await;
+    h.observe(vec![idle.clone()]).await;
+    let first = h.wait(|state| !state.unseen_finished.is_empty()).await;
+    h.observe(vec![working.clone()]).await;
+    let running = h
+        .wait(|state| state.sessions[0].activity == Activity::Working)
+        .await;
+    assert!(running.unseen_finished.is_empty());
+    h.handle
+        .enqueue(Command::FinishedSeen {
+            completions: first.unseen_finished.clone(),
+        })
+        .await
+        .unwrap();
+    let acknowledged = h.wait(|state| state.revision > running.revision).await;
+    assert_eq!(acknowledged.sessions[0].activity, Activity::Working);
+    h.observe(vec![idle.clone()]).await;
+    let second = h.wait(|state| !state.unseen_finished.is_empty()).await;
+    assert_ne!(
+        first.unseen_finished[&idle.key()],
+        second.unseen_finished[&idle.key()]
+    );
+    h.handle
+        .enqueue(Command::FinishedSeen {
+            completions: first.unseen_finished.clone(),
+        })
+        .await
+        .unwrap();
+    let after = h.wait(|state| state.revision > second.revision).await;
+    assert_eq!(after.unseen_finished, second.unseen_finished);
+    h.observe(vec![]).await;
+    h.wait(|state| state.sessions.is_empty() && state.unseen_finished.is_empty())
+        .await;
+}
+
+#[tokio::test]
+async fn acknowledging_one_finished_session_does_not_clear_other_sessions() {
+    let h = Harness::new();
+    h.observe(vec![
+        active_session("one", Activity::Working),
+        active_session("two", Activity::Working),
+    ])
+    .await;
+    h.wait(|state| state.sessions.len() == 2).await;
+    h.observe(vec![
+        active_session("one", Activity::Idle),
+        active_session("two", Activity::Idle),
+    ])
+    .await;
+    let finished = h.wait(|state| state.unseen_finished.len() == 2).await;
+    h.handle
+        .enqueue(Command::FinishedSeen {
+            completions: HashMap::from([(
+                "codex:one".into(),
+                finished.unseen_finished["codex:one"],
+            )]),
+        })
+        .await
+        .unwrap();
+    let seen = h.wait(|state| state.unseen_finished.len() == 1).await;
+    assert!(seen.unseen_finished.contains_key("codex:two"));
+}
+
+#[tokio::test]
+async fn unavailable_or_confirmation_sessions_do_not_report_finished() {
+    let h = Harness::new();
+    h.observe(vec![active_session("one", Activity::Working)])
+        .await;
+    h.wait(|state| state.sessions.len() == 1).await;
+    let mut idle = active_session("one", Activity::Idle);
+    idle.authoritative = false;
+    h.observe(vec![idle]).await;
+    let unavailable = h.wait(|state| !state.sessions[0].authoritative).await;
+    assert!(unavailable.unseen_finished.is_empty());
+    h.observe(vec![session("one", "request")]).await;
+    h.wait(|state| state.sessions[0].activity == Activity::Confirmation)
+        .await;
+    h.observe(vec![active_session("one", Activity::Idle)]).await;
+    let resolved = h
+        .wait(|state| state.sessions[0].activity == Activity::Idle)
+        .await;
+    assert!(resolved.unseen_finished.is_empty());
+}
 #[tokio::test]
 async fn state_subscriptions_include_existing_questions_and_both_humans_see_resolution() {
     let h = Harness::new();

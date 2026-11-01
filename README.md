@@ -81,6 +81,8 @@ Click the menu bar icon to see your sessions.
 
 The icon shows a green count when agents are working and an orange count when requests need your attention.
 
+A blue count shows sessions that have just finished working and have not been seen yet. Those sessions have a blue checkmark in the menu. Their indicators clear when you expand or collapse that session, open it in its application, or load its previous message. Merely viewing or closing the menu does not clear them. A session that starts working again returns to its working state.
+
 Select a session to see its latest messages, working directory, Git branch, and any pending requests. Earlier messages can be loaded from the session history.
 
 When an agent requests permission or asks a question, the available responses appear in the session panel. Supported requests can also be answered from macOS notifications.

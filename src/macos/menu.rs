@@ -70,6 +70,7 @@ enum ControlKind {
     Form,
     Open,
     Native,
+    ContextToggle(String),
 }
 #[derive(Clone)]
 struct RequestControl {
@@ -152,6 +153,8 @@ pub struct State {
     status_badge: OnceCell<Retained<NSBox>>,
     status_count: OnceCell<Retained<NSTextField>>,
     status_working_count: OnceCell<Retained<NSTextField>>,
+    status_finished_count: OnceCell<Retained<NSTextField>>,
+    status_finished_badge: OnceCell<Retained<NSBox>>,
     status_icon: OnceCell<Retained<NSImageView>>,
     status_base_images: OnceCell<[Retained<NSImage>; 2]>,
     status_eyes: OnceCell<[Retained<NSImageView>; 2]>,
@@ -230,6 +233,7 @@ pub struct State {
     buttons: RefCell<Vec<ButtonHover>>,
     request_controls: RefCell<HashMap<String, RequestControl>>,
     question_panels: RefCell<HashMap<String, Retained<inline_questions::Panel>>>,
+    expanded_contexts: RefCell<HashSet<String>>,
     responding: RefCell<HashSet<String>>,
     message_history: RefCell<HashMap<String, MessageHistory>>,
     history_generation: Cell<u64>,
@@ -243,6 +247,24 @@ pub struct State {
 }
 
 impl State {
+    fn acknowledge_finished(&self, key: &str) {
+        let Some(monitor) = self.monitor.get() else {
+            return;
+        };
+        let snapshot = monitor.snapshot();
+        let Some(&generation) = snapshot.unseen_finished.get(key) else {
+            return;
+        };
+        if snapshot
+            .sessions
+            .iter()
+            .any(|session| session.key() == key && session.activity == Activity::Idle)
+        {
+            let _ = monitor.send(crate::actors::monitor::Command::FinishedSeen {
+                completions: HashMap::from([(key.to_owned(), generation)]),
+            });
+        }
+    }
     fn working_count(&self) -> usize {
         let applications = self.applications.borrow();
         self.all
@@ -252,6 +274,22 @@ impl State {
                 session.activity == Activity::Working && applications.enabled(session.client)
             })
             .count()
+    }
+    fn finished_count(&self) -> usize {
+        let snapshot = self.monitor.get().map(|monitor| monitor.snapshot());
+        let applications = self.applications.borrow();
+        snapshot
+            .map(|snapshot| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .filter(|session| {
+                        applications.enabled(session.client)
+                            && snapshot.unseen_finished.contains_key(&session.key())
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
     fn filtered_sessions(&self) -> Vec<Session> {
         let query = self.filter_query.borrow();
@@ -275,6 +313,7 @@ impl State {
         self.opened_approvals.borrow_mut().clear();
         self.opened_working.borrow_mut().clear();
         self.message_history.borrow_mut().clear();
+        self.expanded_contexts.borrow_mut().clear();
         self.history_generation
             .set(self.history_generation.get().wrapping_add(1));
     }
@@ -410,6 +449,7 @@ define_class!(
             let Some(key) = sender.identifier().map(|id| id.to_string()) else { return; };
             let state = self.ivars();
             let Some(session) = state.all.borrow().iter().find(|session| session.key() == key).cloned() else { return; };
+            state.acknowledge_finished(&key);
             let ticket = state.history_generation.get().wrapping_add(1);
             state.history_generation.set(ticket);
             let before = {
@@ -438,9 +478,17 @@ define_class!(
             let control = self.ivars().request_controls.borrow().get(&id).cloned();
             let Some(control) = control else { return; };
             match control.kind {
+                ControlKind::ContextToggle(key) => {
+                    let mut expanded = self.ivars().expanded_contexts.borrow_mut();
+                    if !expanded.remove(&key) { expanded.insert(key); }
+                    drop(expanded);
+                    self.render_rows(&self.ivars().filtered_sessions());
+                    self.update_hover();
+                }
                 ControlKind::Native => {},
                 ControlKind::Form => { self.dismiss_menu(); self.show_form(control.session,None); }
                 ControlKind::Open => {
+                    self.ivars().acknowledge_finished(&control.session.key());
                     self.dismiss_menu(); self.monitor().open(&control.session);
                 }
                 ControlKind::Reply(response) => {
@@ -455,6 +503,7 @@ define_class!(
             let Some(id) = sender.and_then(|button| button.identifier()) else { return; };
             let data = self.ivars().all.borrow();
             if let Some(session) = data.iter().find(|session| session.key() == id.to_string()) {
+                self.ivars().acknowledge_finished(&session.key());
                 self.dismiss_menu();
                 self.monitor().open(session);
             }
@@ -2379,18 +2428,47 @@ impl MenuController {
             badge.setFillColor(&NSColor::systemOrangeColor());
             content.addSubview(&badge);
             let count = self.label(&content, "", rect(28.0, 0.0, 14.0, 14.0), 10.0, 0.3, false);
+            count.setFont(Some(&NSFont::systemFontOfSize(10.0)));
             count.setAlignment(NSTextAlignment::Center);
             count.setTextColor(Some(&NSColor::blackColor()));
             center_label(&count, height / 2.0);
             let working_count =
                 self.label(&content, "", rect(28.0, 0.0, 14.0, 18.0), 12.0, 0.23, false);
             working_count.setTextColor(Some(&NSColor::systemGreenColor()));
+            working_count.setFont(Some(&NSFont::systemFontOfSize(12.0)));
             working_count.setHidden(true);
             center_label(&working_count, height / 2.0);
             self.ivars()
                 .status_working_count
                 .set(working_count)
                 .expect("working count initialized once");
+            let finished_badge =
+                NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(28.0, 0.0, 14.0, 14.0));
+            finished_badge.setBoxType(NSBoxType::Custom);
+            finished_badge.setTitlePosition(NSTitlePosition::NoTitle);
+            finished_badge.setBorderWidth(0.0);
+            finished_badge.setCornerRadius(7.0);
+            finished_badge.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
+                0.45, 0.78, 1.0, 1.0,
+            ));
+            finished_badge.setHidden(true);
+            content.addSubview(&finished_badge);
+            self.ivars()
+                .status_finished_badge
+                .set(finished_badge)
+                .expect("finished badge initialized once");
+            let finished_count =
+                self.label(&content, "", rect(28.0, 0.0, 14.0, 14.0), 10.0, 0.4, false);
+            finished_count.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+                0.07, 0.15, 0.21, 1.0,
+            )));
+            finished_count.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+            finished_count.setAlignment(NSTextAlignment::Center);
+            finished_count.setHidden(true);
+            self.ivars()
+                .status_finished_count
+                .set(finished_count)
+                .expect("finished count initialized once");
             button.addSubview(&content);
             self.ivars()
                 .status_content
@@ -2462,6 +2540,28 @@ impl MenuController {
         } else {
             0.0
         };
+        let finished_count = state.finished_count();
+        let finished_number_width = if finished_count > 99 {
+            26.0
+        } else if finished_count > 9 {
+            20.0
+        } else {
+            14.0
+        };
+        if let Some(label) = state.status_finished_count.get() {
+            label.setHidden(finished_count == 0);
+            label.setStringValue(&NSString::from_str(&if finished_count > 99 {
+                "99+".into()
+            } else {
+                finished_count.to_string()
+            }));
+        }
+        let finished_gap = if working_count > 0 { 5.0 } else { 2.0 };
+        let finished_width = if finished_count > 0 {
+            finished_gap + finished_number_width
+        } else {
+            0.0
+        };
         let badge_width = if count > 99 {
             26.0
         } else if count > 9 {
@@ -2469,8 +2569,13 @@ impl MenuController {
         } else {
             14.0
         };
-        let request_gap = if working_count > 0 { 5.0 } else { 2.0 };
+        let request_gap = if working_count > 0 || finished_count > 0 {
+            5.0
+        } else {
+            2.0
+        };
         let extra_width = working_width
+            + finished_width
             + if count > 0 {
                 request_gap + badge_width
             } else {
@@ -2513,7 +2618,21 @@ impl MenuController {
             label.setFrame(rect(28.0, 0.0, number_width, 18.0));
             center_label(label, height / 2.0);
         }
-        let badge_x = 26.0 + working_width + request_gap;
+        let finished_frame = rect(
+            26.0 + working_width + finished_gap,
+            height / 2.0 - 7.0,
+            finished_number_width,
+            14.0,
+        );
+        if let Some(badge) = state.status_finished_badge.get() {
+            badge.setHidden(finished_count == 0);
+            badge.setFrame(finished_frame);
+        }
+        if let Some(label) = state.status_finished_count.get() {
+            label.setFrame(finished_frame);
+            center_label(label, height / 2.0);
+        }
+        let badge_x = 26.0 + working_width + finished_width + request_gap;
         let badge_y = height / 2.0 - 7.0;
         if let Some(badge) = state.status_badge.get() {
             badge.setHidden(count == 0);
@@ -2562,6 +2681,9 @@ impl MenuController {
         }
         if count > 0 {
             tooltip.push_str(&format!(" · Pending requests: {count}"));
+        }
+        if finished_count > 0 {
+            tooltip.push_str(&format!(" · Unseen finished: {finished_count}"));
         }
         button.setToolTip(Some(&NSString::from_str(&tooltip)));
     }
@@ -2838,12 +2960,67 @@ impl MenuController {
         &self,
         view: &NSView,
         activity: Activity,
+        finished: bool,
         y: f64,
     ) -> Option<Retained<WorkingIconView>> {
+        if activity == Activity::Confirmation || (finished && activity == Activity::Idle) {
+            let is_finished = activity == Activity::Idle;
+            let color = if is_finished {
+                appearance_color([0.0, 102.0, 190.0], [115.0, 199.0, 255.0], 1.0)
+            } else {
+                NSColor::systemOrangeColor()
+            };
+            let ink = if is_finished {
+                appearance_color([255.0; 3], [21.0, 49.0, 73.0], 1.0)
+            } else {
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.2, 0.125, 0.0, 1.0)
+            };
+            // Match the preview's 18-point symbol viewport and 15-point disc.
+            let disc: Retained<StatusContentView> = unsafe {
+                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(328.0, y - 1.0, 18.0, 18.0)]
+            };
+            let circle = NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(1.5, 1.5, 15.0, 15.0));
+            circle.setBoxType(NSBoxType::Custom);
+            circle.setTitlePosition(NSTitlePosition::NoTitle);
+            circle.setBorderWidth(0.0);
+            circle.setCornerRadius(7.5);
+            circle.setFillColor(&color);
+            disc.addSubview(&circle);
+            if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                if is_finished {
+                    ns_string!("checkmark")
+                } else {
+                    ns_string!("exclamationmark")
+                },
+                Some(if is_finished {
+                    ns_string!("Finished (unseen)")
+                } else {
+                    ns_string!("Needs response")
+                }),
+            ) {
+                let configuration =
+                    NSImageSymbolConfiguration::configurationWithPointSize_weight(10.0, 0.4);
+                let image = image
+                    .imageWithSymbolConfiguration(&configuration)
+                    .unwrap_or(image);
+                image.setTemplate(true);
+                let icon = NSImageView::imageViewWithImage(&image, self.mtm());
+                icon.setFrame(rect(4.0, 4.0, 10.0, 10.0));
+                icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+                icon.setContentTintColor(Some(&ink));
+                disc.addSubview(&icon);
+            }
+            disc.setToolTip(Some(if is_finished {
+                ns_string!("Finished (unseen)")
+            } else {
+                ns_string!("Needs response")
+            }));
+            view.addSubview(&disc);
+            return None;
+        }
         let (symbol, color) = match activity {
             Activity::Working => ("arrow.triangle.2.circlepath", NSColor::systemGreenColor()),
-            Activity::Confirmation => ("exclamationmark.circle", NSColor::systemOrangeColor()),
-            Activity::Idle => return None,
+            Activity::Idle | Activity::Confirmation => return None,
             Activity::Unknown => ("questionmark.circle", NSColor::tertiaryLabelColor()),
         };
         if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
@@ -2954,11 +3131,18 @@ impl MenuController {
             targets
                 .iter()
                 .find(|id| {
-                    controls
-                        .get(*id)
-                        .is_some_and(|control| Some(control.session.key()) == requested)
+                    controls.get(*id).is_some_and(|control| {
+                        !matches!(control.kind, ControlKind::ContextToggle(_))
+                            && Some(control.session.key()) == requested
+                    })
                 })
-                .or_else(|| targets.iter().find(|id| controls.contains_key(*id)))
+                .or_else(|| {
+                    targets.iter().find(|id| {
+                        controls.get(*id).is_some_and(|control| {
+                            !matches!(control.kind, ControlKind::ContextToggle(_))
+                        })
+                    })
+                })
                 .cloned()
         };
         if let Some(id) = first {
@@ -3079,9 +3263,10 @@ impl MenuController {
                     .iter()
                     .filter_map(|item| {
                         let id = item.button.identifier()?.to_string();
-                        controls
-                            .get(&id)
-                            .filter(|control| control.session.key() == session_id)?;
+                        controls.get(&id).filter(|control| {
+                            control.session.key() == session_id
+                                && !matches!(control.kind, ControlKind::ContextToggle(_))
+                        })?;
                         let frame = item.button.frame();
                         Some((
                             id,
@@ -3129,6 +3314,7 @@ impl MenuController {
         } else if !event.isARepeat()
             && let Some(session) = state.all.borrow().iter().find(|s| s.key() == id).cloned()
         {
+            state.acknowledge_finished(&session.key());
             self.dismiss_menu();
             self.monitor().open(&session);
         }
@@ -3145,7 +3331,11 @@ impl MenuController {
             .filter(|item| item.button.isEnabled() || item.focusable_when_disabled)
             .filter_map(|item| {
                 let key = item.button.identifier()?.to_string();
-                let owner = controls.get(&key)?.session.key();
+                let control = controls.get(&key)?;
+                if matches!(control.kind, ControlKind::ContextToggle(_)) {
+                    return None;
+                }
+                let owner = control.session.key();
                 Some((key, owner))
             })
             .collect();
@@ -3547,6 +3737,7 @@ impl MenuController {
         if !state.all.borrow().iter().any(|session| session.key() == id) {
             return;
         }
+        state.acknowledge_finished(id);
         self.advance_disclosure();
         let mut expanded = state.expanded.borrow_mut();
         let mut from = state.reveal.borrow().clone();
@@ -3691,17 +3882,23 @@ impl MenuController {
         &self,
         session: &Session,
         width: f64,
+        action: Option<(usize, &RequestControl)>,
     ) -> Option<(Retained<SessionListView>, f64)> {
-        let interaction = session.interaction();
-        let mut sections = Vec::new();
-        if let Some(command) = interaction.command.filter(|value| !value.trim().is_empty()) {
-            sections.push(("Command".to_owned(), command));
-        }
-        for action in interaction.actions {
-            if !action.detail.is_empty() {
-                sections.push((action.label, action.detail));
+        let sections = if let Some((index, action)) = action {
+            if action.detail.trim().is_empty()
+                || !matches!(action.kind, ControlKind::Reply(Response::Action(_)))
+            {
+                return None;
             }
-        }
+            vec![(index + 1, action.label.clone(), action.detail.clone())]
+        } else {
+            session
+                .interaction()
+                .command
+                .filter(|value| !value.trim().is_empty())
+                .map(|command| vec![(0, "Command".to_owned(), command)])
+                .unwrap_or_default()
+        };
         if sections.is_empty() {
             return None;
         }
@@ -3710,14 +3907,14 @@ impl MenuController {
             msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, width, 1.0)]
         };
         let mut y = 0.0;
-        for (title, text) in sections {
+        for (index, title, text) in sections {
             if y > 0.0 {
                 y += 8.0;
             }
             let caption = NSTextField::labelWithString(&NSString::from_str(&title), self.mtm());
             caption.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             caption.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            caption.setFrame(rect(0.0, y, width, 16.0));
+            caption.setFrame(rect(0.0, y, width - 30.0, 16.0));
             view.addSubview(&caption);
             y += 20.0;
             let code = NSTextField::wrappingLabelWithString(
@@ -3732,7 +3929,7 @@ impl MenuController {
                 cell.setLineBreakMode(NSLineBreakMode::ByCharWrapping);
             }
             let code_width = width - 20.0;
-            let height = code
+            let full_height = code
                 .cell()
                 .map(|cell| {
                     cell.cellSizeForBounds(rect(0.0, 0.0, code_width, 1000000.0))
@@ -3741,23 +3938,93 @@ impl MenuController {
                 })
                 .unwrap_or(18.0)
                 .max(18.0);
+            // Measure two actual line fragments in the same native field so
+            // the limit includes both explicit newlines and soft wrapping.
+            let original = code.stringValue();
+            code.setStringValue(ns_string!("M\nM"));
+            let two_lines = code
+                .cell()
+                .map(|cell| {
+                    cell.cellSizeForBounds(rect(0.0, 0.0, code_width, 1000000.0))
+                        .height
+                        .ceil()
+                })
+                .unwrap_or(32.0);
+            code.setStringValue(&original);
+            let key = format!(
+                "context:{}:{index}",
+                session.approval_key().unwrap_or_else(|| session.key())
+            );
+            let expanded = self.ivars().expanded_contexts.borrow().contains(&key);
+            let overflowing = full_height > two_lines;
+            let height = if expanded {
+                full_height
+            } else {
+                full_height.min(two_lines)
+            };
+            code.setMaximumNumberOfLines(if expanded { 0 } else { 2 });
+            let panel_height = height + 16.0;
             let background: Retained<StatusContentView> = unsafe {
-                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, y, width, height + 16.0)]
+                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, y, width, panel_height)]
             };
             let box_view = NSBox::initWithFrame(
                 NSBox::alloc(self.mtm()),
-                rect(0.0, 0.0, width, height + 16.0),
+                rect(0.0, 0.0, width, panel_height),
             );
             box_view.setBoxType(NSBoxType::Custom);
             box_view.setTitlePosition(NSTitlePosition::NoTitle);
             box_view.setCornerRadius(8.0);
             box_view.setBorderWidth(0.0);
-            box_view.setFillColor(&appearance_color([0.0; 3], [255.0; 3], 0.06));
+            box_view.setFillColor(&appearance_color([218.0; 3], [42.0; 3], 1.0));
             background.addSubview(&box_view);
             view.addSubview(&background);
             code.setFrame(rect(10.0, y + 8.0, code_width, height));
             view.addSubview(&code);
-            y += height + 16.0;
+            if overflowing {
+                let button = self.action_button(
+                    &view,
+                    "",
+                    sel!(respondToRequest:),
+                    &key,
+                    rect(width - 24.0, y - 21.0, 24.0, 18.0),
+                    false,
+                );
+                button.setRefusesFirstResponder(true);
+                button.setImage(
+                    NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                        if expanded {
+                            ns_string!("chevron.up")
+                        } else {
+                            ns_string!("chevron.down")
+                        },
+                        Some(if expanded {
+                            ns_string!("Collapse details")
+                        } else {
+                            ns_string!("Expand details")
+                        }),
+                    )
+                    .as_deref(),
+                );
+                button.setToolTip(Some(if expanded {
+                    ns_string!("Collapse details")
+                } else {
+                    ns_string!("Expand details")
+                }));
+                if let Some(hover) = self.ivars().buttons.borrow_mut().last_mut() {
+                    hover.base_alpha = 0.0;
+                    paint_hover(&hover.background, 0.0);
+                }
+                self.ivars().request_controls.borrow_mut().insert(
+                    key.clone(),
+                    RequestControl {
+                        session: session.clone(),
+                        label: String::new(),
+                        detail: String::new(),
+                        kind: ControlKind::ContextToggle(key),
+                    },
+                );
+            }
+            y += panel_height;
         }
         view.setFrameSize(NSSize::new(width, y));
         Some((view, y))
@@ -3958,7 +4225,7 @@ impl MenuController {
             };
             let control_width = content_width - 2.0 * control_inset;
             let context = if is_question && inline.is_none() {
-                self.request_context(session, content_width)
+                self.request_context(session, content_width, None)
             } else {
                 None
             };
@@ -4001,8 +4268,34 @@ impl MenuController {
                     NSSize::new(width, height)
                 })
                 .collect();
-            let (control_frames, controls_height) =
-                answer_button_layout(&control_sizes, control_width);
+            let action_contexts: Vec<_> = controls
+                .iter()
+                .enumerate()
+                .map(|(index, control)| {
+                    self.request_context(session, content_width, Some((index, control)))
+                })
+                .collect();
+            let (control_frames, controls_height) = if action_contexts.iter().any(Option::is_some) {
+                let mut y = 0.0;
+                let frames = control_sizes
+                    .iter()
+                    .zip(&action_contexts)
+                    .map(|(size, context)| {
+                        if y > 0.0 {
+                            y += 8.0;
+                        }
+                        if let Some((_, height)) = context {
+                            y += height + 4.0;
+                        }
+                        let frame = rect(0.0, y, size.width, size.height);
+                        y += size.height;
+                        frame
+                    })
+                    .collect();
+                (frames, y)
+            } else {
+                answer_button_layout(&control_sizes, control_width)
+            };
             let is_expanded = expanded.contains(&session.key());
             let history = self
                 .ivars()
@@ -4143,7 +4436,12 @@ impl MenuController {
             }
             // Reserve the status and disclosure controls independently of the
             // title's shared hover, keyboard highlight and click target.
-            let title_right = if session.activity == Activity::Idle {
+            let finished = self
+                .monitor()
+                .snapshot()
+                .unseen_finished
+                .contains_key(&session.key());
+            let title_right = if session.activity == Activity::Idle && !finished {
                 348.0
             } else {
                 326.0
@@ -4211,6 +4509,7 @@ impl MenuController {
             let working_icon = self.status_icon(
                 &row,
                 session.activity,
+                finished,
                 height - SESSION_HEADER_HEIGHT / 2.0 - 8.0,
             );
             let open = self.action_button(
@@ -4461,6 +4760,15 @@ impl MenuController {
                 previous.setToolTip(Some(&NSString::from_str(&tooltip)));
                 if let Some(key) = session.approval_key() {
                     for (index, control) in controls.into_iter().enumerate() {
+                        if let Some((context, context_height)) = &action_contexts[index] {
+                            context.setFrameOrigin(NSPoint::new(
+                                content_x,
+                                message_end + 8.0 + control_inset + control_frames[index].origin.y
+                                    - context_height
+                                    - 4.0,
+                            ));
+                            document.addSubview(context);
+                        }
                         let id = format!("response:{key}:{index}");
                         let button = self.action_button(
                             &document,
@@ -5260,6 +5568,78 @@ mod close_tests {
             .borrow_mut()
             .set_enabled(&Client::VSCode.application_id(), false);
         assert_eq!(state.working_count(), 0);
+    }
+
+    #[test]
+    fn finished_count_follows_application_visibility_but_not_title_filter() {
+        let state = State::default();
+        let editor = session("editor", None);
+        let mut terminal = session("terminal", None);
+        terminal.client = Client::Terminal;
+        let snapshot = crate::actors::monitor::State {
+            sessions: vec![editor.clone(), terminal.clone()],
+            unseen_finished: HashMap::from([(editor.key(), 1), (terminal.key(), 2)]),
+            ..Default::default()
+        };
+        let handle = crate::actors::monitor::Handle {
+            tx: tokio::sync::mpsc::channel(1).0,
+            state: tokio::sync::watch::channel(std::sync::Arc::new(snapshot)).1,
+        };
+        assert!(state.monitor.set(handle).is_ok());
+        state
+            .applications
+            .borrow_mut()
+            .observe([Client::VSCode, Client::Terminal]);
+        assert_eq!(state.finished_count(), 2);
+        state
+            .applications
+            .borrow_mut()
+            .set_enabled(&Client::Terminal.application_id(), false);
+        assert_eq!(state.finished_count(), 1);
+        *state.filter_query.borrow_mut() = "no match".into();
+        assert_eq!(state.finished_count(), 1);
+    }
+
+    #[test]
+    fn session_actions_acknowledge_only_the_current_finished_generation() {
+        let state = State::default();
+        let idle = session("finished", None);
+        let mut working = session("working", None);
+        working.activity = Activity::Working;
+        let idle_key = idle.key();
+        let working_key = working.key();
+        let snapshot = crate::actors::monitor::State {
+            sessions: vec![idle, working],
+            unseen_finished: HashMap::from([(idle_key.clone(), 7), (working_key.clone(), 8)]),
+            ..Default::default()
+        };
+        let (commands, mut received) = tokio::sync::mpsc::channel(8);
+        let (published, snapshots) =
+            tokio::sync::watch::channel(std::sync::Arc::new(snapshot.clone()));
+        assert!(
+            state
+                .monitor
+                .set(crate::actors::monitor::Handle {
+                    tx: commands,
+                    state: snapshots
+                })
+                .is_ok()
+        );
+        state.acknowledge_finished("codex:missing");
+        state.acknowledge_finished(&working_key);
+        assert!(received.try_recv().is_err());
+        state.acknowledge_finished(&idle_key);
+        let crate::actors::monitor::Command::FinishedSeen { completions } =
+            received.try_recv().unwrap()
+        else {
+            panic!("expected completion acknowledgement");
+        };
+        assert_eq!(completions, HashMap::from([(idle_key.clone(), 7)]));
+        let mut restarted = snapshot;
+        restarted.sessions[0].activity = Activity::Working;
+        published.send_replace(std::sync::Arc::new(restarted));
+        state.acknowledge_finished(&idle_key);
+        assert!(received.try_recv().is_err());
     }
 
     #[test]

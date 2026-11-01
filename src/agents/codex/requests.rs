@@ -79,9 +79,7 @@ fn decision_detail(value: &Value) -> String {
             .iter()
             .map(|argument| shlex::try_quote(argument.as_str().unwrap()))
             .collect::<Result<Vec<_>, _>>();
-        return prefix
-            .map(|words| format!("Future commands starting with: {}", words.join(" ")))
-            .unwrap_or_default();
+        return prefix.map(|words| words.join(" ")).unwrap_or_default();
     }
     value["applyNetworkPolicyAmendment"]["network_policy_amendment"]["host"]
         .as_str()
@@ -296,7 +294,7 @@ mod tests {
         assert_eq!(actions[1].label, "Allow similar commands");
         assert_eq!(
             actions[1].detail,
-            "Future commands starting with: git commit -m 'Remove Codex approval hook'"
+            "git commit -m 'Remove Codex approval hook'"
         );
         assert_eq!(
             wire_response(&request, &Response::Action(actions[1].id.clone()))
@@ -314,10 +312,7 @@ mod tests {
         let request = json!({"method":"item/commandExecution/requestApproval","params":{"command":command,"availableDecisions":[{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","commit"]}}]}});
         let view = interaction(&request);
         assert_eq!(view.command.as_deref(), Some(command));
-        assert_eq!(
-            view.actions[0].detail,
-            "Future commands starting with: git commit"
-        );
+        assert_eq!(view.actions[0].detail, "git commit");
         let mut args = request.clone();
         args["params"]["command"] = json!(["echo", "hello world"]);
         assert_eq!(

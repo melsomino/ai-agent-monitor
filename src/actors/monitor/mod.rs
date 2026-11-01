@@ -33,7 +33,20 @@ pub(crate) async fn run(
     let mut sources = HashMap::<&'static str, Vec<Session>>::new();
     let mut resolved = HashMap::<String, Approval>::new();
     while let Some(command) = rx.recv().await {
+        let previous_sessions = state.sessions.clone();
         match command {
+            Command::FinishedSeen { completions } => {
+                for (key, generation) in completions {
+                    if state.unseen_finished.get(&key) == Some(&generation)
+                        && state
+                            .sessions
+                            .iter()
+                            .any(|s| s.key() == key && s.activity == Activity::Idle)
+                    {
+                        state.unseen_finished.remove(&key);
+                    }
+                }
+            }
             Command::Observe {
                 source,
                 sessions,
@@ -468,6 +481,7 @@ pub(crate) async fn run(
             .filter_map(Session::approval_key)
             .collect();
         state.submissions.retain(|key, _| active.contains(key));
+        state.reconcile_finished(&previous_sessions);
         state.revision += 1;
         published.send_replace(Arc::new(state.clone()));
         if state.stopping {

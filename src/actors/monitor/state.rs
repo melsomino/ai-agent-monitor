@@ -39,6 +39,9 @@ pub struct Notice {
 pub struct State {
     pub revision: u64,
     pub sessions: Vec<Session>,
+    /// Session key -> completion generation. A stale window acknowledgement
+    /// must never clear a later completion of the same session.
+    pub unseen_finished: HashMap<String, u64>,
     pub submissions: HashMap<String, Submission>,
     pub message_sends: HashMap<String, MessageSend>,
     pub history: HashMap<String, Arc<History>>,
@@ -60,6 +63,27 @@ pub struct State {
     pub preferences: crate::domain::preferences::Preferences,
 }
 impl State {
+    pub(super) fn reconcile_finished(&mut self, previous: &[Session]) {
+        self.unseen_finished.retain(|key, _| {
+            self.sessions.iter().any(|session| {
+                session.key() == *key && session.authoritative && session.activity == Activity::Idle
+            })
+        });
+        for session in &self.sessions {
+            if session.authoritative
+                && session.activity == Activity::Idle
+                && previous.iter().any(|old| {
+                    old.key() == session.key()
+                        && old.authoritative
+                        && old.activity == Activity::Working
+                })
+            {
+                self.unseen_finished
+                    .insert(session.key(), self.revision + 1);
+            }
+        }
+    }
+
     pub fn pending_count(&self) -> usize {
         self.sessions
             .iter()

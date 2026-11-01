@@ -1,5 +1,8 @@
 use super::*;
 pub enum Command {
+    FinishedSeen {
+        completions: HashMap<String, u64>,
+    },
     Observe {
         source: &'static str,
         sessions: Result<Vec<Session>, String>,

@@ -39,7 +39,7 @@ define_class!(
             let request = self.ivars().request.map(|distance| height - distance);
             let mut gaps: Vec<_> = self.ivars().messages.iter()
                 .map(|distance| (height - distance, 2.5)).collect();
-            if let Some(center) = request { gaps.push((center, 6.5)); }
+            if let Some(center) = request { gaps.push((center, 7.5)); }
             gaps.sort_by(|a, b| b.0.total_cmp(&a.0));
             let mut cursor = top;
             for (center, radius) in gaps {
@@ -53,13 +53,13 @@ define_class!(
                 NSBezierPath::bezierPathWithOvalInRect(rect(x - 2.5, center - 2.5, 5.0, 5.0)).fill();
             }
             if let Some(center) = request {
-                NSColor::systemOrangeColor().setStroke();
                 NSColor::systemOrangeColor().setFill();
-                let circle = NSBezierPath::bezierPathWithOvalInRect(rect(x - 6.0, center - 6.0, 12.0, 12.0));
-                circle.setLineWidth(1.0);
-                circle.stroke();
+                NSBezierPath::bezierPathWithOvalInRect(rect(x - 7.5, center - 7.5, 15.0, 15.0)).fill();
+                let ink = NSColor::colorWithSRGBRed_green_blue_alpha(0.2, 0.125, 0.0, 1.0);
+                ink.setStroke();
+                ink.setFill();
                 let stem = NSBezierPath::bezierPath();
-                stem.setLineWidth(1.2);
+                stem.setLineWidth(1.7);
                 stem.moveToPoint(NSPoint::new(x, center + 3.0));
                 stem.lineToPoint(NSPoint::new(x, center - 0.5));
                 stem.stroke();

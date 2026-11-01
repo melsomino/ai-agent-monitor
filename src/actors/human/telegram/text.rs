@@ -32,6 +32,21 @@ impl Text {
     pub fn code(&mut self, text: &str) {
         self.literal(text, "code");
     }
+    pub fn code_block(&mut self, text: &str, language: Option<&str>) {
+        let offset = self.units;
+        self.plain(text);
+        if self.units > offset {
+            self.entities.push(Entity {
+                kind: "pre",
+                offset,
+                length: self.units - offset,
+                url: None,
+                language: language
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+            });
+        }
+    }
     fn literal(&mut self, text: &str, kind: &'static str) {
         let offset = self.units;
         self.plain(text);
