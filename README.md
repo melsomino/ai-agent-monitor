@@ -203,6 +203,7 @@ Agent adapters are separate from the interfaces that display requests and submit
 
 See the technical documentation:
 
+- [UI & UX style guide](STYLE_GUIDE.md)
 - [Actor architecture](docs/actor-architecture.md)
 - [Agent integrations](docs/integrations.md)
 
