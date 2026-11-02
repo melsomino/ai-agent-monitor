@@ -565,7 +565,35 @@ pub fn hook_session(
         },
         activity: Activity::Confirmation,
         last_message: String::new(),
-        interaction_data: Interaction::allow(),
+        interaction_data: Interaction {
+            command: event["tool_input"]["command"].as_str().map(str::to_owned),
+            ..if event["_test_extended_choices"] == true {
+                Interaction {
+                    actions: [
+                        ("allow", "Allow once"),
+                        ("test:always", "Allow always"),
+                        ("test:deny", "Deny"),
+                    ]
+                    .into_iter()
+                    .map(|(id, label)| crate::domain::interaction::Action {
+                        id: id.into(),
+                        label: label.into(),
+                        detail: if id == "test:always" {
+                            event["_test_always_command"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .into()
+                        } else {
+                            String::new()
+                        },
+                    })
+                    .collect(),
+                    ..Interaction::default()
+                }
+            } else {
+                Interaction::allow()
+            }
+        },
         target: Some(content.target.clone()),
         approval: Some(Approval {
             id: key.into(),

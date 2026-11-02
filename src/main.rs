@@ -68,6 +68,9 @@ fn run(command: Option<Command>) -> Result<()> {
             session_id,
         }) => {
             let result = app::ipc::request(&app::ipc::Request::Test {
+                command: None,
+                extended_choices: false,
+                always_command: None,
                 approval,
                 session_id,
             })?;

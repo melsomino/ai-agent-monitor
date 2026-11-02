@@ -36,6 +36,12 @@ pub enum Request {
     Test {
         approval: bool,
         session_id: Option<String>,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        extended_choices: bool,
+        #[serde(default)]
+        always_command: Option<String>,
     },
     Notice {
         title: String,
@@ -329,8 +335,14 @@ async fn handle_request(
         Request::Test {
             approval,
             session_id,
+            command,
+            extended_choices,
+            always_command,
         } => {
             let mut event = serde_json::json!({"cwd":core::home(),"_agent":"codex"});
+            event["tool_input"]["command"] = command.into();
+            event["_test_extended_choices"] = extended_choices.into();
+            event["_test_always_command"] = always_command.into();
             if let Some(id) = session_id {
                 event["session_id"] = id.into();
             }

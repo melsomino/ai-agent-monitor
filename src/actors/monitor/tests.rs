@@ -1,6 +1,45 @@
 use super::*;
 use crate::agents::interaction::Delivery;
 use std::time::Duration;
+
+#[test]
+fn hook_session_preserves_command_for_approval_display() {
+    let command = "printf '%s\\n' 'a long command for the approval preview'";
+    let content = core::Notification {
+        title: "Test".into(),
+        body: "Allow?".into(),
+        target: String::new(),
+    };
+    let event = serde_json::json!({
+        "_agent": "claude",
+        "tool_input": {"command": command}
+    });
+    let session = hook_session(&content, &event, None, "test");
+    assert_eq!(session.interaction_data.command.as_deref(), Some(command));
+    let plain = hook_session(&content, &serde_json::json!({}), None, "plain");
+    assert_eq!(plain.interaction_data.command, None);
+    let choices = hook_session(
+        &content,
+        &serde_json::json!({"_test_extended_choices": true, "_test_always_command": "git -C /long/project/path log"}),
+        None,
+        "choices",
+    );
+    assert_eq!(
+        choices
+            .interaction_data
+            .actions
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Allow once", "Allow always", "Deny"]
+    );
+    assert_eq!(
+        choices.interaction_data.actions[1].detail,
+        "git -C /long/project/path log"
+    );
+    assert!(choices.interaction_data.actions[0].detail.is_empty());
+}
+
 fn session(id: &str, request: &str) -> Session {
     Session {
         agent: "codex",

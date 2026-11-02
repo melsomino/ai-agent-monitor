@@ -1367,6 +1367,9 @@ mod tests {
         let ui = Desktop::new(handle, platform_rx).unwrap();
         ui.show();
         drain();
+        requests::check_native_command_layout(drain);
+        ui.show();
+        drain();
         let width = ui.window.allocated_width();
         let height = ui.window.allocated_height();
         let mut surface =

@@ -170,6 +170,36 @@ Application visibility preferences are retained across restarts.
 
 Ubuntu has a native Rust/GTK session panel and a GNOME top-panel icon. It supports local agent discovery, approvals, questions, message history, and messages to live Codex sessions. See [Ubuntu setup](docs/ubuntu.md) for dependencies, build instructions, and platform limitations.
 
+## Build from source (Ubuntu)
+
+Requires Ubuntu with GNOME and Rust with support for the 2024 edition.
+
+Install the system dependencies, then build:
+
+```sh
+sudo apt-get update
+sudo apt-get install build-essential pkg-config libgtk-3-dev libsqlite3-dev \
+  libsecret-tools lsof curl xdg-utils zip
+
+git clone https://github.com/melsomino/ai-agent-monitor.git
+cd ai-agent-monitor
+cargo build --release --locked
+```
+
+Install the executable, desktop launcher, and GNOME top-panel extension:
+
+```sh
+./scripts/install-ubuntu.sh
+```
+
+Log out and back in if GNOME has not loaded the extension, then launch **AI Agent Monitor** from the application menu or run:
+
+```sh
+"$HOME/.local/bin/AIAgentMonitor"
+```
+
+For development, run `cargo run --locked` from the project directory. See [Ubuntu setup and limitations](docs/ubuntu.md) for desktop integration details and verification commands.
+
 ## Build from source (macOS)
 
 Requires Rust with support for the 2024 edition and Xcode Command Line Tools.
