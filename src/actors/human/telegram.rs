@@ -92,7 +92,7 @@ struct Config {
     selected_session: Option<String>,
 }
 fn config_path() -> std::path::PathBuf {
-    core::home().join("Library/Application Support/AI Agent Monitor/telegram.json")
+    core::state_home().join("telegram.json")
 }
 fn persist(config: &Config) -> Result<()> {
     let path = config_path();
@@ -431,9 +431,9 @@ impl Candidate {
 // Save both pieces before retiring the running connection. On preference-write
 // failure, restore the previous credential and keep the in-memory bot untouched.
 fn store_replacement(token: &str, config: &Config, old_token: &str) -> Result<()> {
-    crate::macos::keychain::save(token)?;
+    crate::platform::credentials::save(token)?;
     if let Err(error) = persist(config) {
-        crate::macos::keychain::save(old_token)
+        crate::platform::credentials::save(old_token)
             .context("Could not restore the previous bot credential")?;
         return Err(
             error.context("Could not save the new bot; the previous connection is retained")
@@ -471,7 +471,7 @@ impl Worker {
             .ok()
             .and_then(|v| serde_json::from_slice(&v).ok())
             .unwrap_or_default();
-        let credential = crate::macos::keychain::load();
+        let credential = crate::platform::credentials::load();
         let mut worker = Self {
             monitor,
             tx,
@@ -936,7 +936,7 @@ impl Worker {
                     "Telegram disconnected. This request can no longer be answered here.",
                 );
                 self.cleanup_before_disconnect();
-                match crate::macos::keychain::delete() {
+                match crate::platform::credentials::delete() {
                     Ok(()) => {
                         self.outbox.clear();
                         self.token.clear();
@@ -1007,7 +1007,7 @@ impl Worker {
             self.stage_candidate(token, username, code);
             return Ok(());
         }
-        crate::macos::keychain::save(token)?;
+        crate::platform::credentials::save(token)?;
         self.retire_all("Bot reconnected. Use the latest request message.");
         self.cleanup_before_disconnect();
         self.cleanup = Default::default();
@@ -1295,7 +1295,7 @@ impl Worker {
             }
             BotCommand::Status => vec![format!("AI Agent Monitor {}\nNotifications: {}\nPending questions: {}",
                 core::VERSION, if self.config.enabled {"enabled"} else {"paused"}, self.pending.len())],
-            BotCommand::Help => vec!["/sessions — List all open sessions, including idle sessions\n/status — Monitor and notification status\n/info — Selected session folder and Git branch\n/help — Show these commands\n\nOpen a session and type in chat to send a message to that agent. Previous message loads an earlier agent message. Use answer buttons on question messages, or reply to one to enter a custom answer.\nCommands require your Mac and monitor to be running.".into()],
+            BotCommand::Help => vec!["/sessions — List all open sessions, including idle sessions\n/status — Monitor and notification status\n/info — Selected session folder and Git branch\n/help — Show these commands\n\nOpen a session and type in chat to send a message to that agent. Previous message loads an earlier agent message. Use answer buttons on question messages, or reply to one to enter a custom answer.\nCommands require your computer and monitor to be running.".into()],
         };
         anyhow::ensure!(
             self.outbox.len() + messages.len() <= 128,

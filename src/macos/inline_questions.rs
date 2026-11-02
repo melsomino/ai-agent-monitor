@@ -857,6 +857,13 @@ impl Panel {
         }
     }
 
+    pub fn matches_request(&self, session: &Session) -> bool {
+        let original = &self.ivars().session;
+        original.key() == session.key()
+            && original.approval == session.approval
+            && original.interaction_data == session.interaction_data
+    }
+
     pub fn reconcile(&self, enabled: bool, status: &str) {
         self.ivars().enabled.set(enabled);
         self.ivars()

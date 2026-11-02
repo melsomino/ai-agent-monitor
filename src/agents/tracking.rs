@@ -31,7 +31,7 @@ pub struct Record {
 }
 
 pub fn root() -> PathBuf {
-    core::home().join("Library/Application Support/AI Agent Monitor/agents")
+    core::state_home().join("agents")
 }
 pub fn now() -> u64 {
     SystemTime::now()
@@ -200,7 +200,9 @@ fn owner_from(
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        if process.command.contains("Code Helper (Plugin)") {
+        if process.command.contains("Code Helper (Plugin)")
+            || (cfg!(target_os = "linux") && matches!(name.as_ref(), "code" | "code-insiders"))
+        {
             let (pid, birth) = candidate.unwrap_or((pid, process.birth));
             return Ok((pid, birth, "vscode".into()));
         }

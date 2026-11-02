@@ -5,6 +5,7 @@ use crate::{
     agents::sessions::{Activity, Client},
 };
 use anyhow::{Result, bail};
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSComparisonResult, NSString};
 use serde_json::{Value, json};
 use std::{
@@ -245,12 +246,23 @@ impl Browser {
                 .cmp(&client_order(b.client))
                 .then_with(|| a.client.application_id().cmp(&b.client.application_id()))
                 .then_with(|| {
-                    match NSString::from_str(&a.title)
-                        .localizedStandardCompare(&NSString::from_str(&b.title))
+                    #[cfg(target_os = "macos")]
                     {
-                        NSComparisonResult::Ascending => std::cmp::Ordering::Less,
-                        NSComparisonResult::Descending => std::cmp::Ordering::Greater,
-                        _ => a.key().cmp(&b.key()),
+                        match NSString::from_str(&a.title)
+                            .localizedStandardCompare(&NSString::from_str(&b.title))
+                        {
+                            NSComparisonResult::Ascending => std::cmp::Ordering::Less,
+                            NSComparisonResult::Descending => std::cmp::Ordering::Greater,
+                            _ => a.key().cmp(&b.key()),
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        gtk::glib::FilenameCollationKey::from(a.title.to_lowercase())
+                            .cmp(&gtk::glib::FilenameCollationKey::from(
+                                b.title.to_lowercase(),
+                            ))
+                            .then(a.key().cmp(&b.key()))
                     }
                 })
         });

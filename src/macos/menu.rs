@@ -4255,7 +4255,13 @@ impl MenuController {
                 && session.interaction().actions.is_empty()
             {
                 session.approval_key().map(|key| {
-                    let existing = self.ivars().question_panels.borrow().get(&key).cloned();
+                    let existing = self
+                        .ivars()
+                        .question_panels
+                        .borrow()
+                        .get(&key)
+                        .filter(|panel| panel.matches_request(session))
+                        .cloned();
                     existing.unwrap_or_else(|| {
                         let panel = inline_questions::Panel::create(
                             session.clone(),

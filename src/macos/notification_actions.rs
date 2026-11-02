@@ -124,6 +124,15 @@ pub struct Bindings {
 impl Bindings {
     pub fn bind(&mut self, session: &Session) -> Option<Plan> {
         let key = session.approval_key()?;
+        // Keep an unchanged request stable, but replace both its immutable
+        // snapshot and action category when its context or choices change.
+        // An old category must never approve a newly edited command.
+        if self.values.get(&key).is_some_and(|binding| {
+            binding.session.approval == session.approval
+                && binding.session.interaction_data == session.interaction_data
+        }) {
+            return None;
+        }
         let plan = Plan::new(&session.interaction());
         self.values.insert(
             key,
@@ -233,5 +242,60 @@ mod tests {
             plan.response(0, None),
             Some(Response::Action("decline".into()))
         );
+    }
+
+    #[test]
+    fn bindings_refresh_changed_context_and_choices_without_repeating_unchanged_requests() {
+        use crate::domain::session::{Activity, Approval, Client};
+        let mut session = Session {
+            agent: "codex",
+            id: "chat".into(),
+            title: "Chat".into(),
+            cwd: "/work".into(),
+            workspace: None,
+            git_branch: None,
+            updated_at: 0,
+            client: Client::VSCode,
+            activity: Activity::Confirmation,
+            last_message: String::new(),
+            interaction_data: question(2),
+            target: None,
+            authoritative: true,
+            approval: Some(Approval {
+                id: "request".into(),
+                body: "Pick".into(),
+                expires: u64::MAX,
+                can_allow: false,
+            }),
+        };
+        let key = session.approval_key().unwrap();
+        let mut bindings = Bindings::default();
+        let first = bindings.bind(&session).unwrap();
+        session.updated_at += 1;
+        session.last_message = "Unrelated progress".into();
+        assert!(bindings.bind(&session).is_none());
+        assert!(bindings.lookup(&key, &first.category()).is_some());
+        session.interaction_data.command = Some("echo changed".into());
+        let second = bindings.bind(&session).unwrap();
+        assert!(bindings.lookup(&key, &first.category()).is_none());
+        assert_eq!(
+            bindings
+                .lookup(&key, &second.category())
+                .unwrap()
+                .session
+                .interaction_data,
+            session.interaction_data
+        );
+        session.interaction_data.questions[0].choices[0].label = "Updated option".into();
+        let third = bindings.bind(&session).unwrap();
+        assert!(bindings.lookup(&key, &second.category()).is_none());
+        assert_eq!(
+            third.response(0, None),
+            Some(Response::Answers(BTreeMap::from([(
+                "q".into(),
+                vec!["Updated option".into()]
+            )])))
+        );
+        assert!(bindings.bind(&session).is_none());
     }
 }

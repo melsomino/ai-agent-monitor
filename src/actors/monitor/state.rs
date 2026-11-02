@@ -75,15 +75,10 @@ pub struct State {
     pub discovery_error: Option<String>,
     pub agent_errors: HashMap<String, String>,
     pub stopping: bool,
-    #[cfg(target_os = "macos")]
     pub telegram: crate::domain::telegram::Status,
-    #[cfg(target_os = "macos")]
     pub integrations: Vec<crate::domain::integrations::Row>,
-    #[cfg(target_os = "macos")]
     pub integration_busy: bool,
-    #[cfg(target_os = "macos")]
     pub integration_note: String,
-    #[cfg(target_os = "macos")]
     pub preferences: crate::domain::preferences::Preferences,
 }
 impl State {

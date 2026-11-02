@@ -20,6 +20,11 @@ struct DeliveryQueue {
     in_flight: Option<(Plan, Notice)>,
 }
 impl DeliveryQueue {
+    fn retain_current(&mut self, bindings: &Bindings) {
+        self.queued
+            .retain(|(plan, notice)| bindings.lookup(&notice.key, &plan.category()).is_some());
+    }
+
     fn complete(&mut self, receipt: Receipt, active: bool, now: Instant) {
         if !self
             .in_flight
@@ -99,14 +104,13 @@ pub async fn run(
             bindings.remove(key);
             remove_session_notification(key);
         }
-        delivery
-            .queued
-            .retain(|(plan, notice)| bindings.lookup(&notice.key, &plan.category()).is_some());
         for session in &snapshot.sessions {
             if let Some(key) = session.approval_key()
-                && !known.contains(&key)
                 && let Some(plan) = bindings.bind(session)
             {
+                if known.contains(&key) {
+                    remove_session_notification(&key);
+                }
                 let approval = session.approval.as_ref().unwrap();
                 delivery.queued.push(
                     (
@@ -123,6 +127,9 @@ pub async fn run(
                 );
             }
         }
+        // Prune after rebinding so an obsolete queued category cannot be
+        // delivered in this iteration, including during a delayed retry.
+        delivery.retain_current(&bindings);
         known = active;
         for notice in &snapshot.notices {
             if notices.insert(notice.id) {
@@ -343,6 +350,49 @@ mod tests {
         assert!(queue.in_flight.is_none());
         assert!(queue.queued.next_due().is_none());
     }
+    #[test]
+    fn edited_request_replaces_queued_delivery_and_discards_its_old_retry() {
+        let now = Instant::now();
+        let mut session = session();
+        session.interaction_data = Interaction::allow();
+        let mut bindings = Bindings::default();
+        let old = bindings.bind(&session).unwrap();
+        let notice = Notice {
+            key: session.approval_key().unwrap(),
+            ..notice()
+        };
+        let mut queue = DeliveryQueue::default();
+        queue
+            .queued
+            .push((old.clone(), notice.clone()), now + Duration::from_secs(5));
+        session.interaction_data.command = Some("echo updated".into());
+        let current = bindings.bind(&session).unwrap();
+        queue.queued.push((current.clone(), notice.clone()), now);
+        queue.retain_current(&bindings);
+        assert_eq!(
+            queue.queued.pop_ready(now).unwrap().0.category(),
+            current.category()
+        );
+        assert!(
+            queue
+                .queued
+                .pop_ready(now + Duration::from_secs(10))
+                .is_none()
+        );
+        // An obsolete in-flight version must not reappear after a late failure.
+        let active = bindings.lookup(&notice.key, &old.category()).is_some();
+        queue.in_flight = Some((old, notice.clone()));
+        queue.complete(
+            Receipt {
+                key: notice.key,
+                result: Err("late failure".into()),
+            },
+            active,
+            now,
+        );
+        assert!(queue.queued.next_due().is_none());
+    }
+
     #[tokio::test]
     async fn editor_button_commands_monitor_navigation_instead_of_opening_menu() {
         let session = session();

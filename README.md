@@ -3,7 +3,7 @@
 <div align="center">
   <img src="assets/AppIcon-robots.png" width="128" alt="AI Agent Monitor">
 
-  **A macOS menu bar app for monitoring coding agents.**
+  **A desktop tray app for monitoring coding agents on macOS and Ubuntu.**
 
   [Download for Apple Silicon](https://github.com/melsomino/ai-agent-monitor/releases/latest/download/AI-Agent-Monitor-apple-silicon.dmg) · [Releases](https://github.com/melsomino/ai-agent-monitor/releases)
 
@@ -29,7 +29,7 @@ Codex is fully supported. Claude Code and Cline support is experimental.
 - **Project navigation.** Return to the relevant VS Code workspace or terminal window. Terminal and iTerm support matching-tab selection.
 - **Local operation.** Session discovery and monitoring run on your Mac. No account or hosted monitor service is required.
 
-The app uses a native AppKit interface and runs as a single Rust executable.
+The macOS app uses native AppKit. Ubuntu uses native GTK widgets implemented in Rust. A small GNOME Shell extension provides the top-panel button and Wayland anchoring.
 
 ## Supported agents
 
@@ -164,9 +164,43 @@ Application visibility preferences are retained across restarts.
 - Cline approvals must currently be handled in Cline.
 - Sending new messages through Telegram requires a supported live Codex connection.
 - The Telegram integration requires the Mac and monitor to remain running.
-- Linux is not currently supported.
+- Ubuntu support is experimental; see [Ubuntu setup and limitations](docs/ubuntu.md).
 
-## Build from source
+## Ubuntu
+
+Ubuntu has a native Rust/GTK session panel and a GNOME top-panel icon. It supports local agent discovery, approvals, questions, message history, and messages to live Codex sessions. See [Ubuntu setup](docs/ubuntu.md) for dependencies, build instructions, and platform limitations.
+
+## Build from source (Ubuntu)
+
+Requires Ubuntu with GNOME and Rust with support for the 2024 edition.
+
+Install the system dependencies, then build:
+
+```sh
+sudo apt-get update
+sudo apt-get install build-essential pkg-config libgtk-3-dev libsqlite3-dev \
+  libsecret-tools lsof curl xdg-utils zip
+
+git clone https://github.com/melsomino/ai-agent-monitor.git
+cd ai-agent-monitor
+cargo build --release --locked
+```
+
+Install the executable, desktop launcher, and GNOME top-panel extension:
+
+```sh
+./scripts/install-ubuntu.sh
+```
+
+Log out and back in if GNOME has not loaded the extension, then launch **AI Agent Monitor** from the application menu or run:
+
+```sh
+"$HOME/.local/bin/AIAgentMonitor"
+```
+
+For development, run `cargo run --locked` from the project directory. See [Ubuntu setup and limitations](docs/ubuntu.md) for desktop integration details and verification commands.
+
+## Build from source (macOS)
 
 Requires Rust with support for the 2024 edition and Xcode Command Line Tools.
 

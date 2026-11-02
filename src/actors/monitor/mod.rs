@@ -18,13 +18,12 @@ mod handle;
 pub(crate) use command::AgentCommand;
 pub use command::Command;
 mod command;
-#[cfg(target_os = "macos")]
 pub(crate) async fn run(
     mut rx: mpsc::Receiver<Command>,
     published: watch::Sender<Arc<State>>,
     mut agents: HashMap<&'static str, mpsc::Sender<AgentCommand>>,
     telegram: mpsc::Sender<crate::actors::human::telegram::Event>,
-    ui: crate::macos::bridge::Sender,
+    ui: crate::platform::Sender,
 ) {
     let mut state = State::default();
     let mut preferences_loaded = false;
@@ -144,10 +143,17 @@ pub(crate) async fn run(
                         .join("; "),
                 );
             }
+            #[cfg(target_os = "linux")]
+            Command::SetAnimation(enabled) => {
+                state.preferences.animation = enabled;
+                let _ = ui.try_send(crate::platform::Event::Platform(
+                    crate::platform::PlatformCommand::Animation(enabled),
+                ));
+            }
             Command::SetApplicationEnabled { id, enabled } => {
                 if state.preferences.applications.set_enabled(&id, enabled) {
-                    let _ = ui.try_send(crate::macos::bridge::Event::Platform(
-                        crate::macos::bridge::PlatformCommand::Applications(
+                    let _ = ui.try_send(crate::platform::Event::Platform(
+                        crate::platform::PlatformCommand::Applications(
                             state.preferences.applications.clone(),
                         ),
                     ));
@@ -253,6 +259,7 @@ pub(crate) async fn run(
                         s.key() == session.key()
                             && s.approval.is_some()
                             && s.approval == session.approval
+                            && s.interaction_data == session.interaction_data
                             && s.authoritative
                             && s.approval.as_ref().is_some_and(|a| a.expires > now())
                     })
@@ -336,6 +343,9 @@ pub(crate) async fn run(
                     let _ = agent.try_send(AgentCommand::Refresh);
                 }
             }
+            Command::ShowWindow => {
+                let _ = ui.try_send(crate::platform::Event::Toggle);
+            }
             Command::Open(key) => {
                 if let Some(target) = state
                     .sessions
@@ -343,8 +353,8 @@ pub(crate) async fn run(
                     .find(|s| s.key() == key)
                     .and_then(Session::open_target)
                 {
-                    let _ = ui.try_send(crate::macos::bridge::Event::Platform(
-                        crate::macos::bridge::PlatformCommand::Open(target),
+                    let _ = ui.try_send(crate::platform::Event::Platform(
+                        crate::platform::PlatformCommand::Open(target),
                     ));
                 }
             }
@@ -430,8 +440,9 @@ pub(crate) async fn run(
                 }
                 state.telegram = status;
             }
+            #[cfg(target_os = "macos")]
             Command::Platform(effect) => {
-                let _ = ui.try_send(crate::macos::bridge::Event::Platform(effect));
+                let _ = ui.try_send(crate::platform::Event::Platform(effect));
             }
             Command::IntegrationsObserved { rows, busy, note } => {
                 state.integrations = rows;
@@ -457,8 +468,8 @@ pub(crate) async fn run(
                 .applications
                 .observe(discovered.iter().map(|s| s.client))
         {
-            let _ = ui.try_send(crate::macos::bridge::Event::Platform(
-                crate::macos::bridge::PlatformCommand::Applications(
+            let _ = ui.try_send(crate::platform::Event::Platform(
+                crate::platform::PlatformCommand::Applications(
                     state.preferences.applications.clone(),
                 ),
             ));
@@ -555,7 +566,35 @@ pub fn hook_session(
         },
         activity: Activity::Confirmation,
         last_message: String::new(),
-        interaction_data: Interaction::allow(),
+        interaction_data: Interaction {
+            command: event["tool_input"]["command"].as_str().map(str::to_owned),
+            ..if event["_test_extended_choices"] == true {
+                Interaction {
+                    actions: [
+                        ("allow", "Allow once"),
+                        ("test:always", "Allow always"),
+                        ("test:deny", "Deny"),
+                    ]
+                    .into_iter()
+                    .map(|(id, label)| crate::domain::interaction::Action {
+                        id: id.into(),
+                        label: label.into(),
+                        detail: if id == "test:always" {
+                            event["_test_always_command"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .into()
+                        } else {
+                            String::new()
+                        },
+                    })
+                    .collect(),
+                    ..Interaction::default()
+                }
+            } else {
+                Interaction::allow()
+            }
+        },
         target: Some(content.target.clone()),
         approval: Some(Approval {
             id: key.into(),
@@ -566,5 +605,5 @@ pub fn hook_session(
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests;

@@ -1,6 +1,45 @@
 use super::*;
 use crate::agents::interaction::Delivery;
 use std::time::Duration;
+
+#[test]
+fn hook_session_preserves_command_for_approval_display() {
+    let command = "printf '%s\\n' 'a long command for the approval preview'";
+    let content = core::Notification {
+        title: "Test".into(),
+        body: "Allow?".into(),
+        target: String::new(),
+    };
+    let event = serde_json::json!({
+        "_agent": "claude",
+        "tool_input": {"command": command}
+    });
+    let session = hook_session(&content, &event, None, "test");
+    assert_eq!(session.interaction_data.command.as_deref(), Some(command));
+    let plain = hook_session(&content, &serde_json::json!({}), None, "plain");
+    assert_eq!(plain.interaction_data.command, None);
+    let choices = hook_session(
+        &content,
+        &serde_json::json!({"_test_extended_choices": true, "_test_always_command": "git -C /long/project/path log"}),
+        None,
+        "choices",
+    );
+    assert_eq!(
+        choices
+            .interaction_data
+            .actions
+            .iter()
+            .map(|a| a.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Allow once", "Allow always", "Deny"]
+    );
+    assert_eq!(
+        choices.interaction_data.actions[1].detail,
+        "git -C /long/project/path log"
+    );
+    assert!(choices.interaction_data.actions[0].detail.is_empty());
+}
+
 fn session(id: &str, request: &str) -> Session {
     Session {
         agent: "codex",
@@ -27,7 +66,7 @@ fn session(id: &str, request: &str) -> Session {
 struct Harness {
     handle: Handle,
     agents: mpsc::Receiver<AgentCommand>,
-    _ui: mpsc::Receiver<crate::macos::bridge::Event>,
+    _ui: mpsc::Receiver<crate::platform::Event>,
     _telegram: mpsc::Receiver<crate::actors::human::telegram::Event>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -938,4 +977,64 @@ async fn adapter_failure_clears_inflight_chat_sending_status() {
             .is_some_and(|send| matches!(send.status, MessageStatus::Failed(_)))
     })
     .await;
+}
+
+#[tokio::test]
+async fn changed_request_context_rejects_an_old_control_even_when_approval_id_matches() {
+    let mut h = Harness::new();
+    let mut original = session("one", "approval");
+    original.interaction_data.command = Some("echo original".into());
+    h.observe(vec![original.clone()]).await;
+    h.wait(|s| s.sessions.len() == 1).await;
+    let mut current = original.clone();
+    current.interaction_data.command = Some("echo changed".into());
+    h.observe(vec![current.clone()]).await;
+    h.wait(|s| s.sessions[0].interaction_data.command.as_deref() == Some("echo changed"))
+        .await;
+    h.handle
+        .submit(&original, Response::Action("allow".into()))
+        .unwrap();
+    let state = h.settle().await;
+    assert!(state.submissions.is_empty());
+    assert!(h.agents.try_recv().is_err());
+    h.handle
+        .submit(&current, Response::Action("allow".into()))
+        .unwrap();
+    h.wait(|s| !s.submissions.is_empty()).await;
+    assert!(matches!(
+        h.agents.recv().await,
+        Some(AgentCommand::Respond { .. })
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn refreshed_notification_submits_current_context_and_rejects_old_category() {
+    let mut h = Harness::new();
+    let mut original = session("one", "approval");
+    original.interaction_data.command = Some("echo original".into());
+    h.observe(vec![original.clone()]).await;
+    h.wait(|state| state.sessions.len() == 1).await;
+    let key = original.approval_key().unwrap();
+    let mut bindings = crate::macos::notification_actions::Bindings::default();
+    let old = bindings.bind(&original).unwrap();
+    let mut current = original.clone();
+    current.interaction_data.command = Some("echo updated".into());
+    h.observe(vec![current.clone()]).await;
+    h.wait(|state| state.sessions[0].interaction_data == current.interaction_data)
+        .await;
+    let plan = bindings.bind(&current).unwrap();
+    assert!(bindings.lookup(&key, &old.category()).is_none());
+    let binding = bindings.lookup(&key, &plan.category()).unwrap();
+    h.handle
+        .submit(&binding.session, binding.plan.response(0, None).unwrap())
+        .unwrap();
+    h.wait(|state| !state.submissions.is_empty()).await;
+    match h.agents.recv().await.unwrap() {
+        AgentCommand::Respond { session, response } => {
+            assert_eq!(session.interaction_data, current.interaction_data);
+            assert_eq!(response, Response::Action("allow".into()));
+        }
+        _ => panic!("The refreshed notification must forward the current answer"),
+    }
 }

@@ -30,6 +30,9 @@ pub fn codex_home() -> PathBuf {
 
 pub fn bundle_executable() -> PathBuf {
     let exe = env::current_exe().expect("executable path is unavailable");
+    if cfg!(target_os = "linux") {
+        return exe;
+    }
     if exe.parent().is_some_and(|p| p.ends_with("Contents/MacOS")) {
         exe
     } else {
@@ -315,4 +318,33 @@ pub fn monitor_hook(command: &str, arguments: &[&str]) -> bool {
         && path
             .parent()
             .is_some_and(|p| p.ends_with("AI Agent Monitor.app/Contents/MacOS"))
+}
+
+/// Per-user state and VS Code configuration follow XDG on Linux.
+pub fn state_home() -> PathBuf {
+    if cfg!(target_os = "linux") {
+        xdg_home("XDG_STATE_HOME", ".local/state").join("ai-agent-monitor")
+    } else {
+        home().join("Library/Application Support/AI Agent Monitor")
+    }
+}
+pub fn xdg_home(variable: &str, fallback: &str) -> PathBuf {
+    env::var_os(variable)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home().join(fallback))
+}
+pub fn vscode_home() -> PathBuf {
+    if cfg!(target_os = "linux") {
+        xdg_home("XDG_CONFIG_HOME", ".config").join("Code")
+    } else {
+        home().join("Library/Application Support/Code")
+    }
+}
+pub fn lsof() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "lsof"
+    } else {
+        "/usr/sbin/lsof"
+    }
 }
