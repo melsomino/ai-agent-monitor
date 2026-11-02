@@ -211,7 +211,7 @@ pub struct State {
     footer: OnceCell<Retained<NSView>>,
     footer_height: Cell<f64>,
     footer_extension: OnceCell<FooterExtension>,
-    header_extension: OnceCell<FooterExtension>,
+    header_extension: OnceCell<Retained<MenuTintView>>,
     footer_fill: OnceCell<Retained<NSColor>>,
     scroll: OnceCell<Retained<SessionScrollView>>,
     content_height: Cell<f64>,
@@ -344,6 +344,29 @@ impl State {
         }
         changed
     }
+}
+
+define_class!(
+    // SAFETY: Decorative NSView; drawing and appearance updates are main-thread only.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[derive(Debug)]
+    struct MenuTintView;
+    unsafe impl NSObjectProtocol for MenuTintView {}
+    impl MenuTintView {
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> { None }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_background(&self, _dirty: NSRect) { draw_menu_tint(self.bounds()); }
+    }
+);
+
+fn draw_menu_tint(bounds: NSRect) {
+    NSColor::windowBackgroundColor()
+        .colorWithAlphaComponent(0.65)
+        .setFill();
+    NSBezierPath::bezierPathWithRect(bounds).fill();
 }
 
 define_class!(
@@ -828,8 +851,7 @@ define_class!(
         fn draw_background(&self, _dirty: NSRect) {
             // Keep the native menu material underneath, but attenuate wallpaper
             // and window contrast with an appearance-aware translucent surface.
-            NSColor::windowBackgroundColor().colorWithAlphaComponent(0.65).setFill();
-            NSBezierPath::bezierPathWithRect(self.bounds()).fill();
+            draw_menu_tint(self.bounds());
         }
 
         #[unsafe(method(viewDidMoveToWindow))]
@@ -957,7 +979,7 @@ impl SessionRowView {
             let color = if focused {
                 NSColor::controlAccentColor()
             } else {
-                NSColor::labelColor().colorWithAlphaComponent(0.06)
+                hover_fill_color()
             };
             background.setFillColor(&color);
             paint_hover(background, if active || focused { 1.0 } else { 0.0 });
@@ -1010,7 +1032,7 @@ fn hover_background(mtm: MainThreadMarker, frame: NSRect, radius: f64) -> Retain
     background.setTitlePosition(NSTitlePosition::NoTitle);
     background.setBorderWidth(0.0);
     background.setCornerRadius(radius);
-    background.setFillColor(&NSColor::labelColor().colorWithAlphaComponent(0.06));
+    background.setFillColor(&hover_fill_color());
     background.setWantsLayer(true);
     background.setHidden(true);
     background
@@ -1247,6 +1269,12 @@ fn detail_text_color(approval: bool) -> Retained<NSColor> {
 pub(super) fn working_status_color() -> Retained<NSColor> {
     // Darker green on light material; keep the brighter green in dark mode.
     appearance_color([0.0, 118.0, 55.0], [48.0, 209.0, 88.0], 1.0)
+}
+
+pub(super) fn hover_fill_color() -> Retained<NSColor> {
+    // Explicit appearance variants remain visible over the denser menu tint,
+    // including when controls were first created in the opposite appearance.
+    appearance_color([0.0; 3], [255.0; 3], 0.14)
 }
 
 fn message_style(label: &NSTextField, color: &NSColor) {
@@ -3140,7 +3168,7 @@ impl MenuController {
             extension.view.removeFromSuperview();
         }
         if let Some(extension) = self.ivars().header_extension.get() {
-            extension.view.removeFromSuperview();
+            extension.removeFromSuperview();
         }
         self.stop_keyboard_tracking();
         self.ivars().focus_answer_on_open.set(false);
@@ -3583,12 +3611,12 @@ impl MenuController {
                 NSColor::controlAccentColor()
             } else if item.caption.is_some() && item.base_alpha > 0.0 {
                 appearance_color(
-                    if hovered { [244.0; 3] } else { [255.0; 3] },
-                    if hovered { [78.0; 3] } else { [72.0; 3] },
+                    if hovered { [225.0; 3] } else { [255.0; 3] },
+                    if hovered { [100.0; 3] } else { [72.0; 3] },
                     1.0,
                 )
             } else {
-                NSColor::labelColor().colorWithAlphaComponent(0.06)
+                hover_fill_color()
             };
             item.background.setFillColor(&background);
             if let Some(caption) = &item.caption {
@@ -5016,33 +5044,23 @@ impl MenuController {
         };
         let extension = state.header_extension.get_or_init(|| {
             // SAFETY: Decorative view passes mouse input through to NSMenu.
-            let view: Retained<StatusContentView> =
-                unsafe { msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: gap] };
-            let fill = NSBox::initWithFrame(
-                NSBox::alloc(self.mtm()),
-                rect(0.0, 0.0, gap.size.width, gap.size.height),
-            );
-            fill.setBoxType(NSBoxType::Custom);
-            fill.setTitlePosition(NSTitlePosition::NoTitle);
-            fill.setBorderWidth(0.0);
-            fill.setCornerRadius(0.0);
-            fill.setContentViewMargins(NSSize::new(0.0, 0.0));
-            fill.setFillColor(&NSColor::windowBackgroundColor().colorWithAlphaComponent(0.65));
-            view.addSubview(&fill);
-            FooterExtension { view, fill }
+            unsafe { msg_send![MenuTintView::alloc(self.mtm()), initWithFrame: gap] }
         });
-        extension.view.setHidden(gap.size.height <= 0.0);
-        // SAFETY: All view hierarchy access is on the main thread.
-        if !unsafe { extension.view.superview() }
-            .is_some_and(|parent| std::ptr::eq(&*parent, &*content))
-        {
-            content.addSubview(&extension.view);
+        // The native tracking window's content view can retain Aqua while its
+        // menu item uses Dark Aqua. Match the item, not that unrelated parent.
+        let appearance = root.effectiveAppearance();
+        if extension.effectiveAppearance() != appearance {
+            extension.setAppearance(Some(&appearance));
+            extension.setNeedsDisplay(true);
         }
-        if extension.view.frame() != gap {
-            extension.view.setFrame(gap);
-            extension
-                .fill
-                .setFrame(rect(0.0, 0.0, gap.size.width, gap.size.height));
+        extension.setHidden(gap.size.height <= 0.0);
+        // SAFETY: All view hierarchy access is on the main thread.
+        if !unsafe { extension.superview() }.is_some_and(|parent| std::ptr::eq(&*parent, &*content))
+        {
+            content.addSubview(extension);
+        }
+        if extension.frame() != gap {
+            extension.setFrame(gap);
         }
     }
 

@@ -13,7 +13,7 @@
     --aam-top: light-dark(#f6f6f6, #373737);
     --aam-footer: light-dark(#e7e7e7, #2c2c2c);
     --aam-line: light-dark(#00000019, #ffffff17);
-    --aam-hover: light-dark(#0000000b, #ffffff0d);
+    --aam-hover: light-dark(#00000024, #ffffff24);
     --aam-button: light-dark(#ffffff, #484848);
     --aam-blue: light-dark(#0069db, #0a84ff);
     --aam-on-blue: #fff;
@@ -39,6 +39,11 @@
   #aam-ui-preview .aam-product button:focus-visible { outline: 3px solid var(--aam-ring); outline-offset: 1px; }
   #aam-ui-preview .aam-bar { --aam-text: #f2f5fa; --aam-secondary: #f2f5fa; --aam-hover: #ffffff1f; --aam-green: #35e466; --aam-finished: #73c7ff; --aam-amber: #ff9f0a; min-height: 34px; display: flex; align-items: center; justify-content: flex-end; padding: 3px 15px 5px; gap: 14px; color: var(--aam-secondary); background: linear-gradient(110deg, #607b9b, #5c7696); }
   #aam-ui-preview .aam-bar small { font-size: 11px; }
+  #aam-ui-preview .aam-theme-switch { display: inline-flex; flex-shrink: 0; margin-right: auto; padding: 2px; gap: 2px; border-radius: 7px; background: #00000026; }
+  #aam-ui-preview .aam-theme-switch button { border: 0; border-radius: 5px; padding: 3px 6px; background: transparent; color: #f2f5fa; font-size: 11px; cursor: pointer; }
+  #aam-ui-preview .aam-theme-switch button:hover { background: #ffffff24; }
+  #aam-ui-preview .aam-theme-switch button[aria-pressed="true"] { background: #ffffff40; }
+
   #aam-ui-preview .aam-status-item { display: flex; align-items: center; gap: 5px; background: var(--aam-hover); border-radius: 7px; padding: 3px 9px; position: relative; color: var(--aam-text); }
   #aam-ui-preview [hidden] { display: none !important; }
   #aam-ui-preview .aam-robot { width: 21px; height: 18px; background: var(--aam-text); mask-size: contain; mask-repeat: no-repeat; mask-position: center; }
@@ -125,7 +130,7 @@
   #aam-ui-preview .aam-question legend { padding: 0; width: 100%; }
   #aam-ui-preview .aam-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
   #aam-ui-preview .aam-product .aam-action { border: 1px solid var(--aam-line); background: var(--aam-button); border-radius: 999px; padding: 3px 18px; min-height: 24px; font-size: 12px; line-height: 1.3; font-weight: 500; }
-  #aam-ui-preview .aam-action:hover { background: color-mix(in srgb, var(--aam-button), var(--aam-text) 5%); }
+  #aam-ui-preview .aam-action:hover { background: light-dark(#e1e1e1, #646464); }
   #aam-ui-preview .aam-product .aam-action:focus-visible { background: var(--aam-blue); border-color: transparent; color: var(--aam-on-blue); }
   #aam-ui-preview .aam-action.aam-subtle { border-color: transparent; background: none; font-weight: 400; }
   #aam-ui-preview .aam-action.aam-subtle:hover { background: var(--aam-hover); }
@@ -173,6 +178,14 @@
 <script>
 (() => {
   const root = document.getElementById('aam-ui-preview');
+  function setPreviewTheme(theme) {
+    root.dataset.theme = theme;
+    root.style.colorScheme = theme;
+    root.querySelectorAll('.aam-theme-switch button').forEach(button => {
+      button.setAttribute('aria-pressed', String(button.dataset.theme === theme));
+    });
+  }
+
   function applyExpanded(saved) {
     if (!saved?.privateContent?.expanded) return;
     root.querySelectorAll('.aam-stage').forEach(stage => {
@@ -233,8 +246,13 @@
     const product = document.createElement('div');
     product.className = 'aam-product';
     product.setAttribute('aria-label', 'AI Agent Monitor — ' + stage.parentElement.dataset.variant);
-    product.innerHTML = `<div class="aam-bar"><small>Sat 10:42</small><span class="aam-status-item" aria-label="AI Agent Monitor"><span class="aam-robot" style="mask-image:url(${robot})" aria-hidden="true"></span><span class="aam-working-count">2</span><span class="aam-count aam-finished-count" aria-label="Unseen finished sessions">2</span><span class="aam-count aam-request-count" aria-label="Pending requests">2</span></span></div><div class="aam-menu"><div class="aam-list">${['VS Code','Terminal','Codex'].map(app => `<section class="aam-group" data-app="${app}" aria-label="${app}"><div class="aam-sticky-app"><span class="aam-app-icon" role="img" aria-label="${app}" data-tooltip="${app}"><img src="${applicationIcons[app]}" width="24" height="24" alt=""></span></div><div class="aam-group-sessions">${live.filter(s => s.app === app).map(s => sessionMarkup(s, index + '-' + s.id)).join('')}</div></section>`).join('')}</div><footer class="aam-footer"><div class="aam-usage"><span>Codex Weekly</span><span class="aam-usage-values"><span>74%</span><span>Nov 7</span></span></div><div class="aam-footer-bottom"><span class="aam-version" aria-live="polite">v0.1.0 · preview</span><div class="aam-tools"><button type="button" class="aam-icon-button aam-settings-button cursor-interaction" aria-label="Settings" aria-expanded="false">${icon('settings')}</button><button type="button" class="aam-icon-button aam-power cursor-interaction" aria-label="Pause monitor" aria-pressed="false">${icon('power')}</button></div></div><div class="aam-settings" hidden><strong>General</strong><label><input type="checkbox" checked>Launch at login</label><label><input type="checkbox" checked>Menu bar animation</label><label><input class="aam-show-meta" type="checkbox" checked>Show folder and branch</label></div></footer></div>`;
+    product.innerHTML = `<div class="aam-bar"><div class="aam-theme-switch" role="group" aria-label="Preview appearance"><button type="button" data-theme="light" aria-pressed="false">Light</button><button type="button" data-theme="dark" aria-pressed="false">Dark</button></div><small>Sat 10:42</small><span class="aam-status-item" aria-label="AI Agent Monitor"><span class="aam-robot" style="mask-image:url(${robot})" aria-hidden="true"></span><span class="aam-working-count">2</span><span class="aam-count aam-finished-count" aria-label="Unseen finished sessions">2</span><span class="aam-count aam-request-count" aria-label="Pending requests">2</span></span></div><div class="aam-menu"><div class="aam-list">${['VS Code','Terminal','Codex'].map(app => `<section class="aam-group" data-app="${app}" aria-label="${app}"><div class="aam-sticky-app"><span class="aam-app-icon" role="img" aria-label="${app}" data-tooltip="${app}"><img src="${applicationIcons[app]}" width="24" height="24" alt=""></span></div><div class="aam-group-sessions">${live.filter(s => s.app === app).map(s => sessionMarkup(s, index + '-' + s.id)).join('')}</div></section>`).join('')}</div><footer class="aam-footer"><div class="aam-usage"><span>Codex Weekly</span><span class="aam-usage-values"><span>74%</span><span>Nov 7</span></span></div><div class="aam-footer-bottom"><span class="aam-version" aria-live="polite">v0.1.0 · preview</span><div class="aam-tools"><button type="button" class="aam-icon-button aam-settings-button cursor-interaction" aria-label="Settings" aria-expanded="false">${icon('settings')}</button><button type="button" class="aam-icon-button aam-power cursor-interaction" aria-label="Pause monitor" aria-pressed="false">${icon('power')}</button></div></div><div class="aam-settings" hidden><strong>General</strong><label><input type="checkbox" checked>Launch at login</label><label><input type="checkbox" checked>Menu bar animation</label><label><input class="aam-show-meta" type="checkbox" checked>Show folder and branch</label></div></footer></div>`;
     stage.append(product);
+    product.querySelectorAll('.aam-theme-switch button').forEach(button => {
+      button.addEventListener('click', () => setPreviewTheme(button.dataset.theme));
+    });
+    setPreviewTheme(root.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+
     // Keep the application icon centered on the first header; robots scroll beneath it.
     function syncGutter() {
       product.querySelectorAll('.aam-group').forEach(group => {

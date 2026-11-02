@@ -139,7 +139,7 @@ impl Radio {
         let background = if focused {
             NSColor::controlAccentColor()
         } else {
-            NSColor::labelColor().colorWithAlphaComponent(0.06)
+            super::menu::hover_fill_color()
         };
         self.focus.setFillColor(&background);
         let color = if focused {
@@ -605,7 +605,7 @@ impl Panel {
         background.setTitlePosition(NSTitlePosition::NoTitle);
         background.setBorderWidth(0.0);
         background.setCornerRadius(frame.size.width.min(frame.size.height) / 2.0);
-        background.setFillColor(&NSColor::labelColor().colorWithAlphaComponent(0.06));
+        background.setFillColor(&super::menu::hover_fill_color());
         background.setHidden(matches!(kind, ButtonKind::Radio | ButtonKind::Field));
         view.addSubview(&background);
         // SAFETY: Both selectors are implemented by this retained controller.

@@ -1801,7 +1801,7 @@ html&gt;body{padding:0}&lt;/style&gt;
     --aam-top: light-dark(#f6f6f6, #373737);
     --aam-footer: light-dark(#e7e7e7, #2c2c2c);
     --aam-line: light-dark(#00000019, #ffffff17);
-    --aam-hover: light-dark(#0000000b, #ffffff0d);
+    --aam-hover: light-dark(#00000024, #ffffff24);
     --aam-button: light-dark(#ffffff, #484848);
     --aam-blue: light-dark(#0069db, #0a84ff);
     --aam-on-blue: #fff;
@@ -1827,6 +1827,11 @@ html&gt;body{padding:0}&lt;/style&gt;
   #aam-ui-preview .aam-product button:focus-visible { outline: 3px solid var(--aam-ring); outline-offset: 1px; }
   #aam-ui-preview .aam-bar { --aam-text: #f2f5fa; --aam-secondary: #f2f5fa; --aam-hover: #ffffff1f; --aam-green: #35e466; --aam-finished: #73c7ff; --aam-amber: #ff9f0a; min-height: 34px; display: flex; align-items: center; justify-content: flex-end; padding: 3px 15px 5px; gap: 14px; color: var(--aam-secondary); background: linear-gradient(110deg, #607b9b, #5c7696); }
   #aam-ui-preview .aam-bar small { font-size: 11px; }
+  #aam-ui-preview .aam-theme-switch { display: inline-flex; flex-shrink: 0; margin-right: auto; padding: 2px; gap: 2px; border-radius: 7px; background: #00000026; }
+  #aam-ui-preview .aam-theme-switch button { border: 0; border-radius: 5px; padding: 3px 6px; background: transparent; color: #f2f5fa; font-size: 11px; cursor: pointer; }
+  #aam-ui-preview .aam-theme-switch button:hover { background: #ffffff24; }
+  #aam-ui-preview .aam-theme-switch button[aria-pressed=&quot;true&quot;] { background: #ffffff40; }
+
   #aam-ui-preview .aam-status-item { display: flex; align-items: center; gap: 5px; background: var(--aam-hover); border-radius: 7px; padding: 3px 9px; position: relative; color: var(--aam-text); }
   #aam-ui-preview [hidden] { display: none !important; }
   #aam-ui-preview .aam-robot { width: 21px; height: 18px; background: var(--aam-text); mask-size: contain; mask-repeat: no-repeat; mask-position: center; }
@@ -1913,7 +1918,7 @@ html&gt;body{padding:0}&lt;/style&gt;
   #aam-ui-preview .aam-question legend { padding: 0; width: 100%; }
   #aam-ui-preview .aam-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
   #aam-ui-preview .aam-product .aam-action { border: 1px solid var(--aam-line); background: var(--aam-button); border-radius: 999px; padding: 3px 18px; min-height: 24px; font-size: 12px; line-height: 1.3; font-weight: 500; }
-  #aam-ui-preview .aam-action:hover { background: color-mix(in srgb, var(--aam-button), var(--aam-text) 5%); }
+  #aam-ui-preview .aam-action:hover { background: light-dark(#e1e1e1, #646464); }
   #aam-ui-preview .aam-product .aam-action:focus-visible { background: var(--aam-blue); border-color: transparent; color: var(--aam-on-blue); }
   #aam-ui-preview .aam-action.aam-subtle { border-color: transparent; background: none; font-weight: 400; }
   #aam-ui-preview .aam-action.aam-subtle:hover { background: var(--aam-hover); }
@@ -1961,6 +1966,14 @@ html&gt;body{padding:0}&lt;/style&gt;
 &lt;script&gt;
 (() =&gt; {
   const root = document.getElementById(&#x27;aam-ui-preview&#x27;);
+  function setPreviewTheme(theme) {
+    root.dataset.theme = theme;
+    root.style.colorScheme = theme;
+    root.querySelectorAll(&#x27;.aam-theme-switch button&#x27;).forEach(button =&gt; {
+      button.setAttribute(&#x27;aria-pressed&#x27;, String(button.dataset.theme === theme));
+    });
+  }
+
   function applyExpanded(saved) {
     if (!saved?.privateContent?.expanded) return;
     root.querySelectorAll(&#x27;.aam-stage&#x27;).forEach(stage =&gt; {
@@ -2021,8 +2034,13 @@ html&gt;body{padding:0}&lt;/style&gt;
     const product = document.createElement(&#x27;div&#x27;);
     product.className = &#x27;aam-product&#x27;;
     product.setAttribute(&#x27;aria-label&#x27;, &#x27;AI Agent Monitor — &#x27; + stage.parentElement.dataset.variant);
-    product.innerHTML = `&lt;div class=&quot;aam-bar&quot;&gt;&lt;small&gt;Sat 10:42&lt;/small&gt;&lt;span class=&quot;aam-status-item&quot; aria-label=&quot;AI Agent Monitor&quot;&gt;&lt;span class=&quot;aam-robot&quot; style=&quot;mask-image:url(${robot})&quot; aria-hidden=&quot;true&quot;&gt;&lt;/span&gt;&lt;span class=&quot;aam-working-count&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;aam-count aam-finished-count&quot; aria-label=&quot;Unseen finished sessions&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;aam-count aam-request-count&quot; aria-label=&quot;Pending requests&quot;&gt;2&lt;/span&gt;&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;aam-menu&quot;&gt;&lt;div class=&quot;aam-list&quot;&gt;${[&#x27;VS Code&#x27;,&#x27;Terminal&#x27;,&#x27;Codex&#x27;].map(app =&gt; `&lt;section class=&quot;aam-group&quot; data-app=&quot;${app}&quot; aria-label=&quot;${app}&quot;&gt;&lt;div class=&quot;aam-sticky-app&quot;&gt;&lt;span class=&quot;aam-app-icon&quot; role=&quot;img&quot; aria-label=&quot;${app}&quot; data-tooltip=&quot;${app}&quot;&gt;&lt;img src=&quot;${applicationIcons[app]}&quot; width=&quot;24&quot; height=&quot;24&quot; alt=&quot;&quot;&gt;&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;aam-group-sessions&quot;&gt;${live.filter(s =&gt; s.app === app).map(s =&gt; sessionMarkup(s, index + &#x27;-&#x27; + s.id)).join(&#x27;&#x27;)}&lt;/div&gt;&lt;/section&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;&lt;footer class=&quot;aam-footer&quot;&gt;&lt;div class=&quot;aam-usage&quot;&gt;&lt;span&gt;Codex Weekly&lt;/span&gt;&lt;span class=&quot;aam-usage-values&quot;&gt;&lt;span&gt;74%&lt;/span&gt;&lt;span&gt;Nov 7&lt;/span&gt;&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;aam-footer-bottom&quot;&gt;&lt;span class=&quot;aam-version&quot; aria-live=&quot;polite&quot;&gt;v0.1.0 · preview&lt;/span&gt;&lt;div class=&quot;aam-tools&quot;&gt;&lt;button type=&quot;button&quot; class=&quot;aam-icon-button aam-settings-button cursor-interaction&quot; aria-label=&quot;Settings&quot; aria-expanded=&quot;false&quot;&gt;${icon(&#x27;settings&#x27;)}&lt;/button&gt;&lt;button type=&quot;button&quot; class=&quot;aam-icon-button aam-power cursor-interaction&quot; aria-label=&quot;Pause monitor&quot; aria-pressed=&quot;false&quot;&gt;${icon(&#x27;power&#x27;)}&lt;/button&gt;&lt;/div&gt;&lt;/div&gt;&lt;div class=&quot;aam-settings&quot; hidden&gt;&lt;strong&gt;General&lt;/strong&gt;&lt;label&gt;&lt;input type=&quot;checkbox&quot; checked&gt;Launch at login&lt;/label&gt;&lt;label&gt;&lt;input type=&quot;checkbox&quot; checked&gt;Menu bar animation&lt;/label&gt;&lt;label&gt;&lt;input class=&quot;aam-show-meta&quot; type=&quot;checkbox&quot; checked&gt;Show folder and branch&lt;/label&gt;&lt;/div&gt;&lt;/footer&gt;&lt;/div&gt;`;
+    product.innerHTML = `&lt;div class=&quot;aam-bar&quot;&gt;&lt;div class=&quot;aam-theme-switch&quot; role=&quot;group&quot; aria-label=&quot;Preview appearance&quot;&gt;&lt;button type=&quot;button&quot; data-theme=&quot;light&quot; aria-pressed=&quot;false&quot;&gt;Light&lt;/button&gt;&lt;button type=&quot;button&quot; data-theme=&quot;dark&quot; aria-pressed=&quot;false&quot;&gt;Dark&lt;/button&gt;&lt;/div&gt;&lt;small&gt;Sat 10:42&lt;/small&gt;&lt;span class=&quot;aam-status-item&quot; aria-label=&quot;AI Agent Monitor&quot;&gt;&lt;span class=&quot;aam-robot&quot; style=&quot;mask-image:url(${robot})&quot; aria-hidden=&quot;true&quot;&gt;&lt;/span&gt;&lt;span class=&quot;aam-working-count&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;aam-count aam-finished-count&quot; aria-label=&quot;Unseen finished sessions&quot;&gt;2&lt;/span&gt;&lt;span class=&quot;aam-count aam-request-count&quot; aria-label=&quot;Pending requests&quot;&gt;2&lt;/span&gt;&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;aam-menu&quot;&gt;&lt;div class=&quot;aam-list&quot;&gt;${[&#x27;VS Code&#x27;,&#x27;Terminal&#x27;,&#x27;Codex&#x27;].map(app =&gt; `&lt;section class=&quot;aam-group&quot; data-app=&quot;${app}&quot; aria-label=&quot;${app}&quot;&gt;&lt;div class=&quot;aam-sticky-app&quot;&gt;&lt;span class=&quot;aam-app-icon&quot; role=&quot;img&quot; aria-label=&quot;${app}&quot; data-tooltip=&quot;${app}&quot;&gt;&lt;img src=&quot;${applicationIcons[app]}&quot; width=&quot;24&quot; height=&quot;24&quot; alt=&quot;&quot;&gt;&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;aam-group-sessions&quot;&gt;${live.filter(s =&gt; s.app === app).map(s =&gt; sessionMarkup(s, index + &#x27;-&#x27; + s.id)).join(&#x27;&#x27;)}&lt;/div&gt;&lt;/section&gt;`).join(&#x27;&#x27;)}&lt;/div&gt;&lt;footer class=&quot;aam-footer&quot;&gt;&lt;div class=&quot;aam-usage&quot;&gt;&lt;span&gt;Codex Weekly&lt;/span&gt;&lt;span class=&quot;aam-usage-values&quot;&gt;&lt;span&gt;74%&lt;/span&gt;&lt;span&gt;Nov 7&lt;/span&gt;&lt;/span&gt;&lt;/div&gt;&lt;div class=&quot;aam-footer-bottom&quot;&gt;&lt;span class=&quot;aam-version&quot; aria-live=&quot;polite&quot;&gt;v0.1.0 · preview&lt;/span&gt;&lt;div class=&quot;aam-tools&quot;&gt;&lt;button type=&quot;button&quot; class=&quot;aam-icon-button aam-settings-button cursor-interaction&quot; aria-label=&quot;Settings&quot; aria-expanded=&quot;false&quot;&gt;${icon(&#x27;settings&#x27;)}&lt;/button&gt;&lt;button type=&quot;button&quot; class=&quot;aam-icon-button aam-power cursor-interaction&quot; aria-label=&quot;Pause monitor&quot; aria-pressed=&quot;false&quot;&gt;${icon(&#x27;power&#x27;)}&lt;/button&gt;&lt;/div&gt;&lt;/div&gt;&lt;div class=&quot;aam-settings&quot; hidden&gt;&lt;strong&gt;General&lt;/strong&gt;&lt;label&gt;&lt;input type=&quot;checkbox&quot; checked&gt;Launch at login&lt;/label&gt;&lt;label&gt;&lt;input type=&quot;checkbox&quot; checked&gt;Menu bar animation&lt;/label&gt;&lt;label&gt;&lt;input class=&quot;aam-show-meta&quot; type=&quot;checkbox&quot; checked&gt;Show folder and branch&lt;/label&gt;&lt;/div&gt;&lt;/footer&gt;&lt;/div&gt;`;
     stage.append(product);
+    product.querySelectorAll(&#x27;.aam-theme-switch button&#x27;).forEach(button =&gt; {
+      button.addEventListener(&#x27;click&#x27;, () =&gt; setPreviewTheme(button.dataset.theme));
+    });
+    setPreviewTheme(root.dataset.theme || (matchMedia(&#x27;(prefers-color-scheme: dark)&#x27;).matches ? &#x27;dark&#x27; : &#x27;light&#x27;));
+
     // Keep the application icon centered on the first header; robots scroll beneath it.
     function syncGutter() {
       product.querySelectorAll(&#x27;.aam-group&#x27;).forEach(group =&gt; {

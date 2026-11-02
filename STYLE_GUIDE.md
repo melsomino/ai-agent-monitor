@@ -53,10 +53,12 @@ There is no dashboard heading or search box above the native session list. Setti
 | Working, in the list | `#007637` | `#30D158` | Spinner and robot eyes |
 | Attention | `systemOrangeColor` | `systemOrangeColor` | Pending request markers and request count |
 | Finished, in the list | `#0066BE` | `#73C7FF` | Filled completion disc |
-| Hover fill | `labelColor` at 6% alpha | `labelColor` at 6% alpha | Pointer feedback |
+| Hover fill | Black at 14% alpha | White at 14% alpha | Pointer feedback, resolved for the current appearance |
 | Keyboard selection | `controlAccentColor` | `controlAccentColor` | The single active keyboard target |
 | Selected foreground | `selectedMenuItemTextColor` | `selectedMenuItemTextColor` | Text on a focused selection |
 | Links | `linkColor` | `linkColor` | Native attributed-text links |
+
+Text actions with an opaque resting surface use a more distinct hover: light `#E1E1E1`, dark `#646464`. Keyboard focus remains the system accent color.
 
 The menu-bar artwork sits on a different material from the list. Its working count/eyes use system green; its finished count uses a pale blue filled disc with dark ink. Do not copy the darker list green into the menu bar without checking contrast there.
 
