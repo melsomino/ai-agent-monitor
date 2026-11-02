@@ -33,6 +33,10 @@ fn sign_app(bundle: &Path) -> Result<()> {
 }
 
 pub fn bundle() -> Result<()> {
+    anyhow::ensure!(
+        cfg!(target_os = "macos"),
+        "App bundles and DMGs require macOS; on Ubuntu run the binary directly"
+    );
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let contents = root.join("build").join(core::APP_NAME).join("Contents");
     let executable = contents.join("MacOS/AIAgentMonitor");

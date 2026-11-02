@@ -27,7 +27,7 @@ fn session(id: &str, request: &str) -> Session {
 struct Harness {
     handle: Handle,
     agents: mpsc::Receiver<AgentCommand>,
-    _ui: mpsc::Receiver<crate::macos::bridge::Event>,
+    _ui: mpsc::Receiver<crate::platform::Event>,
     _telegram: mpsc::Receiver<crate::actors::human::telegram::Event>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -938,4 +938,32 @@ async fn adapter_failure_clears_inflight_chat_sending_status() {
             .is_some_and(|send| matches!(send.status, MessageStatus::Failed(_)))
     })
     .await;
+}
+
+#[tokio::test]
+async fn changed_request_context_rejects_an_old_control_even_when_approval_id_matches() {
+    let mut h = Harness::new();
+    let mut original = session("one", "approval");
+    original.interaction_data.command = Some("echo original".into());
+    h.observe(vec![original.clone()]).await;
+    h.wait(|s| s.sessions.len() == 1).await;
+    let mut current = original.clone();
+    current.interaction_data.command = Some("echo changed".into());
+    h.observe(vec![current.clone()]).await;
+    h.wait(|s| s.sessions[0].interaction_data.command.as_deref() == Some("echo changed"))
+        .await;
+    h.handle
+        .submit(&original, Response::Action("allow".into()))
+        .unwrap();
+    let state = h.settle().await;
+    assert!(state.submissions.is_empty());
+    assert!(h.agents.try_recv().is_err());
+    h.handle
+        .submit(&current, Response::Action("allow".into()))
+        .unwrap();
+    h.wait(|s| !s.submissions.is_empty()).await;
+    assert!(matches!(
+        h.agents.recv().await,
+        Some(AgentCommand::Respond { .. })
+    ));
 }

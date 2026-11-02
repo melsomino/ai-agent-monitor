@@ -1,0 +1,43 @@
+.monitor { background-color: @theme_bg_color; color: @theme_fg_color; font-family: sans-serif; font-size: 13px; }
+.monitor-popover { background: transparent; border-radius: 18px; }
+.popover-surface { background: @theme_bg_color; border-radius: 18px; }
+.monitor button { box-shadow: none; text-shadow: none; outline-offset: -1px; }
+.session-list { padding: 6px 6px 8px; }
+.following-group { border-top: 1px solid alpha(@theme_fg_color,.09); margin-top: 6px; padding-top: 6px; }
+.session-header { min-height: 36px; }
+.session-title { background: transparent; border: 0; border-radius: 16px; min-height: 28px; padding: 0 6px; font-size: 13px; font-weight: 600; }
+.session-title:hover,.icon-button:hover,.robot-button:hover,.answer:hover { background: alpha(@theme_fg_color,.06); }
+.session-title:focus,.action:focus { background: @theme_selected_bg_color; color: @theme_selected_fg_color; outline: none; }
+.icon-button,.robot-button { min-width: 28px; min-height: 28px; padding: 0; margin: 0; border: 0; border-radius: 50%; background: transparent; color: alpha(@theme_fg_color,.55); }
+.robot-button { margin-right: 0; }
+.history-button { min-width: 16px; min-height: 0; padding: 0; border: 0; border-radius: 8px; background: transparent; color: alpha(@theme_fg_color,.55); }
+.history-button:hover { background: alpha(@theme_fg_color,.06); }
+.detail { margin: 4px 12px 8px 34px; }
+.message { color: @message; font-size: 13px; }
+.request-card { padding: 11px; background: @request; border: 1px solid alpha(@theme_fg_color,.09); border-radius: 12px; }
+.question { font-size: 13px; font-weight: 500; }
+.action { padding: 4px 18px; min-height: 24px; border-radius: 16px; background-image: none; background-color: @theme_base_color; border: 1px solid alpha(@theme_fg_color,.12); font-size: 12px; font-weight: 500; }
+.action:hover { background: alpha(@theme_fg_color,.06); }
+.subtle { background: transparent; border-color: transparent; }
+.command { padding: 8px 10px; background: @command; border-radius: 8px; font-family: monospace; font-size: 12px; }
+.metadata,.secondary { font-size: 11px; color: alpha(@theme_fg_color,.55); }
+.metadata-row { min-height: 16px; }
+.answer { font-size: 12px; min-height: 21px; padding: 3px 0; border-radius: 9px; color: @theme_fg_color; }
+.answer radio { min-width: 14px; min-height: 14px; margin: 0 7px 0 0; padding: 0; }
+.answer label { padding: 1px 4px; margin-left: -4px; }
+.custom-answer { padding: 3px 0; }
+.custom-radio { min-width: 14px; min-height: 14px; padding: 0; margin: 6px 0 0; }
+.custom-radio radio { min-width: 14px; min-height: 14px; padding: 0; margin: 0; }
+.request-card entry { font-size: 12px; min-height: 27px; border-radius: 6px; }
+.footer { padding: 10px 14px 8px; background: @footer; border-top: 1px solid alpha(@theme_fg_color,.09); }
+.version { font-size: 10px; color: alpha(@theme_fg_color,.42); }
+.usage { font-size: 11px; color: alpha(@theme_fg_color,.65); }
+.empty { margin: 24px; color: alpha(@theme_fg_color,.55); }
+.settings-page { padding: 18px; }
+.error { color: #d47b14; font-size: 11px; }
+.filter { margin-bottom: 6px; color: alpha(@theme_fg_color,.6); font-size: 11px; }
+
+.answer:focus { outline: none; }
+.answer:hover { background: transparent; }
+.answer:hover label { background: alpha(@theme_fg_color,.06); border-radius: 9px; }
+.answer:focus label { background: @theme_selected_bg_color; color: @theme_selected_fg_color; border-radius: 9px; }

@@ -1,0 +1,7 @@
+{
+  "uuid": "ai-agent-monitor@melsomino",
+  "name": "AI Agent Monitor",
+  "description": "Theme-aware robot indicator with a directly anchored monitor panel.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 9
+}

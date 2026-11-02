@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AI Agent Monitor
+Comment=Monitor coding agent sessions and answer requests
+Exec=AIAgentMonitor sessions
+Icon=ai-agent-monitor
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=false

@@ -24,6 +24,7 @@ pub type Owner = (u32, String, String);
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Sessions,
+    ShowWindow,
     Setup,
     NotificationSettings,
     AgentHook {
@@ -50,9 +51,7 @@ struct Reply {
 fn path() -> PathBuf {
     std::env::var_os("AI_AGENT_MONITOR_SOCKET")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            core::home().join("Library/Application Support/AI Agent Monitor/monitor.sock")
-        })
+        .unwrap_or_else(|| core::state_home().join("monitor.sock"))
 }
 fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
@@ -71,12 +70,41 @@ fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
     serde_json::from_slice(&bytes).context("Invalid monitor message")
 }
 fn trusted_peer(stream: &UnixStream) -> Result<()> {
-    let mut uid = 0;
-    let mut gid = 0;
-    // SAFETY: Valid descriptor and writable uid/gid output pointers.
-    let status = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    trusted_fd(stream.as_raw_fd())?;
+    Ok(())
+}
+fn trusted_fd(fd: std::os::fd::RawFd) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let uid = {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: valid descriptor, correctly sized credential buffer and length.
+        anyhow::ensure!(
+            unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    &mut cred as *mut _ as *mut libc::c_void,
+                    &mut size,
+                )
+            } == 0,
+            "Cannot authenticate monitor peer"
+        );
+        cred.uid
+    };
+    #[cfg(not(target_os = "linux"))]
+    let uid = {
+        let mut uid = 0;
+        let mut gid = 0;
+        anyhow::ensure!(
+            unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } == 0,
+            "Cannot authenticate monitor peer"
+        );
+        uid
+    };
     anyhow::ensure!(
-        status == 0 && uid == unsafe { libc::geteuid() },
+        uid == unsafe { libc::geteuid() },
         "Monitor peer belongs to another user"
     );
     Ok(())
@@ -99,7 +127,8 @@ pub fn request(request: &Request) -> Result<Value> {
     let stream = match connect(&path) {
         Ok(stream) => stream,
         Err(error)
-            if std::env::var_os("AI_AGENT_MONITOR_SOCKET").is_none()
+            if cfg!(target_os = "macos")
+                && std::env::var_os("AI_AGENT_MONITOR_SOCKET").is_none()
                 && error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                     matches!(
                         error.kind(),
@@ -187,13 +216,7 @@ pub fn start(
 }
 async fn serve(mut stream: tokio::net::UnixStream, monitor: monitor::Handle) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut uid = 0;
-    let mut gid = 0;
-    anyhow::ensure!(
-        unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0
-            && uid == unsafe { libc::geteuid() },
-        "Untrusted monitor peer"
-    );
+    trusted_fd(stream.as_raw_fd())?;
     let request = tokio::time::timeout(Duration::from_secs(3), async {
         let length = stream.read_u32_le().await? as usize;
         anyhow::ensure!(length <= MAX_FRAME, "Oversized monitor request");
@@ -289,12 +312,16 @@ async fn handle_request(
 ) -> Result<Value> {
     use serde_json::json;
     match request {
+        Request::ShowWindow => {
+            monitor
+                .enqueue(monitor::Command::ShowWindow)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            Ok(Value::Null)
+        }
         Request::Sessions => {
             let state = monitor.snapshot();
-            #[cfg(target_os = "macos")]
             let telegram = crate::actors::human::telegram::diagnostics(&state.telegram);
-            #[cfg(not(target_os = "macos"))]
-            let telegram = Value::Null;
             Ok(
                 json!({"monitor":{"pid":std::process::id(),"version":core::VERSION},"telegram":telegram,"sessions":state.sessions.iter().map(|s|json!({"agent":s.agent,"id":s.id,"title":s.title,"cwd":s.cwd,"workspace":s.workspace,"gitBranch":s.git_branch,"client":s.client.label(),"status":s.activity.label(),"lastMessage":s.last_message,"updatedAt":s.updated_at,"approval":s.approval.as_ref().map(|a|json!({"id":a.id,"body":a.body,"expiresAt":a.expires,"canAllow":a.can_allow}))})).collect::<Vec<_>>()}),
             )
@@ -438,6 +465,15 @@ async fn handle_request(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_socket_peer_is_authenticated_as_current_user() {
+        let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+        super::trusted_peer(&left).unwrap();
+        super::trusted_peer(&right).unwrap();
+        assert!(super::trusted_fd(-1).is_err());
+    }
+
     use super::*;
     #[test]
     fn null_replies_are_successful_but_server_errors_still_fail() {

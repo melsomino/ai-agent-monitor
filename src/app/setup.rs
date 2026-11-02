@@ -130,8 +130,8 @@ pub fn discover(home: &Path, codex: PathBuf, claude: PathBuf) -> Vec<Integration
     }
     if home.join(".cline").is_dir()
         || has_extension(home, "saoudrizwan.claude-dev-")
-        || home
-            .join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev")
+        || crate::app::core::vscode_home()
+            .join("User/globalStorage/saoudrizwan.claude-dev")
             .is_dir()
     {
         found.push(Integration {

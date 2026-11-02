@@ -72,8 +72,7 @@ impl SessionProvider for Codex {
     }
 
     fn open_target(&self, session: &Session) -> String {
-        let storage =
-            crate::app::core::home().join("Library/Application Support/Code/User/workspaceStorage");
+        let storage = crate::app::core::vscode_home().join("User/workspaceStorage");
         if let Some(workspace) = &session.workspace {
             crate::app::core::vscode_file_target(workspace)
         } else {
@@ -110,7 +109,7 @@ fn open(
 ) -> Result<Vec<Session>> {
     // SAFETY: geteuid has no preconditions and scopes discovery to this user.
     let uid = unsafe { libc::geteuid() }.to_string();
-    let mut command = Command::new("/usr/sbin/lsof");
+    let mut command = Command::new(crate::app::core::lsof());
     command.args(["-nP", "-a", "-u", &uid, "-c", "codex", "-F", "pcafn"]);
     let (status, output, errors) = output_with_timeout(&mut command, Duration::from_secs(3))?;
     anyhow::ensure!(
@@ -133,8 +132,7 @@ fn open(
         .filter(|session| session.client == Client::VSCode)
         .map(|session| session.id.clone())
         .collect();
-    let storage =
-        crate::app::core::home().join("Library/Application Support/Code/User/workspaceStorage");
+    let storage = crate::app::core::vscode_home().join("User/workspaceStorage");
     if let Some(mut live) =
         vscode::live_sessions_cached(&vscode_ids, &storage, &mut vscode_cache.borrow_mut())
     {

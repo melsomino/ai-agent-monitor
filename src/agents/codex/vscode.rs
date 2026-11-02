@@ -214,9 +214,22 @@ fn live_logs(paths: &[PathBuf]) -> Result<HashMap<PathBuf, HashSet<u32>>> {
     }
     // SAFETY: geteuid scopes process discovery to the current user.
     let uid = unsafe { libc::geteuid() }.to_string();
-    let mut command = Command::new("/usr/sbin/lsof");
+    let mut command = Command::new(crate::app::core::lsof());
     command
-        .args(["-nP", "-a", "-u", &uid, "-c", "Code Helper", "-F", "pn"])
+        .args([
+            "-nP",
+            "-a",
+            "-u",
+            &uid,
+            "-c",
+            if cfg!(target_os = "linux") {
+                "code"
+            } else {
+                "Code Helper"
+            },
+            "-F",
+            "pn",
+        ])
         .args(paths);
     let (status, output, _) = output_with_timeout(&mut command, Duration::from_secs(2))?;
     // lsof may report unmatched historical paths while still returning live

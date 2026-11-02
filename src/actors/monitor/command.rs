@@ -12,6 +12,7 @@ pub enum Command {
         source: &'static str,
         error: String,
     },
+    SetAnimation(bool),
     SetApplicationEnabled {
         id: String,
         enabled: bool,
@@ -47,6 +48,7 @@ pub enum Command {
     },
     Passive(core::Notification),
     Refresh,
+    ShowWindow,
     Open(String),
     History {
         key: HistoryKey,
@@ -58,20 +60,16 @@ pub enum Command {
         generation: u64,
         result: Result<Option<crate::agents::history::Message>, String>,
     },
-    #[cfg(target_os = "macos")]
     Telegram(crate::actors::human::telegram::Event),
-    #[cfg(target_os = "macos")]
     TelegramObserved(crate::actors::human::telegram::Status),
     #[cfg(target_os = "macos")]
     Platform(crate::macos::bridge::PlatformCommand),
-    #[cfg(target_os = "macos")]
     IntegrationsObserved {
-        rows: Vec<crate::macos::onboarding::Row>,
+        rows: Vec<crate::domain::integrations::Row>,
         busy: bool,
         note: String,
     },
-    #[cfg(target_os = "macos")]
-    PreferencesObserved(crate::macos::settings::Preferences),
+    PreferencesObserved(crate::domain::preferences::Preferences),
     Shutdown,
 }
 pub(crate) enum AgentCommand {

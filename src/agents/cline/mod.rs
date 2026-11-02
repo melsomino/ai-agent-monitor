@@ -33,9 +33,7 @@ pub fn hooks_home() -> PathBuf {
 fn task_files(record: &Record) -> Vec<PathBuf> {
     let home = core::home();
     [
-        home.join(
-            "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/tasks",
-        ),
+        core::vscode_home().join("User/globalStorage/saoudrizwan.claude-dev/tasks"),
         home.join(".cline/data/tasks"),
     ]
     .into_iter()

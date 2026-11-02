@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-/// Native macOS session monitor and approval notifications for coding agents.
+/// Desktop session monitor and approval notifications for coding agents.
 #[derive(Debug, Parser)]
 #[command(name = "AIAgentMonitor", version = env!("AI_AGENT_MONITOR_VERSION"))]
 pub struct Cli {
@@ -27,6 +27,9 @@ impl AgentKind {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Start the Ubuntu monitor without opening the session panel.
+    #[cfg(target_os = "linux")]
+    Background,
     /// Receive a lifecycle/permission hook from Claude Code or Cline.
     AgentHook {
         #[arg(value_enum)]
@@ -43,7 +46,7 @@ pub enum Command {
         #[arg(long)]
         home: Option<PathBuf>,
     },
-    /// Open the sessions window and keep an icon in the macOS menu bar.
+    /// Open the sessions window and keep a desktop tray icon.
     Sessions {
         /// Print only currently open sessions as JSON without opening the window.
         #[arg(long)]
@@ -100,6 +103,8 @@ pub struct Message {
 }
 
 pub enum NativeCommand {
+    #[cfg(target_os = "linux")]
+    Background,
     Listen,
     Sessions,
     OpenTarget(String),

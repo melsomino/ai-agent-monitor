@@ -2,8 +2,11 @@ mod actors;
 mod agents;
 mod app;
 mod domain;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+mod platform;
 
 use app::{cli, core, tools};
 #[cfg(target_os = "macos")]
@@ -109,6 +112,8 @@ fn run(command: Option<Command>) -> Result<()> {
         Some(Command::SendApproval { .. }) => {
             bail!("Legacy approval senders are no longer supported; use the resident monitor")
         }
+        #[cfg(target_os = "linux")]
+        Some(Command::Background) => run_native(NativeCommand::Background)?,
         None => run_native(NativeCommand::Listen)?,
     }
     Ok(())
@@ -119,7 +124,11 @@ fn run_native(command: NativeCommand) -> Result<()> {
     {
         native::run(command)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::run(command)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = command;
         bail!("native notifications require macOS")

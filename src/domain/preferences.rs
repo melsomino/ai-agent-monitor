@@ -13,6 +13,9 @@ pub struct Applications {
     apps: BTreeMap<String, KnownApplication>,
 }
 impl Applications {
+    pub fn entries(&self) -> impl Iterator<Item = &KnownApplication> {
+        self.apps.values()
+    }
     /// Keep previously seen applications, including disabled and currently closed ones.
     pub fn observe(&mut self, clients: impl IntoIterator<Item = Client>) -> bool {
         let mut changed = false;
