@@ -68,6 +68,7 @@ pub(crate) async fn run(
                     });
                 }
                 AgentCommand::History {
+                    key,
                     session,
                     cursor,
                     generation,
@@ -76,7 +77,7 @@ pub(crate) async fn run(
                         .previous_message(&session, cursor.as_deref())
                         .map_err(|e| e.to_string());
                     let _ = handle.publish_from_worker(Command::HistoryObserved {
-                        session: session.key(),
+                        key,
                         generation,
                         result,
                     });

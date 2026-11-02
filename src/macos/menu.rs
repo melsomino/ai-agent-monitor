@@ -42,6 +42,7 @@ const SESSION_HEADER_HOVER_LEFT: f64 = SESSION_TEXT_LEFT - 8.0;
 const SESSION_HEADER_HOVER_WIDTH: f64 = 384.0 - 2.0 * SESSION_HEADER_HOVER_LEFT;
 const MESSAGE_TOP_GAP: f64 = 4.0;
 const BUTTON_HOVER_PADDING: f64 = 0.0;
+const ICON_BUTTON_SIZE: f64 = 28.0;
 const QUESTION_CARD_WIDTH: f64 = DETAIL_WIDTH;
 
 #[derive(Clone, Default)]
@@ -210,6 +211,7 @@ pub struct State {
     footer: OnceCell<Retained<NSView>>,
     footer_height: Cell<f64>,
     footer_extension: OnceCell<FooterExtension>,
+    header_extension: OnceCell<FooterExtension>,
     footer_fill: OnceCell<Retained<NSColor>>,
     scroll: OnceCell<Retained<SessionScrollView>>,
     content_height: Cell<f64>,
@@ -411,6 +413,8 @@ define_class!(
         fn poll_state(&self,_timer:&NSTimer){self.drain_ui();self.receive_sessions();}
         #[unsafe(method(pollPointer:))]
         fn poll_pointer(&self, _timer: &NSTimer) {
+            self.constrain_menu_to_work_area();
+            self.sync_header_extension();
             self.sync_footer_extension();
             self.start_keyboard_tracking();
             self.receive_sessions();
@@ -444,6 +448,13 @@ define_class!(
             self.begin_disclosure(&id);
         }
 
+        #[unsafe(method(markFinishedSeen:))]
+        fn mark_finished_seen(&self, sender: &NSButton) {
+            if let Some(key) = sender.identifier() {
+                self.ivars().acknowledge_finished(&key.to_string());
+            }
+        }
+
         #[unsafe(method(previousMessage:))]
         fn previous_message(&self, sender: &NSButton) {
             let Some(key) = sender.identifier().map(|id| id.to_string()) else { return; };
@@ -463,7 +474,7 @@ define_class!(
                 history.cursor.clone()
             };
             self.render_rows(&state.filtered_sessions());
-            let result = self.monitor().send(crate::actors::monitor::Command::History{session:key.clone(),cursor:before,generation:ticket});
+            let result = self.monitor().send(crate::actors::monitor::Command::History{key:crate::actors::monitor::HistoryKey::window(key.clone()),cursor:before,generation:ticket});
             if let Err(error) = result {
                 if let Some(history) = state.message_history.borrow_mut().get_mut(&key) {
                     history.enqueued(Err(error));
@@ -813,6 +824,36 @@ define_class!(
     struct PanelView;
     unsafe impl NSObjectProtocol for PanelView {}
     impl PanelView {
+        #[unsafe(method(drawRect:))]
+        fn draw_background(&self, _dirty: NSRect) {
+            // Keep the native menu material underneath, but attenuate wallpaper
+            // and window contrast with an appearance-aware translucent surface.
+            NSColor::windowBackgroundColor().colorWithAlphaComponent(0.65).setFill();
+            NSBezierPath::bezierPathWithRect(self.bounds()).fill();
+        }
+
+        #[unsafe(method(viewDidMoveToWindow))]
+        fn attached(&self) {
+            // Prepare the native menu padding before its first visible frame.
+            if let Some(controller) = self.ivars().owner.get().and_then(|owner| owner.load()) {
+                controller.constrain_menu_to_work_area();
+                controller.sync_header_extension();
+            }
+        }
+
+        #[unsafe(method(viewWillDraw))]
+        fn will_draw(&self) {
+            // AppKit can resize the tracking window after our layout and before
+            // painting. Extend the fill in that same frame, not on the next tick.
+            if let Some(controller) = self.ivars().owner.get().and_then(|owner| owner.load()) {
+                controller.constrain_menu_to_work_area();
+                controller.sync_header_extension();
+                controller.sync_footer_extension();
+            }
+            // SAFETY: Preserve NSView's normal pre-draw preparation.
+            unsafe { let _: () = msg_send![super(self), viewWillDraw]; }
+        }
+
         #[unsafe(method(scrollWheel:))]
         fn wheel(&self, event: &NSEvent) { route_wheel(self,event); }
     }
@@ -1203,6 +1244,11 @@ fn detail_text_color(approval: bool) -> Retained<NSColor> {
     appearance_color(light_rgb, dark_rgb, 1.0)
 }
 
+pub(super) fn working_status_color() -> Retained<NSColor> {
+    // Darker green on light material; keep the brighter green in dark mode.
+    appearance_color([0.0, 118.0, 55.0], [48.0, 209.0, 88.0], 1.0)
+}
+
 fn message_style(label: &NSTextField, color: &NSColor) {
     crate::macos::markdown::apply(label, color);
 }
@@ -1551,16 +1597,15 @@ impl MenuController {
             return;
         }
         self.receive_sessions();
+        self.filter();
         self.resize_content(state.content_height.get());
         self.refresh();
-        if let Some(button) = state.status.get().and_then(|item| item.button(self.mtm())) {
-            // Use the same native status-item path as an actual menu-bar click.
-            // Manual popup coordinates can anchor at the screen origin during launch.
-            if button.window().is_some() {
-                // SAFETY: nil is a valid sender; AppKit owns this button's menu action.
-                unsafe {
-                    button.performClick(None);
-                }
+        if let Some(button) = state.status.get().and_then(|item| item.button(self.mtm()))
+            && button.window().is_some()
+        {
+            // SAFETY: AppKit owns the attached status menu's button action.
+            unsafe {
+                button.performClick(None);
             }
         }
     }
@@ -2483,6 +2528,8 @@ impl MenuController {
                 .set(count)
                 .expect("count initialized once");
         }
+        // Let AppKit own status-item selection and switching between menu-bar
+        // items. The custom view confines the menu to the work area before draw.
         item.setMenu(self.ivars().menu.get().map(|menu| &**menu));
         self.ivars()
             .status
@@ -2869,7 +2916,14 @@ impl MenuController {
                 self.mtm(),
             )
         };
-        let frame = if transparent {
+        let frame = if !transparent && title.is_empty() {
+            rect(
+                frame.origin.x + (frame.size.width - ICON_BUTTON_SIZE) / 2.0,
+                frame.origin.y + (frame.size.height - ICON_BUTTON_SIZE) / 2.0,
+                ICON_BUTTON_SIZE,
+                ICON_BUTTON_SIZE,
+            )
+        } else if transparent {
             frame
         } else {
             rect(
@@ -2977,7 +3031,7 @@ impl MenuController {
             };
             // Match the preview's 18-point symbol viewport and 15-point disc.
             let disc: Retained<StatusContentView> = unsafe {
-                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(328.0, y - 1.0, 18.0, 18.0)]
+                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(323.0, y - 1.0, 18.0, 18.0)]
             };
             let circle = NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(1.5, 1.5, 15.0, 15.0));
             circle.setBoxType(NSBoxType::Custom);
@@ -3019,7 +3073,7 @@ impl MenuController {
             return None;
         }
         let (symbol, color) = match activity {
-            Activity::Working => ("arrow.triangle.2.circlepath", NSColor::systemGreenColor()),
+            Activity::Working => ("arrow.triangle.2.circlepath", working_status_color()),
             Activity::Idle | Activity::Confirmation => return None,
             Activity::Unknown => ("questionmark.circle", NSColor::tertiaryLabelColor()),
         };
@@ -3028,7 +3082,7 @@ impl MenuController {
             Some(&NSString::from_str(activity.label())),
         ) {
             image.setTemplate(true);
-            let frame = rect(330.0, y + 1.0, 14.0, 14.0);
+            let frame = rect(325.0, y + 1.0, 14.0, 14.0);
             if activity == Activity::Working {
                 let allocated = WorkingIconView::alloc(self.mtm()).set_ivars(WorkingIconState {
                     angle: Cell::new(0.0),
@@ -3083,6 +3137,9 @@ impl MenuController {
             panel.stop_editing();
         }
         if let Some(extension) = self.ivars().footer_extension.get() {
+            extension.view.removeFromSuperview();
+        }
+        if let Some(extension) = self.ivars().header_extension.get() {
             extension.view.removeFromSuperview();
         }
         self.stop_keyboard_tracking();
@@ -3247,7 +3304,9 @@ impl MenuController {
             return true;
         }
         let Some(id) = state.keyboard_focus.borrow().clone() else {
-            return true;
+            // With no target inside the panel, let the native menu bar handle
+            // horizontal navigation to neighboring status items.
+            return !matches!(key, 123 | 124);
         };
         let control = state.request_controls.borrow().get(&id).cloned();
         let session_id = control
@@ -3986,7 +4045,7 @@ impl MenuController {
                     "",
                     sel!(respondToRequest:),
                     &key,
-                    rect(width - 24.0, y - 21.0, 24.0, 18.0),
+                    rect(width - 28.0, y - 26.0, 28.0, 28.0),
                     false,
                 );
                 button.setRefusesFirstResponder(true);
@@ -4444,7 +4503,7 @@ impl MenuController {
             let title_right = if session.activity == Activity::Idle && !finished {
                 348.0
             } else {
-                326.0
+                316.0
             };
             let text_width = title_right - SESSION_TEXT_LEFT - 12.0;
             let robot_button = self.action_button(
@@ -4453,10 +4512,10 @@ impl MenuController {
                 sel!(expandSession:),
                 &session.key(),
                 rect(
-                    session_layout::ICON_LEFT - 1.0,
-                    height - SESSION_HEADER_HEIGHT / 2.0 - 12.0,
-                    26.0,
-                    24.0,
+                    session_layout::ICON_LEFT - 4.0,
+                    height - SESSION_HEADER_HEIGHT / 2.0 - 14.0,
+                    32.0,
+                    28.0,
                 ),
                 false,
             );
@@ -4467,7 +4526,7 @@ impl MenuController {
             }));
             let robot = SessionRobot::new(
                 self.mtm(),
-                rect(6.0, (24.0 - 11.0) / 2.0 - 1.0, 14.0, 11.0),
+                rect(7.0, (28.0 - 11.0) / 2.0 - 1.0, 14.0, 11.0),
                 session.activity,
             );
             robot_button.addSubview(&robot);
@@ -4506,6 +4565,22 @@ impl MenuController {
                 .set(title)
                 .expect("title initialized once");
             row.paint_title(false);
+            if finished && session.activity == Activity::Idle {
+                let button = self.action_button(
+                    &row,
+                    "",
+                    sel!(markFinishedSeen:),
+                    &session.key(),
+                    rect(
+                        321.0,
+                        height - SESSION_HEADER_HEIGHT / 2.0 - 12.0,
+                        22.0,
+                        24.0,
+                    ),
+                    false,
+                );
+                button.setToolTip(Some(ns_string!("Mark as seen")));
+            }
             let working_icon = self.status_icon(
                 &row,
                 session.activity,
@@ -4535,7 +4610,7 @@ impl MenuController {
                 sel!(expandSession:),
                 &session.key(),
                 rect(
-                    348.0,
+                    351.0,
                     height - SESSION_HEADER_HEIGHT / 2.0 - 12.0,
                     26.0,
                     24.0,
@@ -4550,10 +4625,10 @@ impl MenuController {
                 image.setTemplate(true);
                 // SAFETY: This NSView subclass has no ivars or custom initialization.
                 let decoration: Retained<StatusContentView> = unsafe {
-                    msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(BUTTON_HOVER_PADDING, BUTTON_HOVER_PADDING, 26.0, 24.0)]
+                    msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, ICON_BUTTON_SIZE, ICON_BUTTON_SIZE)]
                 };
                 let icon = NSImageView::imageViewWithImage(&image, self.mtm());
-                icon.setFrame(rect(6.0, 5.0, 14.0, 14.0));
+                icon.setFrame(rect(7.0, 7.0, 14.0, 14.0));
                 icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
                 decoration.addSubview(&icon);
                 arrow.addSubview(&decoration);
@@ -4910,6 +4985,67 @@ impl MenuController {
         self.advance_working_icons();
     }
 
+    fn sync_header_extension(&self) {
+        let state = self.ivars();
+        if !state.menu_open.get() {
+            return;
+        }
+        let Some(root) = state.root.get() else {
+            return;
+        };
+        let Some(content) = root.window().and_then(|window| window.contentView()) else {
+            return;
+        };
+        let frame = content.convertRect_fromView(root.bounds(), Some(root));
+        let bounds = content.bounds();
+        let gap = if content.isFlipped() {
+            rect(
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                (frame.origin.y - bounds.origin.y).max(0.0),
+            )
+        } else {
+            let top = frame.origin.y + frame.size.height;
+            rect(
+                bounds.origin.x,
+                top,
+                bounds.size.width,
+                (bounds.origin.y + bounds.size.height - top).max(0.0),
+            )
+        };
+        let extension = state.header_extension.get_or_init(|| {
+            // SAFETY: Decorative view passes mouse input through to NSMenu.
+            let view: Retained<StatusContentView> =
+                unsafe { msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: gap] };
+            let fill = NSBox::initWithFrame(
+                NSBox::alloc(self.mtm()),
+                rect(0.0, 0.0, gap.size.width, gap.size.height),
+            );
+            fill.setBoxType(NSBoxType::Custom);
+            fill.setTitlePosition(NSTitlePosition::NoTitle);
+            fill.setBorderWidth(0.0);
+            fill.setCornerRadius(0.0);
+            fill.setContentViewMargins(NSSize::new(0.0, 0.0));
+            fill.setFillColor(&NSColor::windowBackgroundColor().colorWithAlphaComponent(0.65));
+            view.addSubview(&fill);
+            FooterExtension { view, fill }
+        });
+        extension.view.setHidden(gap.size.height <= 0.0);
+        // SAFETY: All view hierarchy access is on the main thread.
+        if !unsafe { extension.view.superview() }
+            .is_some_and(|parent| std::ptr::eq(&*parent, &*content))
+        {
+            content.addSubview(&extension.view);
+        }
+        if extension.view.frame() != gap {
+            extension.view.setFrame(gap);
+            extension
+                .fill
+                .setFrame(rect(0.0, 0.0, gap.size.width, gap.size.height));
+        }
+    }
+
     fn sync_footer_extension(&self) {
         let state = self.ivars();
         if !state.menu_open.get() {
@@ -5150,6 +5286,30 @@ impl MenuController {
         }
     }
 
+    fn constrain_menu_to_work_area(&self) {
+        if !self.ivars().menu_open.get() {
+            return;
+        }
+        let Some(window) = self.ivars().root.get().and_then(|root| root.window()) else {
+            return;
+        };
+        let Some(screen) = window.screen() else {
+            return;
+        };
+        // Native status menus stay on the screen but may overlap a side Dock.
+        // Constrain the actual tracking window after AppKit attaches/resizes it;
+        // retain NSMenu's normal tracking, dismissal and non-activating behavior.
+        let frame = window.frame();
+        let visible = screen.visibleFrame();
+        let mut origin = menu_work_area_origin(frame, visible);
+        // Popup placement can add a native edge offset. Align the window's
+        // actual top to the menu bar, not just the custom item's content edge.
+        origin.y = visible.origin.y + visible.size.height - frame.size.height;
+        if frame.origin != origin {
+            window.setFrameOrigin(origin);
+        }
+    }
+
     fn resize_content(&self, content_height: f64) -> f64 {
         let state = self.ivars();
         state.content_height.set(content_height);
@@ -5199,6 +5359,8 @@ impl MenuController {
             && let Some(menu) = state.menu.get()
         {
             menu.update();
+            self.sync_header_extension();
+            self.sync_footer_extension();
         }
         viewport
     }
@@ -5222,7 +5384,9 @@ impl MenuController {
         {
             let mut histories = state.message_history.borrow_mut();
             for (key, history) in histories.iter_mut() {
-                if let Some(value) = snapshot.history.get(key)
+                if let Some(value) = snapshot
+                    .history
+                    .get(&crate::actors::monitor::HistoryKey::window(key.clone()))
                     && value.generation == history.ticket
                 {
                     history.messages = value.messages.clone();
@@ -5438,8 +5602,68 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<Option<Resident>> {
     }))
 }
 
+fn menu_work_area_origin(frame: NSRect, visible: NSRect) -> NSPoint {
+    const GAP: f64 = 4.0;
+    let left = visible.origin.x + GAP;
+    let bottom = visible.origin.y + GAP;
+    let right = (visible.origin.x + visible.size.width - frame.size.width - GAP).max(left);
+    // The visible area's top already ends at the menu bar: no extra gap there.
+    let top = (visible.origin.y + visible.size.height - frame.size.height).max(bottom);
+    NSPoint::new(
+        frame.origin.x.clamp(left, right),
+        frame.origin.y.clamp(bottom, top),
+    )
+}
+
 #[cfg(test)]
 mod close_tests {
+    #[test]
+    fn menu_avoids_side_and_bottom_docks_on_offset_screens() {
+        use super::{menu_work_area_origin, rect};
+        use objc2_foundation::NSPoint;
+
+        // Right Dock: move left without changing the menu's vertical anchor.
+        assert_eq!(
+            menu_work_area_origin(
+                rect(1000.0, 500.0, 392.0, 350.0),
+                rect(0.0, 0.0, 1320.0, 880.0)
+            ),
+            NSPoint::new(924.0, 500.0),
+        );
+        // Left Dock on a display left of the primary screen.
+        assert_eq!(
+            menu_work_area_origin(
+                rect(-1440.0, 500.0, 392.0, 350.0),
+                rect(-1360.0, 0.0, 1360.0, 880.0)
+            ),
+            NSPoint::new(-1356.0, 500.0),
+        );
+        // Bottom Dock: keep the entire menu above its reserved area.
+        assert_eq!(
+            menu_work_area_origin(
+                rect(500.0, 20.0, 392.0, 600.0),
+                rect(0.0, 80.0, 1440.0, 800.0)
+            ),
+            NSPoint::new(500.0, 84.0),
+        );
+        // An already safe position must remain stable across tracking ticks.
+        assert_eq!(
+            menu_work_area_origin(
+                rect(500.0, 100.0, 392.0, 600.0),
+                rect(0.0, 80.0, 1440.0, 800.0)
+            ),
+            NSPoint::new(500.0, 100.0),
+        );
+        // Keep the menu flush with the menu bar, while retaining the Dock gap.
+        assert_eq!(
+            menu_work_area_origin(
+                rect(500.0, 534.0, 392.0, 350.0),
+                rect(0.0, 0.0, 1440.0, 880.0)
+            ),
+            NSPoint::new(500.0, 530.0),
+        );
+    }
+
     #[test]
     fn opening_an_answer_form_releases_registry_borrows_before_callbacks_and_retention() {
         let forms = std::cell::RefCell::new(vec![1]);
@@ -5496,7 +5720,7 @@ mod close_tests {
             ..Default::default()
         };
         history.enqueued(monitor.send(crate::actors::monitor::Command::History {
-            session: "one".into(),
+            key: crate::actors::monitor::HistoryKey::window("one".into()),
             cursor: None,
             generation: 1,
         }));

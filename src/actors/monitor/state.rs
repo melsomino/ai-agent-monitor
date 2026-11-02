@@ -25,6 +25,30 @@ pub struct History {
     pub error: Option<String>,
     pub generation: u64,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HistoryClient {
+    Window,
+    Telegram,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HistoryKey {
+    pub session: String,
+    pub client: HistoryClient,
+}
+impl HistoryKey {
+    pub fn window(session: String) -> Self {
+        Self {
+            session,
+            client: HistoryClient::Window,
+        }
+    }
+    pub fn telegram(session: String) -> Self {
+        Self {
+            session,
+            client: HistoryClient::Telegram,
+        }
+    }
+}
 #[derive(Clone)]
 pub struct HookState {
     pub session: Session,
@@ -44,7 +68,7 @@ pub struct State {
     pub unseen_finished: HashMap<String, u64>,
     pub submissions: HashMap<String, Submission>,
     pub message_sends: HashMap<String, MessageSend>,
-    pub history: HashMap<String, Arc<History>>,
+    pub history: HashMap<HistoryKey, Arc<History>>,
     pub hooks: HashMap<String, HookState>,
     pub notices: Vec<Notice>,
     pub usage: Option<crate::domain::usage::Usage>,
@@ -66,7 +90,9 @@ impl State {
     pub(super) fn reconcile_finished(&mut self, previous: &[Session]) {
         self.unseen_finished.retain(|key, _| {
             self.sessions.iter().any(|session| {
-                session.key() == *key && session.authoritative && session.activity == Activity::Idle
+                session.key() == *key
+                    && (!session.authoritative
+                        || matches!(session.activity, Activity::Idle | Activity::Unknown))
             })
         });
         for session in &self.sessions {

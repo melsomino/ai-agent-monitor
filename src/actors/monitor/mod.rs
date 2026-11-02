@@ -126,7 +126,7 @@ pub(crate) async fn run(
                     }
                 }
                 for (key, history) in &mut state.history {
-                    if key.starts_with(&format!("{source}:")) {
+                    if key.session.starts_with(&format!("{source}:")) {
                         let history = Arc::make_mut(history);
                         history.loading = false;
                         history.error = Some(error.clone());
@@ -349,12 +349,26 @@ pub(crate) async fn run(
                 }
             }
             Command::History {
-                session,
+                key,
                 cursor,
                 generation,
             } => {
-                if let Some(value) = state.sessions.iter().find(|s| s.key() == session).cloned() {
-                    let history = state.history.entry(session.clone()).or_default();
+                if let Some(value) = state
+                    .sessions
+                    .iter()
+                    .find(|s| s.key() == key.session)
+                    .cloned()
+                {
+                    // Retried commands for the same consumer/request must not
+                    // dispatch a second backend read or reset completed state.
+                    if state
+                        .history
+                        .get(&key)
+                        .is_some_and(|h| h.generation == generation)
+                    {
+                        continue;
+                    }
+                    let history = state.history.entry(key.clone()).or_default();
                     let history = Arc::make_mut(history);
                     if cursor.is_none() {
                         *history = History::default();
@@ -362,29 +376,38 @@ pub(crate) async fn run(
                     history.loading = true;
                     history.error = None;
                     history.generation = generation;
-                    let Some(agent) = agents.get(value.agent) else {
-                        continue;
-                    };
-                    if agent
-                        .try_send(AgentCommand::History {
-                            session: Box::new(value),
-                            cursor,
-                            generation,
-                        })
-                        .is_err()
-                    {
-                        history.loading = false;
-                        history.error = Some("History queue is busy".into());
+                    match agents.get(value.agent) {
+                        None => {
+                            history.loading = false;
+                            history.error = Some(
+                                "Agent is unavailable. Restart the monitor to reconnect.".into(),
+                            );
+                        }
+                        Some(agent) => {
+                            if agent
+                                .try_send(AgentCommand::History {
+                                    key,
+                                    session: Box::new(value),
+                                    cursor,
+                                    generation,
+                                })
+                                .is_err()
+                            {
+                                history.loading = false;
+                                history.error = Some("History queue is busy".into());
+                            }
+                        }
                     }
                 }
             }
             Command::HistoryObserved {
-                session,
+                key,
                 generation,
                 result,
             } => {
-                if let Some(h) = state.history.get_mut(&session)
+                if let Some(h) = state.history.get_mut(&key)
                     && h.generation == generation
+                    && h.loading
                 {
                     let h = Arc::make_mut(h);
                     h.loading = false;
@@ -474,7 +497,7 @@ pub(crate) async fn run(
         }
         state
             .history
-            .retain(|key, _| state.sessions.iter().any(|s| s.key() == *key));
+            .retain(|key, _| state.sessions.iter().any(|s| s.key() == key.session));
         let active: HashSet<_> = state
             .sessions
             .iter()

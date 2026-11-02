@@ -78,6 +78,24 @@ impl Harness {
         .await
         .expect("state transition did not arrive")
     }
+    async fn settle(&self) -> Arc<State> {
+        let title = format!("test barrier after {}", self.handle.snapshot().revision);
+        self.handle
+            .enqueue(Command::Passive(core::Notification {
+                title: title.clone(),
+                body: String::new(),
+                target: String::new(),
+            }))
+            .await
+            .unwrap();
+        self.wait(|state| {
+            state
+                .notices
+                .iter()
+                .any(|notice| notice.content.title == title)
+        })
+        .await
+    }
 }
 impl Drop for Harness {
     fn drop(&mut self) {
@@ -211,6 +229,169 @@ async fn unavailable_or_confirmation_sessions_do_not_report_finished() {
         .wait(|state| state.sessions[0].activity == Activity::Idle)
         .await;
     assert!(resolved.unseen_finished.is_empty());
+}
+
+#[tokio::test]
+async fn unseen_completion_survives_temporary_connection_loss_without_changing_generation() {
+    let h = Harness::new();
+    h.observe(vec![active_session("one", Activity::Working)])
+        .await;
+    h.wait(|s| s.sessions.len() == 1).await;
+    h.observe(vec![active_session("one", Activity::Idle)]).await;
+    let finished = h.wait(|s| s.unseen_finished.len() == 1).await;
+    let generation = finished.unseen_finished["codex:one"];
+    for activity in [Activity::Idle, Activity::Unknown, Activity::Working] {
+        let mut disconnected = active_session("one", activity);
+        disconnected.authoritative = false;
+        h.observe(vec![disconnected]).await;
+        let state = h.settle().await;
+        assert_eq!(state.unseen_finished.get("codex:one"), Some(&generation));
+    }
+    h.observe(vec![active_session("one", Activity::Idle)]).await;
+    let restored = h.wait(|s| s.sessions[0].authoritative).await;
+    assert_eq!(restored.unseen_finished.get("codex:one"), Some(&generation));
+    h.observe(vec![active_session("one", Activity::Working)])
+        .await;
+    h.wait(|s| s.sessions[0].activity == Activity::Working && s.unseen_finished.is_empty())
+        .await;
+}
+
+#[tokio::test]
+async fn window_and_telegram_history_are_independent_even_with_matching_generations() {
+    let mut h = Harness::new();
+    h.observe(vec![active_session("one", Activity::Idle)]).await;
+    h.wait(|s| s.sessions.len() == 1).await;
+    let window = HistoryKey::window("codex:one".into());
+    let telegram = HistoryKey::telegram("codex:one".into());
+    for (key, cursor) in [
+        (window.clone(), None),
+        (telegram.clone(), Some("telegram-before".into())),
+    ] {
+        h.handle
+            .enqueue(Command::History {
+                key,
+                cursor,
+                generation: 1,
+            })
+            .await
+            .unwrap();
+    }
+    let loading = h.settle().await;
+    assert!(loading.history[&window].loading && loading.history[&telegram].loading);
+    for expected in [&window, &telegram] {
+        let Some(AgentCommand::History {
+            key, generation, ..
+        }) = h.agents.recv().await
+        else {
+            panic!("history command expected");
+        };
+        assert_eq!(&key, expected);
+        assert_eq!(generation, 1);
+    }
+    for (key, text) in [
+        (telegram.clone(), "Telegram message"),
+        (window.clone(), "Window message"),
+    ] {
+        h.handle
+            .enqueue(Command::HistoryObserved {
+                key,
+                generation: 1,
+                result: Ok(Some(crate::domain::history::Message {
+                    cursor: text.into(),
+                    text: text.into(),
+                })),
+            })
+            .await
+            .unwrap();
+    }
+    let done = h.settle().await;
+    assert_eq!(done.history[&window].messages.len(), 1);
+    assert_eq!(done.history[&window].messages[0].text, "Window message");
+    assert_eq!(done.history[&telegram].messages.len(), 1);
+    assert_eq!(done.history[&telegram].messages[0].text, "Telegram message");
+    // A duplicate completion and a repeated command cannot append the page again.
+    h.handle
+        .enqueue(Command::HistoryObserved {
+            key: window.clone(),
+            generation: 1,
+            result: Ok(Some(crate::domain::history::Message {
+                cursor: "Window message".into(),
+                text: "Duplicate".into(),
+            })),
+        })
+        .await
+        .unwrap();
+    h.handle
+        .enqueue(Command::History {
+            key: window.clone(),
+            generation: 1,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    let repeated = h.settle().await;
+    assert_eq!(repeated.history[&window].messages.len(), 1);
+    assert_eq!(repeated.history[&window].messages[0].text, "Window message");
+    assert!(h.agents.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn history_requests_after_adapter_stop_publish_errors_for_both_clients() {
+    let h = Harness::new();
+    h.observe(vec![active_session("one", Activity::Idle)]).await;
+    h.wait(|s| s.sessions.len() == 1).await;
+    h.handle
+        .enqueue(Command::AgentStopped {
+            source: "codex",
+            error: "Disconnected".into(),
+        })
+        .await
+        .unwrap();
+    h.wait(|s| !s.sessions[0].authoritative).await;
+    let keys = [
+        HistoryKey::window("codex:one".into()),
+        HistoryKey::telegram("codex:one".into()),
+    ];
+    for key in &keys {
+        h.handle
+            .enqueue(Command::History {
+                key: key.clone(),
+                cursor: None,
+                generation: 1,
+            })
+            .await
+            .unwrap();
+    }
+    let failed = h
+        .wait(|s| {
+            keys.iter().all(|key| {
+                s.history
+                    .get(key)
+                    .is_some_and(|history| !history.loading && history.error.is_some())
+            })
+        })
+        .await;
+    for key in &keys {
+        assert!(
+            failed.history[key]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("unavailable")
+        );
+    }
+    // A late worker result cannot overwrite the published failure.
+    h.handle
+        .enqueue(Command::HistoryObserved {
+            key: keys[0].clone(),
+            generation: 1,
+            result: Ok(None),
+        })
+        .await
+        .unwrap();
+    let late = h.settle().await;
+    assert!(!late.history[&keys[0]].exhausted);
+    assert!(late.history[&keys[0]].error.is_some());
 }
 #[tokio::test]
 async fn state_subscriptions_include_existing_questions_and_both_humans_see_resolution() {
@@ -430,17 +611,22 @@ async fn history_ignores_late_generations_and_reports_loading_in_state() {
     h.wait(|s| s.pending_count() == 1).await;
     h.handle
         .enqueue(Command::History {
-            session: s.key(),
+            key: HistoryKey::window(s.key()),
             cursor: None,
             generation: 2,
         })
         .await
         .unwrap();
-    h.wait(|state| state.history.get(&s.key()).is_some_and(|h| h.loading))
-        .await;
+    h.wait(|state| {
+        state
+            .history
+            .get(&HistoryKey::window(s.key()))
+            .is_some_and(|h| h.loading)
+    })
+    .await;
     h.handle
         .enqueue(Command::HistoryObserved {
-            session: s.key(),
+            key: HistoryKey::window(s.key()),
             generation: 1,
             result: Ok(None),
         })
@@ -448,17 +634,17 @@ async fn history_ignores_late_generations_and_reports_loading_in_state() {
         .unwrap();
     h.handle
         .enqueue(Command::HistoryObserved {
-            session: s.key(),
+            key: HistoryKey::window(s.key()),
             generation: 2,
             result: Err("Read failed".into()),
         })
         .await
         .unwrap();
     let state = h
-        .wait(|state| state.history[&s.key()].error.is_some())
+        .wait(|state| state.history[&HistoryKey::window(s.key())].error.is_some())
         .await;
-    assert!(!state.history[&s.key()].loading);
-    assert!(!state.history[&s.key()].exhausted);
+    assert!(!state.history[&HistoryKey::window(s.key())].loading);
+    assert!(!state.history[&HistoryKey::window(s.key())].exhausted);
 }
 #[tokio::test]
 async fn shutdown_is_published_and_releases_active_hooks() {

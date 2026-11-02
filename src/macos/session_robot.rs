@@ -41,7 +41,7 @@ define_class!(
             rounded(0.0, 4.9, 3.2, 6.2, 1.3).fill();
             rounded(17.2, 4.9, 3.2, 6.2, 1.3).fill();
             let eyes = match self.ivars().activity {
-                Activity::Working => NSColor::systemGreenColor(),
+                Activity::Working => super::menu::working_status_color(),
                 Activity::Confirmation => NSColor::systemOrangeColor(),
                 _ => neutral.colorWithAlphaComponent(0.6),
             };

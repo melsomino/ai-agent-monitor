@@ -49,12 +49,12 @@ pub enum Command {
     Refresh,
     Open(String),
     History {
-        session: String,
+        key: HistoryKey,
         cursor: Option<String>,
         generation: u64,
     },
     HistoryObserved {
-        session: String,
+        key: HistoryKey,
         generation: u64,
         result: Result<Option<crate::agents::history::Message>, String>,
     },
@@ -86,6 +86,7 @@ pub(crate) enum AgentCommand {
         response: Response,
     },
     History {
+        key: HistoryKey,
         session: Box<Session>,
         cursor: Option<String>,
         generation: u64,

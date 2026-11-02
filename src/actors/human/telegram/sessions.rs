@@ -104,7 +104,9 @@ impl Browser {
         {
             return None;
         }
-        let history = state.history.get(&session);
+        let history = state
+            .history
+            .get(&monitor::HistoryKey::telegram(session.clone()));
         if history.is_some_and(|history| history.loading) {
             self.history_note =
                 Some("History is loading. Try Previous message again shortly.".into());
@@ -114,7 +116,7 @@ impl Browser {
         self.history_waiting = Some((generation, Instant::now()));
         self.history_note = None;
         Some(monitor::Command::History {
-            session,
+            key: monitor::HistoryKey::telegram(session),
             cursor: self.earlier.as_ref().map(|message| message.cursor.clone()),
             generation,
         })
@@ -123,11 +125,11 @@ impl Browser {
         let Some((generation, started)) = self.history_waiting else {
             return;
         };
-        if let Some(history) = self
-            .selected
-            .as_ref()
-            .and_then(|key| state.history.get(key))
-            && history.generation == generation
+        if let Some(history) = self.selected.as_ref().and_then(|key| {
+            state
+                .history
+                .get(&monitor::HistoryKey::telegram(key.clone()))
+        }) && history.generation == generation
             && !history.loading
         {
             self.history_waiting = None;
@@ -668,6 +670,16 @@ mod tests {
             sessions: vec![session("1", "Chat", Client::VSCode)],
             ..Default::default()
         };
+        // A native-window history request must neither block Telegram nor
+        // supply its result, even when both consumers choose generation 1.
+        state.history.insert(
+            monitor::HistoryKey::window("codex:1".into()),
+            std::sync::Arc::new(monitor::History {
+                loading: true,
+                generation: 1,
+                ..Default::default()
+            }),
+        );
         let mut browser = Browser::new().unwrap();
         browser.message = Some(7);
         let list = browser.content(&state, &HashMap::new());
@@ -681,14 +693,14 @@ mod tests {
             .navigate(7, &format!("{}:previous", browser.nonce))
             .unwrap();
         let monitor::Command::History {
-            session: key,
+            key,
             cursor,
             generation,
         } = browser.history_command(&state).unwrap()
         else {
             panic!("history command expected")
         };
-        assert_eq!(key, "codex:1");
+        assert_eq!(key, monitor::HistoryKey::telegram("codex:1".into()));
         assert!(cursor.is_none());
         let previous = crate::domain::history::Message {
             cursor: "older".into(),
@@ -704,6 +716,7 @@ mod tests {
             }),
         );
         let detail = browser.content(&state, &HashMap::new());
+        assert!(state.history[&monitor::HistoryKey::window("codex:1".into())].loading);
         assert!(
             detail["text"]
                 .as_str()
