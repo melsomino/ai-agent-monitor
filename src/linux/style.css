@@ -3,7 +3,11 @@
 .popover-surface { background: @theme_bg_color; border-radius: 18px; }
 .monitor button { box-shadow: none; text-shadow: none; outline-offset: -1px; }
 .session-list { padding: 6px 6px 8px; }
-.following-group { border-top: 1px solid alpha(@theme_fg_color,.09); margin-top: 6px; padding-top: 6px; }
+.following-group { margin-top: 6px; }
+.application-heading label { font-size: 11px; font-weight: 600; }
+.session-destination { opacity: 0; color: alpha(@theme_fg_color,.55); }
+.session-title:focus .session-destination { color: @theme_selected_fg_color; }
+.session-title:hover .session-destination,.session-title:focus .session-destination { opacity: 1; }
 .session-header { min-height: 36px; }
 .session-title { background: transparent; border: 0; border-radius: 16px; min-height: 28px; padding: 0 6px; font-size: 13px; font-weight: 600; }
 .session-title:hover,.icon-button:hover,.robot-button:hover,.answer:hover { background: alpha(@theme_fg_color,.06); }

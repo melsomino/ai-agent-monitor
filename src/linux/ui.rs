@@ -35,8 +35,7 @@ pub struct Desktop {
     panel: panel::Panel,
     list: gtk::Box,
     scroll: gtk::ScrolledWindow,
-    pinned: gtk::DrawingArea,
-    groups: RefCell<Vec<(gtk::Box, Option<gtk::gdk_pixbuf::Pixbuf>)>>,
+    groups: RefCell<Vec<gtk::Box>>,
     footer: gtk::Box,
     usage: gtk::Box,
     filter_label: gtk::Label,
@@ -51,7 +50,7 @@ pub struct Desktop {
     settings: RefCell<Option<Rc<settings::Settings>>>,
     notifications: RefCell<notifications::Notifications>,
     attached: Cell<bool>,
-    phase: Rc<Cell<f64>>,
+    robot_epoch: std::time::Instant,
     timer: RefCell<Option<glib::SourceId>>,
     provider: RefCell<gtk::CssProvider>,
     last_frame_height: Cell<i32>,
@@ -148,9 +147,6 @@ impl Desktop {
         style::class(&list, "session-list");
         scroll.add(&list);
         overlay.add(&scroll);
-        let pinned = widgets::mouse_transparent_layer();
-        overlay.add_overlay(&pinned);
-        overlay.set_overlay_pass_through(&pinned, true);
         root.pack_start(&overlay, true, true, 0);
         let empty = widgets::label("No open sessions", "empty", true);
         list.pack_start(&empty, false, false, 0);
@@ -191,7 +187,6 @@ impl Desktop {
             panel,
             list,
             scroll,
-            pinned,
             groups: RefCell::new(Vec::new()),
             footer,
             usage,
@@ -207,18 +202,11 @@ impl Desktop {
             settings: RefCell::new(None),
             notifications: RefCell::new(notifications),
             attached: Cell::new(false),
-            phase: Rc::new(Cell::new(0.0)),
+            robot_epoch: std::time::Instant::now(),
             timer: RefCell::new(None),
             provider: RefCell::new(provider),
             last_frame_height: Cell::new(0),
             closed: Cell::new(false),
-        });
-        let weak = Rc::downgrade(&this);
-        this.pinned.connect_draw(move |_, c| {
-            if let Some(ui) = weak.upgrade() {
-                ui.draw_application_icons(c);
-            }
-            glib::Propagation::Proceed
         });
         let weak = Rc::downgrade(&this);
         this.input.connect_commit(move |_, text| {
@@ -402,13 +390,6 @@ impl Desktop {
             }
         }
         if self.window.is_visible() {
-            self.phase
-                .set((self.phase.get() + 0.08) % std::f64::consts::TAU);
-            for row in self.rows.borrow().values() {
-                if row.session.borrow().activity == Activity::Working {
-                    row.status_slot.queue_draw();
-                }
-            }
             self.resize_to_content();
         }
     }
@@ -517,7 +498,7 @@ impl Desktop {
             }
         }
         if keys != old_order {
-            for (group, _) in self.groups.borrow_mut().drain(..) {
+            for group in self.groups.borrow_mut().drain(..) {
                 for child in group.children() {
                     group.remove(&child);
                 }
@@ -532,8 +513,24 @@ impl Desktop {
                         style::class(&container, "following-group");
                     }
                     self.list.pack_start(&container, false, false, 0);
-                    let icon = widgets::application_pixbuf(s.client);
-                    self.groups.borrow_mut().push((container.clone(), icon));
+                    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                    heading.set_height_request(24);
+                    heading.set_margin_bottom((layout::GROUP_HEADER_HEIGHT - 24.0) as i32);
+                    heading.set_margin_start(7);
+                    heading.set_margin_end(8);
+                    style::class(&heading, "application-heading");
+                    heading.pack_start(&widgets::application_icon(s.client), false, false, 0);
+                    heading.pack_start(
+                        &widgets::label(s.client.label(), "secondary", false),
+                        false,
+                        false,
+                        0,
+                    );
+                    let line = gtk::Separator::new(gtk::Orientation::Horizontal);
+                    line.set_valign(gtk::Align::Center);
+                    heading.pack_start(&line, true, true, 2);
+                    container.pack_start(&heading, false, false, 0);
+                    self.groups.borrow_mut().push(container.clone());
                     group = Some((id, container));
                 }
                 let row = self
@@ -558,7 +555,6 @@ impl Desktop {
             .set_text(model::empty_text(&state, &self.query.borrow()));
         self.list.show_all();
         self.empty.set_visible(sessions.is_empty());
-        self.pinned.show_all();
         self.filter_label
             .set_text(&format!("Filter: {}", self.query.borrow()));
         self.filter_label
@@ -778,36 +774,7 @@ impl Desktop {
             self.window.resize(408, height);
         }
     }
-    fn pin_icons(&self) {
-        self.pinned.queue_draw();
-    }
-    fn draw_application_icons(&self, c: &gtk::cairo::Context) {
-        use gtk::gdk::prelude::GdkContextExt;
-        let top = self.scroll.vadjustment().value();
-        for (group, icon) in self.groups.borrow().iter() {
-            let a = group.allocation();
-            let start = group
-                .children()
-                .first()
-                .and_then(|row| row.translate_coordinates(&self.list, 0, 0))
-                .map_or(a.y(), |(_, y)| y);
-            let y = layout::sticky_y(start as f64, (a.y() + a.height()) as f64, top) - top;
-            if (a.y() + a.height()) as f64 > top
-                && (a.y() as f64) < top + self.scroll.allocated_height() as f64
-            {
-                if let Some(icon) = icon {
-                    let icon_y = (y + 6.0).round();
-                    if let Some(bg) = self.window.style_context().lookup_color("theme_bg_color") {
-                        c.set_source_rgba(bg.red(), bg.green(), bg.blue(), bg.alpha());
-                        c.rectangle(8.0, icon_y, 24.0, 24.0);
-                        let _ = c.fill();
-                    }
-                    c.set_source_pixbuf(icon, 8.0, icon_y);
-                    let _ = c.paint();
-                }
-            }
-        }
-    }
+    fn pin_icons(&self) {}
     fn update_usage(&self, state: &monitor::State) {
         for c in self.usage.children() {
             self.usage.remove(&c);
@@ -871,6 +838,7 @@ struct Row {
     root: gtk::Overlay,
     title: gtk::Button,
     title_label: gtk::Label,
+    destination: gtk::Box,
     robot: gtk::Button,
     chevron: gtk::Button,
     status_slot: gtk::Box,
@@ -901,7 +869,12 @@ impl Row {
         style::class(&title, "session-title");
         let title_label = widgets::label("", "", false);
         title_label.set_ellipsize(pango::EllipsizeMode::End);
-        title.add(&title_label);
+        let title_content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        title_content.pack_start(&title_label, true, true, 0);
+        let destination = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        style::class(&destination, "session-destination");
+        title_content.pack_start(&destination, false, false, 0);
+        title.add(&title_content);
         header.pack_start(&title, false, false, 0);
         let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         header.pack_start(&spacer, true, true, 0);
@@ -936,6 +909,7 @@ impl Row {
             root,
             title,
             title_label,
+            destination,
             robot,
             chevron,
             status_slot,
@@ -1056,14 +1030,24 @@ impl Row {
             if session.activity == Activity::Idle
                 && !state.unseen_finished.contains_key(&session.key())
             {
-                284
+                242
             } else {
-                250
+                208
             },
         );
         self.title_label.set_size_request(width, 22);
         self.title
             .set_tooltip_text(Some(&format!("Switch to {}", session.client.label())));
+        for child in self.destination.children() {
+            self.destination.remove(&child);
+        }
+        let arrow = gtk::Image::from_icon_name(Some("go-next-symbolic"), gtk::IconSize::Menu);
+        arrow.set_pixel_size(14);
+        self.destination.pack_start(&arrow, false, false, 0);
+        let app = widgets::application_icon(session.client);
+        app.set_pixel_size(16);
+        self.destination.pack_start(&app, false, false, 0);
+        self.destination.show_all();
         let expanded = ui.disclosure.borrow().expanded.get(&session.key()) == Some(&true);
         self.revealer.set_transition_duration(
             if gtk::Settings::default().is_none_or(|s| s.is_gtk_enable_animations()) {
@@ -1077,13 +1061,13 @@ impl Row {
         self.robot
             .set_tooltip_text(Some(if expanded { "Collapse" } else { "Show details" }));
         self.robot
-            .set_image(Some(&widgets::robot(session.activity)));
+            .set_image(Some(&widgets::robot(session.activity, ui.robot_epoch)));
         for c in self.status_slot.children() {
             self.status_slot.remove(&c);
         }
         let finished = state.unseen_finished.contains_key(&session.key());
         if finished || session.activity != Activity::Idle {
-            let icon = widgets::status(session.activity, finished, ui.phase.clone());
+            let icon = widgets::status(session.activity, finished);
             if finished {
                 let button = gtk::Button::new();
                 style::class(&button, "icon-button");
@@ -1402,13 +1386,9 @@ mod tests {
             "footer remains opaque inside the rounded surface"
         );
         drop(pixels);
-        assert!(
-            ui.pinned.window().unwrap().is_pass_through(),
-            "application artwork must pass mouse events to the session robot"
-        );
-        // Move the actual X11 pointer over the app artwork, rather than emitting a
-        // synthetic enter signal directly on the button: both overlay windows
-        // must let GTK pick the robot underneath.
+        // Move the actual X11 pointer over the robot rather than emitting a
+        // synthetic enter signal directly on the button. Group artwork no longer
+        // overlays the robot or intercepts its input.
         if std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
             let robot = ui.rows.borrow()["codex:two"].robot.clone();
             let window = ui.window.window().unwrap();

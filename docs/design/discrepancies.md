@@ -70,7 +70,7 @@ H power Pause/Resume local only, native Quit terminates. H Show folder and branc
 <a id="d-13"></a>
 ## D-13 — Reduced motion and accessibility intent
 
-H disables disclosure transitions on prefers-reduced-motion. M guards ambient eyes only; G guards Revealer only, eyes depend animation preference and list spinner always advances while visible. Custom app/robot/drawing semantics incomplete for screen readers. **Decision:** Scope of reduced-motion and semantic focus/expanded-state parity. Real VoiceOver/Orca/highcontrast verification required; no conformance claim. [Foundations](components/foundations.md#visual-motion).
+H disables disclosure transitions and session robot motion on prefers-reduced-motion. M guards ambient eyes and session robot motion; G guards Revealer and session robot motion, while panel eyes depend on animation preference and the working list indicator is now static. Custom app/robot/drawing semantics incomplete for screen readers. **Decision:** Scope of reduced-motion and semantic focus/expanded-state parity. Real VoiceOver/Orca/highcontrast verification required; no conformance claim. [Foundations](components/foundations.md#visual-motion).
 
 <a id="d-14"></a>
 ## D-14 — Integration setup and error observability

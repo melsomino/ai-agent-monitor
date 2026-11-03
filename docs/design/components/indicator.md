@@ -7,7 +7,7 @@ The ambient indicator provides a compact summary without opening the session lis
 
 **IN-01 (S):** Working/finished totals MUST reflect application visibility, and MUST NOT change just because the popup title query changes. H has no application filtering and calculates fixture counts only. **Pending filtering is unresolved:** M uses `State::pending_count()` on all sessions, G filters applications first. See [D-01](../discrepancies.md#d-01).
 
-Sources: [M menu](../../../src/macos/menu.rs) `build_status_item`, `update_badge`, `State::working_count`, `finished_count`; [G panel](../../../src/linux/panel.rs) `Panel::publish`; [Shell](../../../src/linux/gnome-extension/extension.js) `enable`, `_update`, `_animateEyes`; [H](../../../design/previews/monitor-ui-fragment.html) `recount`, `.aam-bar`.
+Sources: [M menu](../../../src/macos/menu.rs) `build_status_item`, `update_badge`, `State::working_count`, `finished_count`; [G panel](../../../src/linux/panel.rs) `Panel::publish`; [Shell](../../../src/linux/gnome-extension/extension.js) `enable`, `_update`, `_animateEyes`; [H](../../../design/previews/monitor-ui.html) `recount`, `.aam-bar`.
 
 <a id="indicator-rendering"></a>
 ## Rendering by frontend

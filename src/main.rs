@@ -7,6 +7,7 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 mod platform;
+mod robot_motion;
 
 use app::{cli, core, tools};
 #[cfg(target_os = "macos")]

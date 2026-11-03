@@ -36,12 +36,13 @@
 | PS-01 |Discovery/live membership |Fixtures |Provider+TTY/window evidence |Provider,without Mac TTY filter |M/P,[shared capabilities](shared.md#shared-capabilities) |
 | PS-02 |Grouping rank |Fixed VSCode,Terminal,Codex |Client rank+ID |Same rank+ID |C/M |
 | PS-03 |Title ordering |Fixture order |Foundation natural |GLib natural lowercase |M/P,locale outcome U |
-| PS-04 |Sticky real app icon |Embedded image,CSS |OS file/bundle icon |Desktop/theme icon,generic others |C/P |
+| PS-04 |Application group identification |Scrolling icon/name/separator header |Same document header |Same GTK group child header |C; 24 icon, 26 reserved header height, no sticky overlay |
 | PS-05 |Robot title/status/chevron |Yes |Yes |Yes |C,[sessions](components/sessions.md) |
-| PS-06 |Title opens /robot toggles |Simulation/toggle |Host open/toggle |Host open/toggle |C/M |
+| PS-ROBOT |Working robot fixed size/eyes alternate |2.4s CSS; fixed14×11; 8 interpolated eye phases |Same shared motion, native drawing |Same shared motion, GTK frame callback |C; system reduced-motion yields normal size/both green; runtime GTK/H not verified |
+| PS-06 |Title opens /robot toggles |Simulation/toggle; hover/focus shows → + app icon |Host open/toggle; same destination hint |Host open/toggle; same destination hint |C/M; H host action simulated |
 | PS-07 |Title hover measured width |Yes |Yes |Natural button |C/P |
 | PS-08 |Icon circular target |26×24robot,25footer |28square normalized |28minimum+theme |D,foundations |
-| PS-09 |Working/request/idle |Static arrows/filled!/none |Spinner/filled!/none |Spinner/filled!/none |C/M |
+| PS-09 |Working/request/idle |Static filled green play/filled!/none |Same, direct triangle drawing |Same, Cairo solid triangle |C/P; Working indicator is informational |
 | PS-10 |Unknown |No fixture branch;defaults request |Muted questionmark |Muted? |M/D |
 | PS-11 |Finished click |Inert disc |Ack generation |Ack generation |M |
 | PS-12 |Finished action ack |Title/robot/chevron/history click |Same plus check;keyboard disclosure |Same plus check |C/M,keyboard H omission |
@@ -94,7 +95,7 @@
 | PK-10 |Focus-on-open/reveal answer |Absent |Yes |Yes |M |
 | PK-11 |Resolve clears key focus |Blur within form |Removed control clears |Removed card clears |C/P |
 | PK-12 |Caret blink |Browser |Tracking-time custom fallback |GTK entry |P |
-| PK-13 |Reduced motion |CSS transitions off |Eyes only |Reveal only (eye pref separate) |D,[D-13](discrepancies.md#d-13) |
+| PK-13 |Reduced motion |CSS transitions and working robot off |Menu-bar eyes and working robot off |Reveal and working robot off (panel eye pref separate) |D,[D-13](discrepancies.md#d-13) |
 
 ## Settings and external channels
 

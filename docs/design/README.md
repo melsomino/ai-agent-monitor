@@ -7,7 +7,7 @@ This is the living, platform-independent product specification, reverse-engineer
 
 Three frontend implementations are compared throughout:
 
-1. **H — HTML:** [interactive prototype](../../design/previews/monitor-ui-fragment.html) and its [standalone host](../../design/previews/monitor-ui.html). Primary reference for visual design and demonstrated interaction intent, including its JavaScript, not just its appearance.
+1. **H — HTML:** [standalone interactive prototype](../../design/previews/monitor-ui.html). Primary reference for visual design and demonstrated interaction intent, including its JavaScript, not just its appearance.
 2. **M — macOS:** Rust/AppKit. Primary reference for established native behavior, with OS-specific constraints kept separate.
 3. **G — GNOME:** Rust/GTK 3 plus the GNOME Shell extension, including Wayland positioning and activation.
 

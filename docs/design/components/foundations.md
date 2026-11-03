@@ -5,7 +5,7 @@
 
 All measurements below are logical units: CSS px in H, AppKit pt in M, GTK logical px in G. They are not physical pixels and do not establish screenshot equality under scaling. H is the primary design reference; implemented deviations are preserved here. Native font metrics, OS materials and themes can change final rendering. Titles have greater weight than messages; metadata/version have lower contrast and smaller type. Request importance is primarily orange iconography, not an orange-filled form.
 
-Sources: [H CSS](../../../design/previews/monitor-ui-fragment.html) `.aam-*`; [shared layout](../../../src/domain/layout.rs); [M menu](../../../src/macos/menu.rs) constants, `render_rows`, `action_button`; [G CSS](../../../src/linux/style.css), [style](../../../src/linux/style.rs), [widgets](../../../src/linux/widgets.rs).
+Sources: [H CSS](../../../design/previews/monitor-ui.html) `.aam-*`; [shared layout](../../../src/domain/layout.rs); [M menu](../../../src/macos/menu.rs) constants, `render_rows`, `action_button`; [G CSS](../../../src/linux/style.css), [style](../../../src/linux/style.rs), [widgets](../../../src/linux/widgets.rs).
 
 <a id="visual-geometry"></a>
 ## Geometry ledger (S)
@@ -16,13 +16,13 @@ Sources: [H CSS](../../../design/previews/monitor-ui-fragment.html) `.aam-*`; [s
 | Outer corners |18, explicit border/shadow | System menu outline/corners/shadow |18 Cairo clipped surface, shadow + 1px outline |
 | Header |36 minimum |36 |36 minimum |
 | List inset |6 left/right/top,10 bottom |top6, bottom8; viewport x4 |6/6/8 CSS |
-| Group boundary |margin6 + padding6 + 1px line |13 gap with separator |margin6 + padding6 + 1px line |
-| App icon |24, sticky anchor width20 |24, x8 |24, drawn x8 |
+| Group boundary |26 heading reserve, 6 gap before later groups |Same |Same |
+| App heading |24 icon, secondary11/600 name, centered trailing separator; scrolls |24 icon x8, secondary11 semibold name, centered separator; scrolls |24 icon in heading box, secondary11/600 name and centered separator; scrolls |
 | Robot art |14×11, top1 |14×11, custom optical offset |14×11 custom Cairo |
 | Robot hit target |26×24, radius12 |Normalized28×28, radius14 |28×28 minimum,50% radius |
 | Chevron hit target |28, margin0 3 |28×28 normalized |28×28 minimum |
 | Title start |Derived from flex gutter; inset14 and markers |x40 in document |Robot28 + title padding6 (within list inset) |
-| Title highlight |Measured right edge +12; left29 |x32, measured title +12; height36 radius16 |Natural title button with6 horizontal padding,radius16 |
+| Title highlight |Measured button right +12; left29 |x32, measured title +42 reserved destination +12; height36 radius16 |Natural title button with6 horizontal padding,radius16;42 reserved destination |
 | Expanded detail |padding2 top,12 bottom, left37 at default inset |width326,x40, top gap4 |Messages326 after34 gutter; card/meta start34,end12; top4,bottom8 |
 | Request card |padding11,radius12,border1 |width326,padding11,radius12,border1 |padding11,radius12,border1 |
 | Command |padding8 vertical/10 horizontal,radius8 |same padding/radius |same padding/radius |
@@ -83,9 +83,10 @@ Filled request/finished discs use dark request ink in H/M; G draws white foregro
 | Motion | H | M | G |
 |---|---|---|---|
 | Disclosure & chevron |180ms ease, CSS grid0fr→1fr,rotate90° |240ms cubic ease-out, interrupted motion continues from sampled position |GTK Revealer240ms; chevron follows actual revealed fraction |
-| Working status |Static refresh icon; no spinner animation code |rotation240°/s about center |phase+.08rad per16ms visible tick |
+| Working status |Static green15px disc /18px viewport, solid6.72×8.32 play, centroid centered |Static green15pt disc /18pt viewport, same direct triangle geometry |Static green15px disc /18px viewport, same direct triangle geometry |
+| Session robot |Fixed14×11 body; eight interpolated eye phases over2.4s |Same shared eye sampler and native draw |Same shared eye sampler and GTK draw |
 | Indicator eyes |Static raster-mask logo, no eye sequence |8steps,150ms tick |same8levels,140ms tick |
-| Reduced motion |CSS transition:none |eye animation disabled via accessibility setting; disclosure/spinner lack equivalent guard |Revealer follows GTK animations; panel eye loop/list spinner lack system-reduction guard |
+| Reduced motion |Disclosure transitions and eye animation disabled |Menu-bar eyes and session robot disabled; disclosure lacks equivalent guard |Revealer and session robot follow GTK animations; panel eye loop lacks system-reduction guard |
 | Theme |Light/Dark preview switch, initial media preference |Dynamic Aqua/Dark Aqua providers + native appearance |Theme name/prefer-dark notification reloads CSS and refreshes markup |
 
 Acceptance: inspect both themes with long title, multi-line answer, nested command and last-row hover. Compare artwork size separately from target size. Test reduced-motion per row above; do not report parity if only the menu-eye preference was disabled.

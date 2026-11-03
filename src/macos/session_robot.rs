@@ -6,10 +6,12 @@ use objc2_app_kit::{
     NSWindingRule,
 };
 use objc2_foundation::{NSAffineTransform, NSObjectProtocol, NSPoint, NSRect, NSSize};
+use std::cell::Cell;
 
 #[derive(Debug)]
 pub(super) struct State {
     activity: Activity,
+    motion: Cell<crate::robot_motion::Frame>,
 }
 
 define_class!(
@@ -27,9 +29,9 @@ define_class!(
         #[unsafe(method(drawRect:))]
         fn draw_robot(&self, _dirty: NSRect) {
             NSGraphicsContext::saveGraphicsState_class();
-            let scale = self.bounds().size.width / 22.0;
+            let scale = 14.0 / 22.0;
             let transform = NSAffineTransform::transform();
-            transform.translateXBy_yBy(0.8 * scale, (self.bounds().size.height - 16.0 * scale) / 2.0);
+            transform.translateXBy_yBy(self.bounds().size.width / 2.0 - 10.2 * scale, (self.bounds().size.height - 16.0 * scale) / 2.0);
             transform.scaleBy(scale);
             transform.concat();
             let neutral = NSColor::secondaryLabelColor();
@@ -45,8 +47,9 @@ define_class!(
                 Activity::Confirmation => NSColor::systemOrangeColor(),
                 _ => neutral.colorWithAlphaComponent(0.6),
             };
-            eyes.setFill();
-            for x in [7.45, 12.55] {
+            for (index, x) in [7.45, 12.55].into_iter().enumerate() {
+                let level = if self.ivars().activity == Activity::Working { self.ivars().motion.get().eyes[index] } else { 1.0 };
+                eyes.colorWithAlphaComponent(eyes.alphaComponent() * level).setFill();
                 NSBezierPath::bezierPathWithOvalInRect(frame(x - 1.8, 6.2, 3.6, 3.6)).fill();
             }
             NSGraphicsContext::restoreGraphicsState_class();
@@ -55,8 +58,17 @@ define_class!(
 );
 
 impl SessionRobot {
+    pub(super) fn advance(&self, seconds: f64, animate: bool) {
+        if self.ivars().activity == Activity::Working {
+            self.ivars()
+                .motion
+                .set(crate::robot_motion::sample(seconds, animate));
+            self.setNeedsDisplay(true);
+        }
+    }
+
     pub(super) fn bottom_contour_in(&self, parent: &NSView) -> NSPoint {
-        let scale = self.bounds().size.width / 22.0;
+        let scale = 14.0 / 22.0;
         let bottom = (self.bounds().size.height - 16.0 * scale) / 2.0 + 0.4 * scale;
         parent.convertPoint_fromView(
             NSPoint::new(self.bounds().size.width / 2.0, bottom),
@@ -65,7 +77,10 @@ impl SessionRobot {
     }
 
     pub(super) fn new(mtm: MainThreadMarker, frame: NSRect, activity: Activity) -> Retained<Self> {
-        let allocated = Self::alloc(mtm).set_ivars(State { activity });
+        let allocated = Self::alloc(mtm).set_ivars(State {
+            activity,
+            motion: Cell::new(crate::robot_motion::sample(0.0, false)),
+        });
         // SAFETY: NSView's designated initializer with initialized subclass state.
         unsafe { msg_send![super(allocated), initWithFrame: frame] }
     }

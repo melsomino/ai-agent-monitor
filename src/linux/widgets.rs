@@ -137,27 +137,6 @@ pub fn application_icon(client: crate::domain::session::Client) -> gtk::Image {
     image.set_tooltip_text(Some(client.label()));
     image
 }
-pub fn application_pixbuf(
-    client: crate::domain::session::Client,
-) -> Option<gtk::gdk_pixbuf::Pixbuf> {
-    let image = application_icon(client);
-    let theme = gtk::IconTheme::default()?;
-    if image.storage_type() == gtk::ImageType::Gicon {
-        theme
-            .lookup_by_gicon(&image.gicon().0, 24, gtk::IconLookupFlags::FORCE_SIZE)?
-            .load_icon()
-            .ok()
-    } else {
-        theme
-            .load_icon(
-                image.icon_name()?.as_str(),
-                24,
-                gtk::IconLookupFlags::FORCE_SIZE,
-            )
-            .ok()
-            .flatten()
-    }
-}
 pub(super) fn rounded(c: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     use std::f64::consts::{FRAC_PI_2, PI};
     c.new_sub_path();
@@ -167,7 +146,7 @@ pub(super) fn rounded(c: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64
     c.arc(x + r, y + r, r, PI, PI + FRAC_PI_2);
     c.close_path();
 }
-pub fn robot(activity: Activity) -> gtk::DrawingArea {
+pub fn robot(activity: Activity, started: std::time::Instant) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_has_window(false);
     area.set_size_request(14, 11);
@@ -176,11 +155,14 @@ pub fn robot(activity: Activity) -> gtk::DrawingArea {
     area.connect_draw(move |w, c| {
         let fg = w.style_context().color(gtk::StateFlags::NORMAL);
         let _ = c.save();
-        c.scale(
-            w.allocated_width() as f64 / 22.0,
-            w.allocated_height() as f64 / 16.0,
+        let animate = gtk::Settings::default().is_none_or(|s| s.is_gtk_enable_animations());
+        let motion = crate::robot_motion::sample(started.elapsed().as_secs_f64(), animate);
+        let scale = 14.0 / 22.0;
+        c.translate(
+            w.allocated_width() as f64 / 2.0 - 10.2 * scale,
+            (w.allocated_height() as f64 - 16.0 * scale) / 2.0,
         );
-        c.translate(0.8, 0.0);
+        c.scale(scale, scale);
         c.set_source_rgba(fg.red(), fg.green(), fg.blue(), 0.6);
         c.set_fill_rule(cairo::FillRule::EvenOdd);
         rounded(c, 1.4, 0.4, 17.2, 15.2, 4.8);
@@ -189,27 +171,39 @@ pub fn robot(activity: Activity) -> gtk::DrawingArea {
         rounded(c, 0.0, 4.9, 3.2, 6.2, 1.3);
         rounded(c, 17.2, 4.9, 3.2, 6.2, 1.3);
         let _ = c.fill();
-        match activity {
-            Activity::Working => {
-                if style::dark(w) {
-                    c.set_source_rgb(0.188, 0.82, 0.345)
-                } else {
-                    c.set_source_rgb(0.0, 0.463, 0.216)
+        for (index, x) in [7.45, 12.55].into_iter().enumerate() {
+            match activity {
+                Activity::Working => {
+                    let (r, g, b) = if style::dark(w) {
+                        (0.188, 0.82, 0.345)
+                    } else {
+                        (0.0, 0.463, 0.216)
+                    };
+                    c.set_source_rgba(r, g, b, motion.eyes[index]);
                 }
+                Activity::Confirmation => c.set_source_rgb(1.0, 0.584, 0.0),
+                _ => c.set_source_rgba(fg.red(), fg.green(), fg.blue(), 0.6),
             }
-            Activity::Confirmation => c.set_source_rgb(1.0, 0.584, 0.0),
-            _ => c.set_source_rgba(fg.red(), fg.green(), fg.blue(), 0.6),
-        };
-        for x in [7.45, 12.55] {
             c.arc(x, 8.0, 1.8, 0.0, std::f64::consts::TAU);
             let _ = c.fill();
         }
         let _ = c.restore();
         glib::Propagation::Proceed
     });
+    if activity == Activity::Working {
+        let last_animated = Cell::new(true);
+        area.add_tick_callback(move |w, _| {
+            let animate = gtk::Settings::default().is_none_or(|s| s.is_gtk_enable_animations());
+            let changed = last_animated.replace(animate) != animate;
+            if animate || changed {
+                w.queue_draw();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
     area
 }
-pub fn status(activity: Activity, finished: bool, phase: Rc<Cell<f64>>) -> gtk::DrawingArea {
+pub fn status(activity: Activity, finished: bool) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_has_window(false);
     area.set_size_request(18, 18);
@@ -221,7 +215,7 @@ pub fn status(activity: Activity, finished: bool, phase: Rc<Cell<f64>>) -> gtk::
         activity.label()
     }));
     area.connect_draw(move |w, c| {
-        use std::f64::consts::{PI, TAU};
+        use std::f64::consts::TAU;
         let _ = c.save();
         c.translate(9.0, 9.0);
         if finished || activity == Activity::Confirmation {
@@ -257,18 +251,18 @@ pub fn status(activity: Activity, finished: bool, phase: Rc<Cell<f64>>) -> gtk::
             } else {
                 c.set_source_rgb(0.0, 0.463, 0.216)
             };
-            c.rotate(phase.get());
-            c.set_line_width(1.3);
-            for a in [0.0, PI] {
-                c.arc(0.0, 0.0, 5.4, a, a + 2.25);
-                let _ = c.stroke();
-                let end = a + 2.25;
-                c.move_to(5.4 * end.cos(), 5.4 * end.sin());
-                c.rel_line_to(-2.0, -0.3);
-                c.rel_line_to(1.5, 2.0);
-                c.close_path();
-                let _ = c.fill();
+            c.arc(0.0, 0.0, 7.5, 0.0, TAU);
+            let _ = c.fill();
+            if style::dark(w) {
+                c.set_source_rgb(16.0 / 255.0, 53.0 / 255.0, 30.0 / 255.0);
+            } else {
+                c.set_source_rgb(1.0, 1.0, 1.0);
             }
+            c.move_to(-2.24, -4.16);
+            c.line_to(4.48, 0.0);
+            c.line_to(-2.24, 4.16);
+            c.close_path();
+            let _ = c.fill();
         } else if activity == Activity::Unknown {
             let fg = w.style_context().color(gtk::StateFlags::NORMAL);
             c.set_source_rgba(fg.red(), fg.green(), fg.blue(), 0.45);

@@ -36,8 +36,6 @@ const SESSION_TEXT_LEFT: f64 = session_layout::TEXT_LEFT;
 const DETAIL_WIDTH: f64 = session_layout::DETAIL_WIDTH;
 const LIST_BOTTOM_PADDING: f64 = 8.0;
 const SESSION_HOVER_PADDING: f64 = 0.0;
-const SESSION_HOVER_LEFT: f64 = 6.0;
-const SESSION_HOVER_WIDTH: f64 = 374.0;
 const SESSION_HEADER_HOVER_LEFT: f64 = SESSION_TEXT_LEFT - 8.0;
 const SESSION_HEADER_HOVER_WIDTH: f64 = 384.0 - 2.0 * SESSION_HEADER_HOVER_LEFT;
 const MESSAGE_TOP_GAP: f64 = 4.0;
@@ -442,7 +440,7 @@ define_class!(
             self.start_keyboard_tracking();
             self.receive_sessions();
             self.advance_disclosure();
-            self.advance_working_icons();
+            self.advance_robot_eyes();
             self.sample_pointer();
             let panels: Vec<_> = self.ivars().question_panels.borrow().values().cloned().collect();
             let now = Instant::now();
@@ -747,34 +745,30 @@ define_class!(
     }
 );
 
-#[derive(Debug)]
-struct WorkingIconState {
-    angle: Cell<f64>,
-}
-
 define_class!(
-    // SAFETY: NSImageView supports subclassing; angle and drawing stay on the main thread.
-    #[unsafe(super(NSImageView))]
+    // SAFETY: Decoration-only NSView, drawn exclusively on the main thread.
+    #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
-    #[ivars = WorkingIconState]
     #[derive(Debug)]
-    struct WorkingIconView;
-    unsafe impl NSObjectProtocol for WorkingIconView {}
-    impl WorkingIconView {
+    struct WorkingStatusView;
+    unsafe impl NSObjectProtocol for WorkingStatusView {}
+    impl WorkingStatusView {
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> { None }
+
         #[unsafe(method(drawRect:))]
-        fn draw_rotated(&self, dirty: NSRect) {
-            let bounds = self.bounds();
-            let x = bounds.origin.x + bounds.size.width / 2.0;
-            let y = bounds.origin.y + bounds.size.height / 2.0;
-            NSGraphicsContext::saveGraphicsState_class();
-            let transform = NSAffineTransform::transform();
-            transform.translateXBy_yBy(x, y);
-            transform.rotateByDegrees(self.ivars().angle.get());
-            transform.translateXBy_yBy(-x, -y);
-            transform.concat();
-            // SAFETY: Invoke NSImageView's drawing within the saved graphics state.
-            unsafe { let _: () = msg_send![super(self), drawRect: dirty]; }
-            NSGraphicsContext::restoreGraphicsState_class();
+        fn draw_status(&self, _dirty: NSRect) {
+            let center = NSPoint::new(self.bounds().size.width / 2.0, self.bounds().size.height / 2.0);
+            working_status_color().setFill();
+            NSBezierPath::bezierPathWithOvalInRect(rect(center.x - 7.5, center.y - 7.5, 15.0, 15.0)).fill();
+            appearance_color([255.0; 3], [16.0, 53.0, 30.0], 1.0).setFill();
+            // Center the triangle's visual mass, without SF Symbol alignment insets.
+            let triangle = NSBezierPath::bezierPath();
+            triangle.moveToPoint(NSPoint::new(center.x - 2.24, center.y - 4.16));
+            triangle.lineToPoint(NSPoint::new(center.x + 4.48, center.y));
+            triangle.lineToPoint(NSPoint::new(center.x - 2.24, center.y + 4.16));
+            triangle.closePath();
+            triangle.fill();
         }
     }
 );
@@ -818,7 +812,7 @@ fn owner(view: &NSView) -> Option<Retained<MenuController>> {
 }
 fn pointer_changed(view: &NSView) {
     if let Some(controller) = owner(view) {
-        controller.update_sticky_icons();
+        controller.update_group_headings();
         controller.update_hover();
     }
 }
@@ -934,6 +928,8 @@ struct HoverState {
     title: OnceCell<Retained<NSTextField>>,
     arrow: OnceCell<Retained<NSImageView>>,
     thread: OnceCell<Retained<SessionThread>>,
+    destination: OnceCell<Retained<StatusContentView>>,
+    destination_arrow: OnceCell<Retained<NSImageView>>,
 }
 define_class!(
     // SAFETY: This NSView only stores its hover decoration on the main thread.
@@ -983,6 +979,17 @@ impl SessionRowView {
             };
             background.setFillColor(&color);
             paint_hover(background, if active || focused { 1.0 } else { 0.0 });
+        }
+        if let Some(destination) = self.ivars().destination.get() {
+            destination.setHidden(!active && !focused);
+        }
+        if let Some(arrow) = self.ivars().destination_arrow.get() {
+            let color = if focused {
+                NSColor::selectedMenuItemTextColor()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            arrow.setContentTintColor(Some(&color));
         }
         self.paint_title(focused);
         if let Some(arrow) = self.ivars().arrow.get() {
@@ -1094,13 +1101,12 @@ struct LayoutRow {
     detail_height: f64,
     detail: Option<Retained<RevealClipView>>,
     arrow: Option<Retained<NSImageView>>,
-    working_icon: Option<Retained<WorkingIconView>>,
+    robot: Retained<SessionRobot>,
 }
 
 struct GroupIcon {
     view: Retained<StatusContentView>,
     first: usize,
-    last: usize,
 }
 
 /// Use one row only when the entire set fits; otherwise keep natural widths
@@ -2790,15 +2796,6 @@ impl MenuController {
         label
     }
 
-    fn separator(&self, view: &NSView, y: f64, width: f64) {
-        let line = NSBox::initWithFrame(
-            NSBox::alloc(self.mtm()),
-            rect(SESSION_HOVER_LEFT, y, width, 1.0),
-        );
-        line.setBoxType(NSBoxType::Separator);
-        view.addSubview(&line);
-    }
-
     fn build_menu(&self) {
         let mtm = self.mtm();
         // NSMenu supplies the system background and owns presentation/dismissal.
@@ -2992,6 +2989,33 @@ impl MenuController {
         button
     }
 
+    fn client_group_heading(&self, client: Client) -> Retained<StatusContentView> {
+        let view: Retained<StatusContentView> = unsafe {
+            msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 384.0, 24.0)]
+        };
+        let icon = self.client_icon(client);
+        icon.setFrame(rect(session_layout::ICON_LEFT, 0.0, 24.0, 24.0));
+        view.addSubview(&icon);
+        let name = self.label(
+            &view,
+            client.label(),
+            rect(session_layout::ICON_LEFT + 32.0, 4.0, 280.0, 16.0),
+            11.0,
+            0.3,
+            true,
+        );
+        name.sizeToFit();
+        center_label(&name, 12.0);
+        let left = name.frame().origin.x + name.frame().size.width + 10.0;
+        let line = NSBox::initWithFrame(
+            NSBox::alloc(self.mtm()),
+            rect(left, 12.0, (376.0 - left).max(0.0), 1.0),
+        );
+        line.setBoxType(NSBoxType::Separator);
+        view.addSubview(&line);
+        view
+    }
+
     fn client_icon(&self, client: Client) -> Retained<StatusContentView> {
         // Keep the decoration click-through while using the app's own full-color icon.
         // SAFETY: This decoration-only NSView subclass has no ivars.
@@ -3038,13 +3062,15 @@ impl MenuController {
         view
     }
 
-    fn status_icon(
-        &self,
-        view: &NSView,
-        activity: Activity,
-        finished: bool,
-        y: f64,
-    ) -> Option<Retained<WorkingIconView>> {
+    fn status_icon(&self, view: &NSView, activity: Activity, finished: bool, y: f64) {
+        if activity == Activity::Working {
+            let disc: Retained<WorkingStatusView> = unsafe {
+                msg_send![WorkingStatusView::alloc(self.mtm()), initWithFrame: rect(323.0, y - 1.0, 18.0, 18.0)]
+            };
+            disc.setToolTip(Some(ns_string!("Working")));
+            view.addSubview(&disc);
+            return;
+        }
         if activity == Activity::Confirmation || (finished && activity == Activity::Idle) {
             let is_finished = activity == Activity::Idle;
             let color = if is_finished {
@@ -3098,11 +3124,10 @@ impl MenuController {
                 ns_string!("Needs response")
             }));
             view.addSubview(&disc);
-            return None;
+            return;
         }
         let (symbol, color) = match activity {
-            Activity::Working => ("arrow.triangle.2.circlepath", working_status_color()),
-            Activity::Idle | Activity::Confirmation => return None,
+            Activity::Idle | Activity::Confirmation | Activity::Working => return,
             Activity::Unknown => ("questionmark.circle", NSColor::tertiaryLabelColor()),
         };
         if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
@@ -3111,46 +3136,25 @@ impl MenuController {
         ) {
             image.setTemplate(true);
             let frame = rect(325.0, y + 1.0, 14.0, 14.0);
-            if activity == Activity::Working {
-                let allocated = WorkingIconView::alloc(self.mtm()).set_ivars(WorkingIconState {
-                    angle: Cell::new(0.0),
-                });
-                // SAFETY: NSImageView's initializer is valid after initializing our angle ivar.
-                let icon: Retained<WorkingIconView> =
-                    unsafe { msg_send![super(allocated), initWithFrame: frame] };
-                icon.setImage(Some(&image));
-                icon.setContentTintColor(Some(&color));
-                icon.setToolTip(Some(&NSString::from_str(activity.label())));
-                view.addSubview(&icon);
-                return Some(icon);
-            }
             let icon = NSImageView::imageViewWithImage(&image, self.mtm());
             icon.setFrame(frame);
             icon.setContentTintColor(Some(&color));
             icon.setToolTip(Some(&NSString::from_str(activity.label())));
             view.addSubview(&icon);
         }
-        None
     }
 
-    fn advance_working_icons(&self) {
+    fn advance_robot_eyes(&self) {
         let state = self.ivars();
-        let angle = self.working_angle();
-        for item in state.layout.borrow().iter() {
-            if let Some(icon) = &item.working_icon {
-                icon.ivars().angle.set(angle);
-                NSView::setNeedsDisplay(icon, true);
-            }
-        }
-    }
-
-    fn working_angle(&self) -> f64 {
-        let elapsed = self
-            .ivars()
+        let seconds = state
             .working_epoch
             .get_or_init(Instant::now)
-            .elapsed();
-        -(elapsed.as_secs_f64() * 240.0).rem_euclid(360.0)
+            .elapsed()
+            .as_secs_f64();
+        let animate = !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        for item in state.layout.borrow().iter() {
+            item.robot.advance(seconds, animate);
+        }
     }
 
     fn close_panel(&self) {
@@ -3938,30 +3942,21 @@ impl MenuController {
             origin.x,
             origin.y.min((y - viewport).max(0.0)),
         ));
-        self.update_sticky_icons();
+        self.update_group_headings();
         self.update_hover();
     }
 
-    fn update_sticky_icons(&self) {
+    fn update_group_headings(&self) {
         let state = self.ivars();
-        let Some(list) = state.list.get() else {
-            return;
-        };
-        let viewport_top = list.visibleRect().origin.y.max(0.0);
         let layout = state.layout.borrow();
         for icon in state.group_icons.borrow().iter() {
-            let (Some(first), Some(last)) = (layout.get(icon.first), layout.get(icon.last)) else {
-                continue;
-            };
-            let start = first.view.frame().origin.y;
-            let last_frame = last.view.frame();
-            let y = session_layout::sticky_y(
-                start,
-                last_frame.origin.y + last_frame.size.height,
-                viewport_top,
-            ) + (SESSION_HEADER_HEIGHT - session_layout::ICON_SIZE) / 2.0;
-            icon.view
-                .setFrameOrigin(NSPoint::new(session_layout::ICON_LEFT, y));
+            if let Some(first) = layout.get(icon.first) {
+                // Group labels belong to the document, not the viewport.
+                icon.view.setFrameOrigin(NSPoint::new(
+                    0.0,
+                    first.view.frame().origin.y - session_layout::GROUP_HEADER_HEIGHT,
+                ));
+            }
         }
     }
 
@@ -4237,16 +4232,20 @@ impl MenuController {
         let mut icons: Vec<GroupIcon> = Vec::new();
         for session in ordered {
             let new_group = group != Some(session.client);
-            let session_gap = if new_group && group.is_some() {
-                session_layout::GROUP_GAP
+            let session_gap = if new_group {
+                session_layout::GROUP_HEADER_HEIGHT
+                    + if group.is_some() {
+                        session_layout::GROUP_GAP
+                    } else {
+                        0.0
+                    }
             } else {
                 0.0
             };
             if new_group {
                 icons.push(GroupIcon {
-                    view: self.client_icon(session.client),
+                    view: self.client_group_heading(session.client),
                     first: layout.len(),
-                    last: layout.len(),
                 });
                 group = Some(session.client);
             }
@@ -4522,11 +4521,6 @@ impl MenuController {
                 .unwrap_or(0.0);
             let height = SESSION_HEADER_HEIGHT + detail_height;
             let row = SessionRowView::create(self.mtm(), rect(0.0, y, 384.0, height));
-            if session_gap > 0.0 {
-                // Draw in the existing gap. Pinning to the row's top below keeps
-                // the divider aligned while either session expands or collapses.
-                self.separator(&row, height + session_gap / 2.0 - 0.5, SESSION_HOVER_WIDTH);
-            }
             // Reserve the status and disclosure controls independently of the
             // title's shared hover, keyboard highlight and click target.
             let finished = self
@@ -4539,7 +4533,7 @@ impl MenuController {
             } else {
                 316.0
             };
-            let text_width = title_right - SESSION_TEXT_LEFT - 12.0;
+            let text_width = title_right - SESSION_TEXT_LEFT - 12.0 - 42.0;
             let robot_button = self.action_button(
                 &row,
                 "",
@@ -4560,7 +4554,12 @@ impl MenuController {
             }));
             let robot = SessionRobot::new(
                 self.mtm(),
-                rect(7.0, (28.0 - 11.0) / 2.0 - 1.0, 14.0, 11.0),
+                rect(
+                    (robot_button.bounds().size.width - 14.0) / 2.0,
+                    (robot_button.bounds().size.height - 11.0) / 2.0,
+                    14.0,
+                    11.0,
+                ),
                 session.activity,
             );
             robot_button.addSubview(&robot);
@@ -4582,7 +4581,7 @@ impl MenuController {
                 .cell()
                 .map(|cell| cell.cellSize().width.ceil())
                 .unwrap_or(text_width);
-            let highlight_width = SESSION_TEXT_LEFT + natural_width.min(text_width) + 12.0
+            let highlight_width = SESSION_TEXT_LEFT + natural_width.min(text_width) + 42.0 + 12.0
                 - SESSION_HEADER_HOVER_LEFT;
             if let Some(background) = row.ivars().background.get() {
                 background.setFrameSize(NSSize::new(highlight_width, SESSION_HEADER_HEIGHT));
@@ -4615,7 +4614,7 @@ impl MenuController {
                 );
                 button.setToolTip(Some(ns_string!("Mark as seen")));
             }
-            let working_icon = self.status_icon(
+            self.status_icon(
                 &row,
                 session.activity,
                 finished,
@@ -4634,6 +4633,37 @@ impl MenuController {
                 ),
                 true,
             );
+            let destination: Retained<StatusContentView> = unsafe {
+                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(SESSION_TEXT_LEFT + natural_width.min(text_width) + 8.0, height - SESSION_HEADER_HEIGHT / 2.0 - 8.0, 34.0, 16.0)]
+            };
+            if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                ns_string!("arrow.right"),
+                None,
+            ) {
+                let arrow = NSImageView::imageViewWithImage(&image, self.mtm());
+                arrow.setFrame(rect(0.0, 1.0, 14.0, 14.0));
+                arrow.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+                destination.addSubview(&arrow);
+                row.ivars()
+                    .destination_arrow
+                    .set(arrow)
+                    .expect("destination arrow initialized once");
+            }
+            let app_icon = self.client_icon(session.client);
+            app_icon.setFrame(rect(18.0, 0.0, 16.0, 16.0));
+            let children = app_icon.subviews();
+            for index in 0..children.count() {
+                children
+                    .objectAtIndex(index)
+                    .setFrame(rect(0.0, 0.0, 16.0, 16.0));
+            }
+            destination.addSubview(&app_icon);
+            destination.setHidden(true);
+            row.addSubview(&destination);
+            row.ivars()
+                .destination
+                .set(destination)
+                .expect("destination initialized once");
             open.setToolTip(Some(&NSString::from_str(&format!(
                 "Switch to {}",
                 session.client.label()
@@ -4975,11 +5005,8 @@ impl MenuController {
                 detail_height,
                 detail: detail_clip,
                 arrow: arrow_icon,
-                working_icon,
+                robot,
             });
-            if let Some(icon) = icons.last_mut() {
-                icon.last = layout.len() - 1;
-            }
             y += height;
         }
         for icon in &icons {
@@ -5016,7 +5043,7 @@ impl MenuController {
             .question_panels
             .borrow_mut()
             .retain(|key, _| active.contains(key));
-        self.advance_working_icons();
+        self.advance_robot_eyes();
     }
 
     fn sync_header_extension(&self) {

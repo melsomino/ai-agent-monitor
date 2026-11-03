@@ -9,7 +9,7 @@ An active request is a neutral solid card in the expanded message column, with a
 
 M chooses an inline `Panel` for nonempty questions **and empty actions**. Otherwise it builds action controls, direct single-question choices, optional Answer… fallback and Open in editor. G renders actions and questions together, potentially including both. H has separate hardcoded approval/multiple-question fixtures. Mixed actions+questions are therefore not a shared visual contract.
 
-Sources: [M menu](../../../src/macos/menu.rs) `request_controls`, `render_rows`, `request_context`; [inline questions](../../../src/macos/inline_questions.rs) `Panel::create`, `sync`, `submit`; [G requests](../../../src/linux/requests.rs) `Card::new`, `command_block`; [H](../../../design/previews/monitor-ui-fragment.html) `questionForm`, `sessionMarkup`, `finish`.
+Sources: [M menu](../../../src/macos/menu.rs) `request_controls`, `render_rows`, `request_context`; [inline questions](../../../src/macos/inline_questions.rs) `Panel::create`, `sync`, `submit`; [G requests](../../../src/linux/requests.rs) `Card::new`, `command_block`; [H](../../../design/previews/monitor-ui.html) `questionForm`, `sessionMarkup`, `finish`.
 
 <a id="request-approval"></a>
 ## Permission actions and command scope
