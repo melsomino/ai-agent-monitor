@@ -1,3 +1,5 @@
 build/
 target/
 .build-number.lock
+
+.DS_Store

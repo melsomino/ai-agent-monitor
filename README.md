@@ -20,7 +20,9 @@ The monitor connects to agents you already have running. It doesn't launch or ma
 
 https://github.com/user-attachments/assets/f491aea5-8d64-4dc3-ad42-f22e84ae4da0
 
-<!-- TODO: Add macOS and Ubuntu screenshots when ready. -->
+### Multiple Codex sessions
+
+![AI Agent Monitor showing four working Codex sessions over VS Code](docs/images/sessions.png)
 
 ## Platforms
 
@@ -46,6 +48,14 @@ The GNOME Shell extension provides the panel icon, global shortcut, and Wayland 
 - **Telegram.** Browse sessions, read messages, answer requests, and send messages to supported live sessions from your phone.
 - **Project navigation.** Return to the relevant VS Code workspace. On macOS, Terminal and iTerm also support matching-tab selection.
 - **Local operation.** Session discovery and monitoring run locally on the machine hosting your agents. No monitor account or hosted monitor service is required.
+
+### Questions and custom answers
+
+![Agent questions with preset choices, custom answer fields, and a shared Send answer button](docs/images/questions.png)
+
+### Approval requests
+
+![Permission request with command details, Allow once, Allow similar commands, and Deny](docs/images/approvals.png)
 
 ## Supported agents
 
@@ -89,7 +99,7 @@ On first launch, it detects supported agents and sets up the required integratio
 
 You can check or repeat setup under **Settings → Integrations**.
 
-The release DMG is signed with Developer ID and notarized by Apple.
+Release preparation includes Developer ID signing and Apple notarization. Check the selected release notes for the signing and notarization status of that download.
 
 Prebuilt releases require macOS 13 or later and Apple Silicon. Intel builds are possible from source.
 
@@ -98,6 +108,8 @@ Prebuilt releases require macOS 13 or later and Apple Silicon. Intel builds are 
 [Build and install from source](#build-from-source-ubuntu), including the companion GNOME Shell extension. There is no prebuilt Ubuntu package yet.
 
 Codex connects automatically. For Claude Code or Cline, open **Settings → Integrations → Check & set up** to install the required hooks.
+
+![AI Agent Monitor on Ubuntu GNOME showing Codex sessions over VS Code](docs/images/ubuntu.png)
 
 ## Using the monitor
 
@@ -109,13 +121,19 @@ Completion indicators clear when you interact with that session. See the [comple
 
 Select a session to see its latest messages, working directory, Git branch, and any pending requests. Earlier messages can be loaded from the session history.
 
-When an agent requests permission or asks a question, the available responses appear in the session panel. Supported actions are also available in desktop notifications; more complex requests can be answered in the monitor.
+When an agent requests permission or asks a question, the available responses appear in the session panel.
 
 Responses are checked against the current request before being sent. Requests already resolved in the agent's own interface are removed from the monitor.
 
 Click a session title to open its project or return to its application. On macOS, Terminal and iTerm can select the corresponding tab when it can be identified. Terminal-tab selection is not implemented on Ubuntu.
 
 You can configure a global keyboard shortcut under **Settings → General**.
+
+### macOS notification actions
+
+Supported actions are also available in desktop notifications; more complex requests can be answered in the monitor.
+
+![Native macOS notification with its Allow once, Allow similar commands, and Deny menu open](docs/images/notifications.png)
 
 ## Telegram
 
@@ -130,6 +148,10 @@ You can:
 - View the current working directory and Git branch.
 
 The selected session stays available between messages. Session views update automatically as the agent's state changes.
+
+### Telegram sessions and replies
+
+![Telegram bot showing the session list and an approval request with response buttons](docs/images/telegram.png)
 
 ### Why a personal bot?
 
