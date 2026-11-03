@@ -16,7 +16,13 @@ It shows which agents are working, which are waiting for input, and what they're
 
 The monitor connects to agents you already have running. It doesn't launch or manage them.
 
-<!-- TODO: Add the demo video preview here, followed by macOS and Ubuntu screenshots when ready. -->
+## Demo
+
+https://github.com/user-attachments/assets/f491aea5-8d64-4dc3-ad42-f22e84ae4da0
+
+<!-- TODO: Add macOS and Ubuntu screenshots when ready. -->
+
+## Platforms
 
 Codex is fully supported. Claude Code and Cline support is experimental.
 
