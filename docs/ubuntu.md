@@ -4,10 +4,18 @@ The Ubuntu interface is implemented in Rust with GTK 3. It runs in the same exec
 
 A small JavaScript GNOME Shell extension owns the top-panel button, symbolic robot artwork, working-eye animation, global shortcut, compositor placement, and existing editor-window activation. GNOME Shell extensions require JavaScript; session rendering and application behavior remain in Rust.
 
+## GNOME compatibility
+
+Ubuntu support is experimental. The companion extension declares compatibility with **GNOME Shell 45, 46, 47, 48, 49, and 50** in [`metadata.json`](../src/linux/gnome-extension/metadata.json). This is the declared compatibility range, not confirmation that every version has been tested end to end. Versions outside that range are not declared supported by the extension.
+
+Check your installed version with `gnome-shell --version`. The extension is required for the top-panel icon, global shortcut, Wayland positioning, and existing VS Code window activation. The GTK window can run without it, but those integrations will be unavailable. Other Linux desktops are not currently supported.
+
 ## Build and install
 
+Install Rust using [rustup](https://rustup.rs/) if it is not already installed. The toolchain must support the 2024 edition.
+
 ```sh
-sudo apt-get install build-essential pkg-config libgtk-3-dev libsqlite3-dev \
+sudo apt-get install git build-essential pkg-config libgtk-3-dev libsqlite3-dev \
   libsecret-tools lsof curl xdg-utils zip
 cargo build --release --locked
 ./scripts/install-ubuntu.sh
@@ -26,9 +34,9 @@ cargo run --locked
 
 The app also runs as a normal panel window if the GNOME extension is unavailable. Ubuntu GNOME is the supported Linux desktop; a generic AppIndicator menu is no longer used.
 
-## Style guide and interactions
+## UI/UX specification and interactions
 
-[`STYLE_GUIDE.md`](../STYLE_GUIDE.md) is the behavior contract. The HTML mockup remains a visual reference.
+The [UI/UX Specification](design/README.md) is the authoritative cross-platform reference. It compares the interactive HTML prototype, macOS and GNOME without silently resolving their differences. See the [GNOME supplement](design/platforms/gnome.md) and [three-way parity matrix](design/parity.md) for native behavior and known gaps.
 
 The native panel uses the shared 392-pixel width, 36-pixel headers, 24-pixel sticky application icons, and 326-pixel detail region. Sessions are grouped by application identity and naturally sorted by title. The footer remains outside the main scroller; window height follows content up to the screen-dependent limit. The compositor anchors the panel beneath the robot and confines it to the monitor's usable area.
 

@@ -2,6 +2,7 @@ use crate::app::core;
 use anyhow::{Context, Result, bail};
 use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
+// Local builds use ad-hoc signing unless a Keychain identity is selected explicitly.
 const DEFAULT_SIGNING_IDENTITY: &str = "-";
 
 fn sign_app(bundle: &Path) -> Result<()> {

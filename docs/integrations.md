@@ -28,7 +28,7 @@ Hooks from another copy of this app bundle are migrated to the current executabl
 
 Launching directly from `/Volumes` or App Translocation displays installation instructions and exits before acquiring the resident lock or writing hooks. The user must drag the bundle to a stable location such as Applications first.
 
-The `dmg` command packages the current executable, signs the bundle using the configured identity, creates a compressed read-only disk image with an Applications shortcut, and writes a SHA-256 checksum. Asset names identify the native architecture; no universal-binary claim is made. `bundle` and `dmg` default to Developer ID identity `-`, with `--options runtime --timestamp`, and verify the result with `codesign --verify --strict`. `AI_AGENT_MONITOR_SIGN_IDENTITY` overrides the identity; `-` explicitly selects ad-hoc signing without a timestamp. Signing does not perform notarization.
+The `dmg` command packages the current executable, signs the bundle using the configured identity, creates a compressed read-only disk image with an Applications shortcut, and writes a SHA-256 checksum. Asset names identify the native architecture; no universal-binary claim is made. `bundle` and `dmg` use ad-hoc signing by default and verify the result with `codesign --verify --strict`. Set `AI_AGENT_MONITOR_SIGN_IDENTITY` to a Developer ID identity from your Keychain to enable `--options runtime --timestamp`. The release script selects a Developer ID identity from Keychain rather than embedding a personal certificate identifier. Signing does not perform notarization.
 
 ## Codex discovery
 
