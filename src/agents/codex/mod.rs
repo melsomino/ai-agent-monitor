@@ -1,5 +1,6 @@
 //! Codex backend with direct client and VS Code integrations.
 pub(crate) mod async_questions;
+mod models;
 pub(crate) mod requests;
 pub(crate) mod runtime;
 pub(crate) mod usage;
@@ -124,6 +125,14 @@ fn open(
         if let Some(path) = files.get(&session.id) {
             enrich_cached(session, path, &mut cache.borrow_mut());
         }
+    }
+    let names = models::display_names(home);
+    for session in &mut sessions {
+        session.model_display_name = session
+            .model
+            .as_deref()
+            .and_then(|id| names.get(id.trim()))
+            .cloned();
     }
     #[cfg(target_os = "macos")]
     crate::macos::terminal::retain_live_codex(&mut sessions, &output)?;
@@ -348,9 +357,19 @@ fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
     } else {
         ""
     };
+    let model = if has("model") {
+        "NULLIF(TRIM(model), '')"
+    } else {
+        "NULL"
+    };
+    let effort = if has("reasoning_effort") {
+        "NULLIF(TRIM(reasoning_effort), '')"
+    } else {
+        "NULL"
+    };
     let placeholders = vec!["?"; ids.len()].join(",");
     let sql = format!(
-        "SELECT id, {title}, {cwd}, {updated} AS updated FROM threads WHERE id IN ({placeholders}) {archived} ORDER BY updated DESC, id"
+        "SELECT id, {title}, {cwd}, {updated} AS updated, {model} AS session_model, {effort} AS session_effort FROM threads WHERE id IN ({placeholders}) {archived} ORDER BY updated DESC, id"
     );
     let mut statement = db.prepare(&sql)?;
     statement
@@ -365,6 +384,9 @@ fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
                 cwd: PathBuf::from(row.get::<_, String>(2)?),
                 workspace: None,
                 git_branch: None,
+                model: row.get(4)?,
+                model_display_name: None,
+                reasoning_effort: row.get(5)?,
                 updated_at: row.get(3)?,
                 client: Client::Unknown,
                 activity: Activity::Unknown,
@@ -602,12 +624,28 @@ fn last_activity_before(
 }
 
 fn parse_events(session: &mut Session, tail: &str) {
+    let mut reported_model = None;
+    let mut reported_effort = None;
     for line in tail.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         let payload = &value["payload"];
         match value["type"].as_str() {
+            Some("turn_context") => {
+                if let Some(model) = payload["model"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    reported_model = Some(model.to_owned());
+                    reported_effort = payload["effort"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                }
+            }
             Some("event_msg") => match payload["type"].as_str() {
                 Some("task_started" | "turn_started") => session.activity = Activity::Working,
                 Some("task_complete" | "turn_complete" | "turn_aborted") => {
@@ -637,12 +675,84 @@ fn parse_events(session: &mut Session, tail: &str) {
             _ => {}
         }
     }
+    if session.model.is_none() {
+        session.model = reported_model;
+        if session.reasoning_effort.is_none() {
+            session.reasoning_effort = reported_effort;
+        }
+    } else if session.reasoning_effort.is_none() && session.model == reported_model {
+        session.reasoning_effort = reported_effort;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn model_is_session_specific_and_refreshes_without_global_defaults() {
+        let home = tempfile::tempdir().unwrap();
+        let db = Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, title TEXT, model TEXT, reasoning_effort TEXT); INSERT INTO threads VALUES ('one', 'One', 'gpt-6.1-sol', 'medium'), ('two', 'Two', '  ', NULL);").unwrap();
+        let ids = HashSet::from(["one".into(), "two".into()]);
+        let sessions = read_open(home.path(), &ids).unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|s| s.id == "one")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("gpt-6.1-sol")
+        );
+        let named = sessions.iter().find(|s| s.id == "one").unwrap();
+        assert_eq!(named.model_label().as_deref(), Some("gpt-6.1-sol Medium"));
+        let mut catalog_named = named.clone();
+        catalog_named.model_display_name = Some("Catalog Name-Exactly".into());
+        assert_eq!(
+            catalog_named.model_label().as_deref(),
+            Some("Catalog Name-Exactly Medium")
+        );
+        let mut custom = named.clone();
+        custom.model = Some("custom-provider-model".into());
+        custom.reasoning_effort = None;
+        assert_eq!(
+            custom.model_label().as_deref(),
+            Some("custom-provider-model")
+        );
+        let mut legacy = sessions.into_iter().find(|s| s.id == "two").unwrap();
+        assert_eq!(legacy.model, None);
+        parse_events(
+            &mut legacy,
+            r#"{"type":"turn_context","payload":{"model":"old-model"}}
+{"type":"event_msg","payload":{"type":"tool_output","model":"not-the-agent-model"}}
+{"type":"turn_context","payload":{"model":"last-turn-model","effort":"high"}}"#,
+        );
+        assert_eq!(legacy.model.as_deref(), Some("last-turn-model"));
+        assert_eq!(legacy.reasoning_effort.as_deref(), Some("high"));
+        let mut no_effort = legacy.clone();
+        no_effort.model = None;
+        no_effort.reasoning_effort = None;
+        parse_events(
+            &mut no_effort,
+            r#"{"type":"turn_context","payload":{"model":"older","effort":"high"}}
+{"type":"turn_context","payload":{"model":"newer"}}"#,
+        );
+        assert_eq!(no_effort.reasoning_effort, None);
+
+        db.execute("UPDATE threads SET model = 'model-b' WHERE id = 'one'", [])
+            .unwrap();
+        let mut current = read_open(home.path(), &HashSet::from(["one".into()]))
+            .unwrap()
+            .remove(0);
+        assert_eq!(current.model.as_deref(), Some("model-b"));
+        parse_events(
+            &mut current,
+            r#"{"type":"turn_context","payload":{"model":"older-journal-model"}}"#,
+        );
+        assert_eq!(current.model.as_deref(), Some("model-b"));
+    }
 
     #[test]
     fn legacy_hook_approval_cannot_be_answered_by_codex() {
@@ -669,6 +779,9 @@ mod tests {
             cwd: PathBuf::new(),
             workspace: None,
             git_branch: None,
+            model: None,
+            model_display_name: None,
+            reasoning_effort: None,
             updated_at: 0,
             client: Client::Terminal,
             activity: Activity::Confirmation,
@@ -705,6 +818,9 @@ mod tests {
             cwd: PathBuf::new(),
             workspace: None,
             git_branch: None,
+            model: None,
+            model_display_name: None,
+            reasoning_effort: None,
             updated_at: 0,
             client: Client::Unknown,
             activity: Activity::Unknown,
@@ -764,6 +880,9 @@ mod tests {
             cwd: PathBuf::new(),
             workspace: None,
             git_branch: None,
+            model: None,
+            model_display_name: None,
+            reasoning_effort: None,
             updated_at: 0,
             client: Client::Unknown,
             activity: Activity::Unknown,

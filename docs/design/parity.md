@@ -42,6 +42,7 @@
 | PS-06 |Title opens /robot toggles |Simulation/toggle; hover/focus shows → + app icon |Host open/toggle; same destination hint |Host open/toggle; same destination hint |C/M; H host action simulated |
 | PS-07 |Title hover measured width |Yes |Yes |Natural button |C/P |
 | PS-08 |Icon circular target |26×24robot,25footer |28square normalized |28minimum+theme |D,foundations |
+| PS-MODEL |Expanded-session model metadata |Optional fixture row, cpu icon |Optional reported model, cpu symbol |Optional reported model, chip symbol |C/P; hide unknown; Codex/Claude supported, Cline unknown |
 | PS-09 |Working/request/idle |Static filled green play/filled!/none |Same, direct triangle drawing |Same, Cairo solid triangle |C/P; Working indicator is informational |
 | PS-10 |Unknown |No fixture branch;defaults request |Muted questionmark |Muted? |M/D |
 | PS-11 |Finished click |Inert disc |Ack generation |Ack generation |M |

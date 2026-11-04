@@ -329,7 +329,7 @@ async fn handle_request(
             let state = monitor.snapshot();
             let telegram = crate::actors::human::telegram::diagnostics(&state.telegram);
             Ok(
-                json!({"monitor":{"pid":std::process::id(),"version":core::VERSION},"telegram":telegram,"sessions":state.sessions.iter().map(|s|json!({"agent":s.agent,"id":s.id,"title":s.title,"cwd":s.cwd,"workspace":s.workspace,"gitBranch":s.git_branch,"client":s.client.label(),"status":s.activity.label(),"lastMessage":s.last_message,"updatedAt":s.updated_at,"approval":s.approval.as_ref().map(|a|json!({"id":a.id,"body":a.body,"expiresAt":a.expires,"canAllow":a.can_allow}))})).collect::<Vec<_>>()}),
+                json!({"monitor":{"pid":std::process::id(),"version":core::VERSION},"telegram":telegram,"sessions":state.sessions.iter().map(|s|json!({"agent":s.agent,"id":s.id,"title":s.title,"cwd":s.cwd,"workspace":s.workspace,"gitBranch":s.git_branch,"model":s.model,"modelDisplayName":s.model_display_name,"reasoningEffort":s.reasoning_effort,"modelLabel":s.model_label(),"client":s.client.label(),"status":s.activity.label(),"lastMessage":s.last_message,"updatedAt":s.updated_at,"approval":s.approval.as_ref().map(|a|json!({"id":a.id,"body":a.body,"expiresAt":a.expires,"canAllow":a.can_allow}))})).collect::<Vec<_>>()}),
             )
         }
         Request::Test {

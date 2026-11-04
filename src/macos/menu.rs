@@ -4139,6 +4139,14 @@ impl MenuController {
                 branch.clone(),
             ));
         }
+        if let Some(label) = session.model_label() {
+            rows.push((
+                "cpu",
+                "Model",
+                label,
+                format!("Model: {}", session.model.as_deref().unwrap_or_default()),
+            ));
+        }
         let mut y = 0.0;
         for (symbol, description, value, tooltip) in rows {
             if y > 0.0 {
@@ -6112,6 +6120,9 @@ mod close_tests {
             cwd: "/project".into(),
             workspace: None,
             git_branch: None,
+            model: None,
+            model_display_name: None,
+            reasoning_effort: None,
             updated_at: 0,
             client: Client::VSCode,
             activity: if approval.is_some() {

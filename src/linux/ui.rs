@@ -1265,6 +1265,14 @@ impl Row {
                 0,
             );
         }
+        if let Some(label) = session.model_label() {
+            let row = widgets::meta("computer-chip-symbolic", &label);
+            row.set_tooltip_text(Some(&format!(
+                "Model: {}",
+                session.model.as_deref().unwrap_or_default()
+            )));
+            self.metadata.pack_start(&row, false, false, 0);
+        }
         self.detail.show_all();
         self.feedback.set_visible(!feedback.is_empty());
     }
@@ -1278,7 +1286,7 @@ mod tests {
         session::{Approval, Client},
     };
     fn session(id: &str, title: &str, client: Client, activity: Activity) -> Session {
-        Session{agent:"codex",id:id.into(),title:title.into(),cwd:"/tmp/native-monitor".into(),workspace:None,git_branch:Some("ubuntu".into()),updated_at:1,client,activity,last_message:"## Native Rust interface\n\nThe **session** is ready. [Documentation](https://example.com)".into(),interaction_data:Interaction::default(),target:Some("vscode://file/tmp/native-monitor".into()),authoritative:true,approval:None}
+        Session{agent:"codex",id:id.into(),title:title.into(),cwd:"/tmp/native-monitor".into(),workspace:None,git_branch:Some("ubuntu".into()),model:None,model_display_name:None,reasoning_effort:None,updated_at:1,client,activity,last_message:"## Native Rust interface\n\nThe **session** is ready. [Documentation](https://example.com)".into(),interaction_data:Interaction::default(),target:Some("vscode://file/tmp/native-monitor".into()),authoritative:true,approval:None}
     }
     fn drain() {
         let until = std::time::Instant::now() + Duration::from_millis(350);

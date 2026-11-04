@@ -129,6 +129,13 @@ fn parse(record: &mut Record, input: &str) {
         } else if v["type"] == "assistant"
             && let Some(parts) = v["message"]["content"].as_array()
         {
+            if let Some(model) = v["message"]["model"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "<synthetic>")
+            {
+                record.model = Some(model.to_owned());
+            }
             let text = parts
                 .iter()
                 .filter(|p| p["type"] == "text")
@@ -172,6 +179,7 @@ pub fn hook(
             .into_owned(),
         cwd: cwd.clone(),
         transcript: None,
+        model: None,
         pid: owner.0,
         birth: owner.1.clone(),
         client: owner.2.clone(),
@@ -330,12 +338,18 @@ mod tests {
         parse(
             &mut record,
             r#"{"type":"custom-title","customTitle":"Renamed chat"}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Latest answer"},{"type":"tool_use","name":"Bash"}]}}
+{"type":"assistant","message":{"model":"claude-session-model","content":[{"type":"text","text":"Latest answer"},{"type":"tool_use","name":"Bash"}]}}
 {"type":"user","message":{"content":[{"type":"tool_result","content":"not assistant text"}]}}
-{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"subagent answer"}]}}"#,
+{"type":"assistant","isSidechain":true,"message":{"model":"other-subagent-model","content":[{"type":"text","text":"subagent answer"}]}}"#,
         );
         assert_eq!(record.title, "Renamed chat");
         assert_eq!(record.last_message, "Latest answer");
+        assert_eq!(record.model.as_deref(), Some("claude-session-model"));
+        parse(
+            &mut record,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","content":[]}}"#,
+        );
+        assert_eq!(record.model.as_deref(), Some("claude-session-model"));
     }
 
     #[test]

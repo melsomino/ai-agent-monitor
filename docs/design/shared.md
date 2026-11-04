@@ -58,3 +58,5 @@ An open transcript alone is insufficient proof of a live terminal on macOS. That
 7. Restart the monitor with an old remote button still visible: it cannot obtain response authority from its previous nonce/category alone.
 
 These contracts concern observable behavior. Actor construction, mailbox topology and transport protocols are architecture, except where latency, queue failure, or retained state affects the user.
+
+Per-session model metadata is optional (`Session::model`), reflects session-specific observations, and is independent of activity/interaction state. See [session footer model rules](components/sessions.md#sessions-metadata) for sources, precedence and unavailable behavior.

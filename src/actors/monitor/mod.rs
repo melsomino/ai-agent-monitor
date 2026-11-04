@@ -558,6 +558,9 @@ pub fn hook_session(
             .unwrap_or_else(core::home),
         workspace: None,
         git_branch: None,
+        model: None,
+        model_display_name: None,
+        reasoning_effort: None,
         updated_at: now() as i64,
         client: if owner.is_some_and(|o| o.2 == "vscode") {
             Client::VSCode

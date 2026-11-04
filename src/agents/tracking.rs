@@ -22,6 +22,8 @@ pub struct Record {
     pub title: String,
     pub cwd: PathBuf,
     pub transcript: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub pid: u32,
     pub birth: String,
     pub client: String,
@@ -256,6 +258,9 @@ pub fn snapshot(r: &Record) -> Session {
         cwd: r.cwd.clone(),
         workspace: None,
         git_branch: None,
+        model: r.model.clone(),
+        model_display_name: None,
+        reasoning_effort: None,
         updated_at: (r.updated / 1_000_000_000) as i64,
         client: if r.client == "vscode" {
             Client::VSCode
@@ -298,6 +303,7 @@ mod tests {
             title: id.into(),
             cwd: "/project".into(),
             transcript: None,
+            model: None,
             pid,
             birth: "birth".into(),
             client: "vscode".into(),
@@ -305,6 +311,13 @@ mod tests {
             last_message: String::new(),
             updated,
         }
+    }
+    #[test]
+    fn pre_model_hook_records_remain_readable() {
+        let mut json = serde_json::to_value(record("claude", "chat", 42, 0)).unwrap();
+        json.as_object_mut().unwrap().remove("model");
+        let record: Record = serde_json::from_value(json).unwrap();
+        assert_eq!(record.model, None);
     }
     #[test]
     fn distinguishes_ide_agents_without_binding_their_lifetime_to_the_whole_editor() {

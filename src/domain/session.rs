@@ -65,6 +65,11 @@ pub struct Session {
     pub cwd: PathBuf,
     pub workspace: Option<PathBuf>,
     pub git_branch: Option<String>,
+    /// Last known model reported by this session; never inferred from global defaults.
+    pub model: Option<String>,
+    /// Provider catalog name, used verbatim; raw model is the fallback.
+    pub model_display_name: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub updated_at: i64,
     pub client: Client,
     pub activity: Activity,
@@ -76,6 +81,41 @@ pub struct Session {
 }
 
 impl Session {
+    /// Human-readable model name and session-reported reasoning level.
+    pub fn model_label(&self) -> Option<String> {
+        let raw = self.model.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let mut label = self
+            .model_display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(raw)
+            .to_owned();
+        if let Some(effort) = self
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            label.push(' ');
+            label.push_str(match effort {
+                "none" => "None",
+                "minimal" => "Minimal",
+                "low" => "Low",
+                "medium" => "Medium",
+                "high" => "High",
+                "xhigh" => "Extra High",
+                "max" => "Max",
+                "ultra" => "Ultra",
+                other => other,
+            });
+        }
+        Some(label)
+    }
+
     pub fn project_path(&self) -> &Path {
         self.workspace.as_deref().unwrap_or(&self.cwd)
     }
