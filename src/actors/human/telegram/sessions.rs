@@ -35,6 +35,11 @@ pub(super) struct Browser {
     show_info: bool,
     delivered_agent: Option<(String, String)>,
     staged_agent: Option<(String, String)>,
+    staged_images: Vec<(String, crate::domain::media::Image)>,
+    sent_images: std::collections::VecDeque<String>,
+    failed_images: HashMap<String, Instant>,
+    media_advanced: bool,
+    media_caption: String,
 }
 impl Browser {
     pub fn resume(session: String) -> Result<Self> {
@@ -63,6 +68,11 @@ impl Browser {
             show_info: false,
             delivered_agent: None,
             staged_agent: None,
+            staged_images: vec![],
+            sent_images: Default::default(),
+            failed_images: HashMap::new(),
+            media_advanced: false,
+            media_caption: String::new(),
         })
     }
     pub fn selected(&self, message: i64) -> Option<&str> {
@@ -167,7 +177,7 @@ impl Browser {
             })
     }
     pub fn needs_new_message(&self) -> bool {
-        self.message.is_some() && self.has_new_agent_text()
+        self.message.is_some() && (self.has_new_agent_text() || self.media_advanced)
     }
     pub fn detach_message(&mut self) {
         self.message = None;
@@ -175,9 +185,37 @@ impl Browser {
         self.active_request = None;
     }
     pub fn commit(&mut self, content: Value) {
+        self.media_advanced = false;
         self.rendered = content;
         self.active_request = self.staged_request.clone();
         self.delivered_agent = self.staged_agent.clone();
+    }
+    pub fn pending_image(&self) -> Option<(String, crate::domain::media::Image, String)> {
+        self.staged_images
+            .iter()
+            .find(|(id, _)| {
+                !self.sent_images.contains(id)
+                    && self
+                        .failed_images
+                        .get(id)
+                        .is_none_or(|retry| Instant::now() >= *retry)
+            })
+            .map(|(id, image)| (id.clone(), image.clone(), self.media_caption.clone()))
+    }
+    pub fn image_sent(&mut self, id: String) {
+        self.failed_images.remove(&id);
+        self.sent_images.push_back(id);
+        while self.sent_images.len() > 512 {
+            self.sent_images.pop_front();
+        }
+        self.media_advanced = true;
+    }
+    pub fn image_failed(&mut self, id: String) {
+        if self.failed_images.len() >= 512 {
+            self.failed_images.clear();
+        }
+        self.failed_images
+            .insert(id, Instant::now() + Duration::from_secs(15));
     }
     pub fn can_present(&self, pending: &Pending) -> bool {
         self.selected_available
@@ -280,6 +318,25 @@ impl Browser {
                 Some((selected.clone(), session.last_message.clone()))
             }
         });
+        self.staged_images.clear();
+        if !self.show_info
+            && let Some(session) = self
+                .selected
+                .as_ref()
+                .and_then(|key| sessions.iter().find(|s| s.key() == *key))
+        {
+            let images = self
+                .earlier
+                .as_ref()
+                .map_or(session.images.as_slice(), |message| {
+                    message.images.as_slice()
+                });
+            self.staged_images = images
+                .iter()
+                .map(|image| (format!("{}:{}", session.key(), image.id), image.clone()))
+                .collect();
+            self.media_caption = short(&session.title, 200);
+        }
         let pending_request = self.selected.as_ref().and_then(|selected| {
             sessions
                 .iter()
@@ -526,6 +583,7 @@ mod tests {
             client,
             activity: Activity::Idle,
             last_message: "Latest message".into(),
+            images: vec![],
             interaction_data: Default::default(),
             target: None,
             approval: None,
@@ -544,6 +602,46 @@ mod tests {
                 )
             })
             .collect()
+    }
+    #[test]
+    fn previous_message_exposes_its_images_through_monitor_history_only() {
+        let chat = session("chat", "Chat", Client::Terminal);
+        let mut state = monitor::State {
+            sessions: vec![chat.clone()],
+            ..Default::default()
+        };
+        let mut browser = Browser::resume(chat.key()).unwrap();
+        browser.content(&state, &HashMap::new());
+        assert!(browser.pending_image().is_none());
+        browser.previous_requested = true;
+        let Some(monitor::Command::History {
+            key, generation, ..
+        }) = browser.history_command(&state)
+        else {
+            panic!("history command expected");
+        };
+        let history = std::sync::Arc::make_mut(state.history.entry(key).or_default());
+        history.generation = generation;
+        history.cursor = Some("image-page".into());
+        history.messages.push(crate::domain::history::Message {
+            cursor: "image-page".into(),
+            text: "[Image]".into(),
+            images: crate::agents::codex::images::output_images(
+                &crate::agents::codex::images::fixture(),
+            ),
+        });
+        browser.content(&state, &HashMap::new());
+        let (id, image, _) = browser.pending_image().expect("history image");
+        assert_eq!(image.mime, "image/png");
+        browser.image_sent(id);
+        browser.content(&state, &HashMap::new());
+        assert!(browser.pending_image().is_none());
+        state
+            .preferences
+            .applications
+            .set_enabled(&chat.client.application_id(), false);
+        browser.content(&state, &HashMap::new());
+        assert!(browser.pending_image().is_none());
     }
     #[test]
     fn list_matches_native_groups_order_visibility_and_idle_status() {
@@ -718,6 +816,7 @@ mod tests {
         assert_eq!(key, monitor::HistoryKey::telegram("codex:1".into()));
         assert!(cursor.is_none());
         let previous = crate::domain::history::Message {
+            images: vec![],
             cursor: "older".into(),
             text: "Previous agent message".into(),
         };

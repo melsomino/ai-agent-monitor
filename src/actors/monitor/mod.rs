@@ -425,6 +425,15 @@ pub(crate) async fn run(
                         Ok(Some(message)) => {
                             h.cursor = Some(message.cursor.clone());
                             h.messages.insert(0, message);
+                            // Keep the most recently requested history page's images.
+                            let mut image_bytes = 0;
+                            for message in &mut h.messages {
+                                image_bytes +=
+                                    message.images.iter().map(|i| i.data.len()).sum::<usize>();
+                                if image_bytes > 40 * 1024 * 1024 {
+                                    message.images.clear();
+                                }
+                            }
                         }
                         Ok(None) => h.exhausted = true,
                         Err(e) => h.error = Some(e),
@@ -569,6 +578,7 @@ pub fn hook_session(
         },
         activity: Activity::Confirmation,
         last_message: String::new(),
+        images: vec![],
         interaction_data: Interaction {
             command: event["tool_input"]["command"].as_str().map(str::to_owned),
             ..if event["_test_extended_choices"] == true {

@@ -14,11 +14,23 @@ pub use crate::domain::history::Message;
 pub struct Record {
     pub text: String,
     pub kind: u8,
+    pub images: Vec<crate::domain::media::Image>,
 }
 fn hash(text: &str) -> u64 {
     let mut hash = DefaultHasher::new();
     text.hash(&mut hash);
     hash.finish()
+}
+fn record_hash(record: &Record) -> u64 {
+    if record.images.is_empty() {
+        return hash(&record.text);
+    }
+    let mut hasher = DefaultHasher::new();
+    record.text.hash(&mut hasher);
+    for image in &record.images {
+        image.id.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 fn matches_anchor(text: &str, anchor: &str) -> bool {
     text.trim_end() == anchor.trim_end()
@@ -31,7 +43,7 @@ fn cursor(metadata: &std::fs::Metadata, offset: u64, record: &Record) -> String 
         metadata.ino(),
         offset,
         record.kind,
-        hash(&record.text)
+        record_hash(record)
     )
 }
 fn decode(cursor: &str, metadata: &std::fs::Metadata) -> Result<(u64, u8, u64)> {
@@ -63,14 +75,15 @@ pub fn jsonl(
         anyhow::ensure!(offset < metadata.len(), "Transcript was truncated");
         file.seek(SeekFrom::Start(offset))?;
         let mut line = Vec::new();
-        BufReader::new((&mut file).take(2 * 1024 * 1024 + 1)).read_until(b'\n', &mut line)?;
+        BufReader::new((&mut file).take(crate::agents::codex::images::MAX_RECORD as u64 + 1))
+            .read_until(b'\n', &mut line)?;
         let record = serde_json::from_slice::<Value>(&line)
             .ok()
             .and_then(|value| parse(&value));
         anyhow::ensure!(
             record
                 .as_ref()
-                .is_some_and(|record| record.kind == kind && self::hash(&record.text) == hash),
+                .is_some_and(|record| record.kind == kind && self::record_hash(record) == hash),
             "Transcript changed; reopen the session to reload history"
         );
         position = offset;
@@ -128,7 +141,7 @@ fn read_record(
     end: u64,
     parse: fn(&Value) -> Option<Record>,
 ) -> Result<Option<Record>> {
-    if end <= start || end - start > 2 * 1024 * 1024 {
+    if end <= start || end - start > crate::agents::codex::images::MAX_RECORD as u64 {
         return Ok(None);
     }
     file.seek(SeekFrom::Start(start))?;
@@ -147,7 +160,7 @@ fn select(
     found: &mut bool,
     anchor: Option<&str>,
 ) -> Option<Message> {
-    let fingerprint = hash(&record.text);
+    let fingerprint = record_hash(&record);
     if previous.is_some_and(|(kind, hash)| kind != record.kind && hash == fingerprint) {
         return None;
     }
@@ -161,10 +174,19 @@ fn select(
     Some(Message {
         cursor: cursor(metadata, offset, &record),
         text: record.text.trim_end().to_owned(),
+        images: record.images,
     })
 }
 
 pub fn codex(value: &Value) -> Option<Record> {
+    let images = crate::agents::codex::images::output_images(value);
+    if !images.is_empty() {
+        return Some(Record {
+            text: "[Image]".into(),
+            kind: 4,
+            images,
+        });
+    }
     let payload = &value["payload"];
     if payload["channel"] == "analysis" || payload["phase"] == "analysis" {
         return None;
@@ -173,6 +195,7 @@ pub fn codex(value: &Value) -> Option<Record> {
         return Some(Record {
             text: payload["message"].as_str()?.to_owned(),
             kind: 0,
+            images: vec![],
         });
     }
     if value["type"] == "response_item"
@@ -187,6 +210,7 @@ pub fn codex(value: &Value) -> Option<Record> {
                 .collect::<Vec<_>>()
                 .join("\n"),
             kind: 1,
+            images: vec![],
         });
     }
     None
@@ -204,6 +228,7 @@ pub fn claude(value: &Value) -> Option<Record> {
             .collect::<Vec<_>>()
             .join("\n"),
         kind: 2,
+        images: vec![],
     })
 }
 pub fn cline(path: &Path, before: Option<&str>, anchor: Option<&str>) -> Result<Option<Message>> {
@@ -222,6 +247,7 @@ pub fn cline(path: &Path, before: Option<&str>, anchor: Option<&str>) -> Result<
         .then(|| Record {
             text: value["text"].as_str().unwrap_or("").to_owned(),
             kind: 3,
+            images: vec![],
         })
     };
     let mut end = messages.len();
@@ -230,7 +256,7 @@ pub fn cline(path: &Path, before: Option<&str>, anchor: Option<&str>) -> Result<
         let (index, _, fingerprint) = decode(before, &metadata)?;
         let record = messages.get(index as usize).and_then(parse);
         anyhow::ensure!(
-            record.is_some_and(|record| hash(&record.text) == fingerprint),
+            record.is_some_and(|record| record_hash(&record) == fingerprint),
             "Cline task history changed"
         );
         end = index as usize;
@@ -250,6 +276,7 @@ pub fn cline(path: &Path, before: Option<&str>, anchor: Option<&str>) -> Result<
         return Ok(Some(Message {
             cursor: cursor(&metadata, index as u64, &record),
             text: record.text.trim_end().into(),
+            images: record.images,
         }));
     }
     anyhow::ensure!(
@@ -345,6 +372,43 @@ mod tests {
         assert_eq!(previous.text, "Earlier");
         assert!(
             cline(&path, Some(&previous.cursor), None)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    #[test]
+    fn previous_image_pages_survive_large_tool_records_and_keep_text_cursor_order() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout.jsonl");
+        let mut image = crate::agents::codex::images::fixture();
+        image["payload"]["output"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type":"input_text","text":"x".repeat(2 * 1024 * 1024)}));
+        let text = |s| {
+            serde_json::json!({"type":"event_msg","payload":{"type":"agent_message","message":s}})
+                .to_string()
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n{}\n", text("Old"), image, text("Latest")),
+        )
+        .unwrap();
+        let image_page = jsonl(&path, None, Some("Latest"), codex).unwrap().unwrap();
+        assert_eq!(image_page.text, "[Image]");
+        assert_eq!(image_page.images.len(), 1);
+        let old = jsonl(&path, Some(&image_page.cursor), None, codex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.text, "Old");
+        assert!(old.images.is_empty());
+        assert!(
+            jsonl(&path, Some(&old.cursor), None, codex)
                 .unwrap()
                 .is_none()
         );

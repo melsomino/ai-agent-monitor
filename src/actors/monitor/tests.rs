@@ -55,6 +55,7 @@ fn session(id: &str, request: &str) -> Session {
         client: Client::VSCode,
         activity: Activity::Confirmation,
         last_message: "Last message".into(),
+        images: vec![],
         interaction_data: Interaction::allow(),
         target: Some("vscode://file/work".into()),
         authoritative: true,
@@ -339,6 +340,7 @@ async fn window_and_telegram_history_are_independent_even_with_matching_generati
                 key,
                 generation: 1,
                 result: Ok(Some(crate::domain::history::Message {
+                    images: vec![],
                     cursor: text.into(),
                     text: text.into(),
                 })),
@@ -357,6 +359,7 @@ async fn window_and_telegram_history_are_independent_even_with_matching_generati
             key: window.clone(),
             generation: 1,
             result: Ok(Some(crate::domain::history::Message {
+                images: vec![],
                 cursor: "Window message".into(),
                 text: "Duplicate".into(),
             })),

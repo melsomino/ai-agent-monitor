@@ -214,6 +214,7 @@ mod behavior_tests {
             client: Client::VSCode,
             activity,
             last_message: String::new(),
+            images: vec![],
             interaction_data: Interaction::default(),
             target: None,
             authoritative: true,

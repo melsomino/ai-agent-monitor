@@ -664,6 +664,7 @@ mod tests {
             client: crate::agents::sessions::Client::VSCode,
             activity: crate::agents::sessions::Activity::Idle,
             last_message: String::new(),
+            images: vec![],
             approval: None,
         };
         assert_eq!(

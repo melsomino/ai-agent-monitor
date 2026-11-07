@@ -1286,7 +1286,7 @@ mod tests {
         session::{Approval, Client},
     };
     fn session(id: &str, title: &str, client: Client, activity: Activity) -> Session {
-        Session{agent:"codex",id:id.into(),title:title.into(),cwd:"/tmp/native-monitor".into(),workspace:None,git_branch:Some("ubuntu".into()),model:None,model_display_name:None,reasoning_effort:None,updated_at:1,client,activity,last_message:"## Native Rust interface\n\nThe **session** is ready. [Documentation](https://example.com)".into(),interaction_data:Interaction::default(),target:Some("vscode://file/tmp/native-monitor".into()),authoritative:true,approval:None}
+        Session{agent:"codex",id:id.into(),title:title.into(),cwd:"/tmp/native-monitor".into(),workspace:None,git_branch:Some("ubuntu".into()),model:None,model_display_name:None,reasoning_effort:None,updated_at:1,client,activity,last_message:"## Native Rust interface\n\nThe **session** is ready. [Documentation](https://example.com)".into(),images:vec![],interaction_data:Interaction::default(),target:Some("vscode://file/tmp/native-monitor".into()),authoritative:true,approval:None}
     }
     fn drain() {
         let until = std::time::Instant::now() + Duration::from_millis(350);

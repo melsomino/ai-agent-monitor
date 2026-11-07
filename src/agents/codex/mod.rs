@@ -1,5 +1,6 @@
 //! Codex backend with direct client and VS Code integrations.
 pub(crate) mod async_questions;
+pub(crate) mod images;
 mod models;
 pub(crate) mod requests;
 pub(crate) mod runtime;
@@ -27,6 +28,7 @@ use std::{
 pub struct Codex {
     runtime: runtime::Runtime,
     activity: std::cell::RefCell<HashMap<PathBuf, ActivityCheckpoint>>,
+    images: std::cell::RefCell<images::Cache>,
     vscode: std::cell::RefCell<vscode::LogCache>,
 }
 
@@ -46,6 +48,7 @@ impl SessionProvider for Codex {
             &self.runtime,
             &self.activity,
             &self.vscode,
+            &self.images,
         )
     }
 
@@ -107,6 +110,7 @@ fn open(
     runtime: &runtime::Runtime,
     cache: &std::cell::RefCell<HashMap<PathBuf, ActivityCheckpoint>>,
     vscode_cache: &std::cell::RefCell<vscode::LogCache>,
+    image_cache: &std::cell::RefCell<images::Cache>,
 ) -> Result<Vec<Session>> {
     // SAFETY: geteuid has no preconditions and scopes discovery to this user.
     let uid = unsafe { libc::geteuid() }.to_string();
@@ -121,9 +125,11 @@ fn open(
     let files = open_files(&output, home);
     let ids = files.keys().cloned().collect();
     let mut sessions = read_open(home, &ids)?;
+    image_cache.borrow_mut().retain(files.values().cloned());
     for session in &mut sessions {
         if let Some(path) = files.get(&session.id) {
             enrich_cached(session, path, &mut cache.borrow_mut());
+            session.images = image_cache.borrow_mut().latest(path);
         }
     }
     let names = models::display_names(home);
@@ -391,6 +397,7 @@ fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
                 client: Client::Unknown,
                 activity: Activity::Unknown,
                 last_message: String::new(),
+                images: vec![],
                 approval: None,
             })
         })?
@@ -786,6 +793,7 @@ mod tests {
             client: Client::Terminal,
             activity: Activity::Confirmation,
             last_message: String::new(),
+            images: vec![],
             approval: Some(crate::agents::sessions::Approval {
                 id: response.to_string_lossy().into_owned(),
                 body: request.body.clone(),
@@ -825,6 +833,7 @@ mod tests {
             client: Client::Unknown,
             activity: Activity::Unknown,
             last_message: String::new(),
+            images: vec![],
             approval: None,
         };
         let oversized = serde_json::json!({"type":"response_item", "payload":{
@@ -887,6 +896,7 @@ mod tests {
             client: Client::Unknown,
             activity: Activity::Unknown,
             last_message: String::new(),
+            images: vec![],
             approval: None,
         };
         parse_events(

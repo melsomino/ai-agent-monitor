@@ -67,6 +67,8 @@ Hook requests can overlay/create sessions until expiry or hook loss. Legacy hook
 <a id="state-history"></a>
 ## History, sends, and local presentation
 
+`Session::images` carries bounded current-turn Codex tool images; history `Message::images` carries images on an individual earlier page. Buffers are shared, not copied into every snapshot, and contain no external file/URL fetch instructions. See [Telegram media contracts](interactions/telegram.md#tg-images).
+
 `History` stores messages, cursor, loading, exhausted, error, generation per `(session, Window|Telegram)`. Starting with no cursor resets that consumer's history; same-generation duplicate commands do not reread. A matching completed read prepends one message, `None` means exhausted, an error leaves retry possible. Late/wrong-generation completion is ignored; session removal prunes history. macOS additionally maintains an anchor to retain a message that was latest when history began; GNOME composes fetched history with current latest without that anchor.
 
 Chat message sends are separate from answers: IDs deduplicate commands, text must be 1–16000 characters after nonblank validation, session must exist, be visible by application setting, and authoritative. Up to 256 retained send entries, evicting completed entries first. States Sending → Sent or Failed; unsupported adapters return a capability error. Codex uncertain send says to check the agent before sending again. No local popup composer is implemented; this is observable in Telegram.

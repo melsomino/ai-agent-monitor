@@ -173,6 +173,7 @@ mod tests {
                 client: Client::Terminal,
                 activity: Activity::Confirmation,
                 last_message: "Answer".into(),
+                images: vec![],
                 approval: Some(Approval {
                     id: "same-request".into(),
                     body: "Approve?".into(),

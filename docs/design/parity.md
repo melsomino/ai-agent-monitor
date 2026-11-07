@@ -122,4 +122,6 @@
 | PX-18 |Telegram same-ID change |Absent |Reject stale,doesn't refresh Pending |Same shared limitation |D,[D-10](discrepancies.md#d-10) |
 | PX-19 |Accessibility |ARIA/browser |AppKit labels,custom draws |GTK/ATK,custom draws |P/U,[coverage](coverage.md#coverage-limits) |
 
+| TG-IMAGES |Codex embedded images |No backend media fixture |History placeholder; no native preview |History placeholder; no native preview |Telegram sends media from monitor state; [TG-IMAGE-01–03](interactions/telegram.md#tg-images); H/M/G native preview missing |
+
 External-channel cells are M because H has no implementation, not because desktop OS notifications should be emulated in a sandboxed prototype. The shared Rust Telegram channel is identical logic on M/G except host collation, credentials and native setup; duplication in the matrix intentionally makes its absence in H explicit.

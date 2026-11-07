@@ -2,4 +2,5 @@
 pub struct Message {
     pub cursor: String,
     pub text: String,
+    pub images: Vec<crate::domain::media::Image>,
 }

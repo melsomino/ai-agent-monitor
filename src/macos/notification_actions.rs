@@ -261,6 +261,7 @@ mod tests {
             client: Client::VSCode,
             activity: Activity::Confirmation,
             last_message: String::new(),
+            images: vec![],
             interaction_data: question(2),
             target: None,
             authoritative: true,

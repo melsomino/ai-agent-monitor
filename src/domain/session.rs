@@ -74,6 +74,7 @@ pub struct Session {
     pub client: Client,
     pub activity: Activity,
     pub last_message: String,
+    pub images: Vec<crate::domain::media::Image>,
     pub interaction_data: Interaction,
     pub target: Option<String>,
     pub authoritative: bool,

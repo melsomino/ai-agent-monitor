@@ -221,6 +221,7 @@ mod tests {
             client: Client::VSCode,
             activity: Activity::Confirmation,
             last_message: String::new(),
+            images: vec![],
             interaction_data: Interaction::default(),
             target: Some("target".into()),
             authoritative: true,

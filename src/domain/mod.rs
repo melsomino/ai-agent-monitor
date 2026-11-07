@@ -11,3 +11,5 @@ pub mod telegram;
 pub mod usage;
 
 pub mod layout;
+
+pub mod media;

@@ -151,6 +151,8 @@ The selected session stays available between messages. Session views update auto
 
 ### Telegram sessions and replies
 
+In a selected Codex session, embedded images from agent tool results are forwarded as photos or files. **Previous message** can also show images from earlier history. User-uploaded images and links to local files are not forwarded automatically.
+
 ![Telegram bot showing the session list and an approval request with response buttons](docs/images/telegram.png)
 
 ### Why a personal bot?

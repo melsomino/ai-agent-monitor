@@ -38,7 +38,7 @@ These principles preserve explicitly documented design intent from the supersede
 
 | Adapter | Observed sessions | Activity/messages | Responses | Navigation/history constraints |
 |---|---|---|---|---|
-| Codex | Local writable rollout handles + database/transcript + live owner/VS Code evidence | Runtime idle/active/wait flags, latest transcript message, async questions | Command/file/permission decisions, structured questions, custom input where offered; live chat messages | Workspace-aware VS Code target; macOS terminal routing; transcript history |
+| Codex | Local writable rollout handles + database/transcript + live owner/VS Code evidence | Runtime idle/active/wait flags, latest transcript message, embedded current-turn tool images, async questions | Command/file/permission decisions, structured questions, custom input where offered; live chat messages | Workspace-aware VS Code target; macOS terminal routing; transcript history |
 | Claude Code, experimental | Hook record tied to PID and process birth time | Lifecycle hooks and assistant transcript; custom title | One-time Allow through permission hook/pending request | Project pinned at SessionStart; transcript history; new chat-message sending unsupported |
 | Cline, experimental | Latest tracked task per live extension host | Lifecycle + freshest task `ui_messages.json` | External approval unsupported; request directs user to Cline | Selected task only, task history; new chat-message sending unsupported |
 

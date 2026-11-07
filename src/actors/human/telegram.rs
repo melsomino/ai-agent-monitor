@@ -155,6 +155,9 @@ fn api(token: &str, method: &str, payload: Value) -> Result<Value> {
         config_quote(&format!("https://api.telegram.org/bot{token}/{method}")),
         config_quote(&payload.to_string())
     );
+    request_api_config(method, &config, "12")
+}
+fn request_api_config(method: &str, config: &str, timeout: &str) -> Result<Value> {
     let mut child = Command::new("/usr/bin/curl")
         .args([
             "--silent",
@@ -162,7 +165,7 @@ fn api(token: &str, method: &str, payload: Value) -> Result<Value> {
             "--connect-timeout",
             "5",
             "--max-time",
-            "12",
+            timeout,
             "--max-filesize",
             "2097152",
             "--config",
@@ -189,6 +192,59 @@ fn api(token: &str, method: &str, payload: Value) -> Result<Value> {
         serde_json::from_slice(&output.stdout).context("Invalid response from Telegram")?;
     api_result(method, value)
 }
+fn send_image(token: &str, image: &crate::domain::media::Image, payload: Value) -> Result<Value> {
+    anyhow::ensure!(valid_token(token), "Invalid bot token");
+    // Keep the token in curl stdin and binary data in a private temporary file.
+    let mut file = tempfile::NamedTempFile::new().context("Could not prepare Telegram image")?;
+    file.write_all(&image.data)?;
+    let (method, field) = image_method(image);
+    let extension = match image.mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        _ => "webp",
+    };
+    let path = file
+        .path()
+        .to_str()
+        .context("Invalid temporary image path")?
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let part = format!(
+        "{field}=@\"{path}\";filename=image.{extension};type={}",
+        image.mime
+    );
+    let mut config = format!(
+        "url = {}\nrequest = \"POST\"\nform = {}\n",
+        config_quote(&format!("https://api.telegram.org/bot{token}/{method}")),
+        config_quote(&part)
+    );
+    for key in ["chat_id", "caption"] {
+        if let Some(value) = payload.get(key) {
+            let value = value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            config.push_str(&format!(
+                "form-string = {}\n",
+                config_quote(&format!("{key}={value}"))
+            ));
+        }
+    }
+    request_api_config(method, &config, "30")
+}
+fn image_method(image: &crate::domain::media::Image) -> (&'static str, &'static str) {
+    if image.data.len() <= 10_000_000
+        && let Some((w, h)) = image.dimensions()
+        && w > 0
+        && h > 0
+        && u64::from(w) + u64::from(h) <= 10000
+        && u64::from(w.max(h)) <= 20 * u64::from(w.min(h))
+    {
+        return ("sendPhoto", "photo");
+    }
+    ("sendDocument", "document")
+}
+
 fn api_result(method: &str, value: Value) -> Result<Value> {
     if value["ok"] != true && value["error_code"] == 400 {
         let description = value["description"].as_str().unwrap_or_default();
@@ -1167,21 +1223,55 @@ impl Worker {
     fn flush_browser(&mut self) {
         let snapshot = self.monitor.snapshot();
         let token = self.token.clone();
-        if self.flush_browser_with(&snapshot, |method, payload| api(&token, method, payload)) {
+        if self.flush_browser_media_with(
+            &snapshot,
+            |method, payload| api(&token, method, payload),
+            |image, payload| send_image(&token, image, payload),
+        ) {
             self.save();
         }
     }
+    #[cfg(test)]
     fn flush_browser_with(
         &mut self,
         snapshot: &monitor::State,
+        send: impl FnMut(&str, Value) -> Result<Value>,
+    ) -> bool {
+        self.flush_browser_media_with(snapshot, send, |_, _| bail!("Unexpected image upload"))
+    }
+    fn flush_browser_media_with(
+        &mut self,
+        snapshot: &monitor::State,
         mut send: impl FnMut(&str, Value) -> Result<Value>,
+        mut upload: impl FnMut(&crate::domain::media::Image, Value) -> Result<Value>,
     ) -> bool {
         let Some(browser) = self.browser.as_mut() else {
             return false;
         };
         let content = browser.content(snapshot, &self.pending);
-        // Only new agent text advances the chat. Request and status changes edit
-        // the current card, keeping its message ID and answer buttons together.
+        if let Some((id, image, caption)) = browser.pending_image() {
+            match upload(
+                &image,
+                json!({"chat_id":self.config.chat,"caption":caption}),
+            ) {
+                Ok(result) if result["message_id"].as_i64().is_some() => {
+                    self.browser.as_mut().unwrap().image_sent(id);
+                    self.retry = Instant::now() + Duration::from_secs(1);
+                    return false;
+                }
+                result => {
+                    self.browser.as_mut().unwrap().image_failed(id);
+                    let error = result
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "Telegram did not confirm image delivery".into());
+                    self.note(&error);
+                }
+            }
+        }
+        let browser = self.browser.as_mut().unwrap();
+        // New agent text or a delivered image advances the chat. Request and
+        // status changes alone edit the current card and keep its answer buttons.
         if browser.needs_new_message() {
             let old = browser.message.unwrap();
             let cleanup = send(
@@ -1594,6 +1684,7 @@ mod tests {
             client: Client::Terminal,
             activity: Activity::Confirmation,
             last_message: String::new(),
+            images: vec![],
             approval: Some(Approval {
                 id: "request".into(),
                 body: "Choose carefully".into(),
@@ -2270,6 +2361,97 @@ mod tests {
         worker.browser = Some(browser);
         (worker, state, key, data)
     }
+    #[test]
+    fn images_are_uploaded_once_before_the_new_card_and_answers_remain_bound() {
+        let (mut worker, mut state, key, _) = browsing_request(pending(Interaction::allow()));
+        state.sessions[0].images =
+            crate::agents::codex::images::output_images(&crate::agents::codex::images::fixture());
+        let calls = RefCell::new(Vec::new());
+        for _ in 0..4 {
+            worker.flush_browser_media_with(
+                &state,
+                |method, payload| {
+                    calls.borrow_mut().push(method.to_owned());
+                    if method == "sendMessage" {
+                        assert!(
+                            !payload["reply_markup"]["inline_keyboard"]
+                                .as_array()
+                                .unwrap()
+                                .is_empty()
+                        );
+                    }
+                    Ok(json!({"message_id":80}))
+                },
+                |image, payload| {
+                    calls.borrow_mut().push(image_method(image).0.to_owned());
+                    assert!(image.data.starts_with(b"\x89PNG\r\n\x1a\n"));
+                    assert!(payload["caption"].as_str().is_some());
+                    Ok(json!({"message_id":79}))
+                },
+            );
+        }
+        assert_eq!(
+            *calls.borrow(),
+            ["sendPhoto", "editMessageReplyMarkup", "sendMessage"]
+        );
+        let browser = worker.browser.as_ref().unwrap();
+        assert!(browser.permits_answer(80, &worker.pending[&key]));
+        assert_eq!(
+            browser.current_session(),
+            Some(state.sessions[0].key().as_str())
+        );
+    }
+
+    #[test]
+    fn failed_photo_upload_does_not_remove_the_question_controls_or_current_session() {
+        let (mut worker, mut state, key, _) = browsing_request(pending(Interaction::allow()));
+        state.sessions[0].images =
+            crate::agents::codex::images::output_images(&crate::agents::codex::images::fixture());
+        worker.flush_browser_media_with(
+            &state,
+            |method, payload| {
+                assert_eq!(method, "editMessageText");
+                assert!(
+                    !payload["reply_markup"]["inline_keyboard"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                Ok(json!({"message_id":77}))
+            },
+            |_, _| bail!("offline"),
+        );
+        assert!(
+            worker
+                .browser
+                .as_ref()
+                .unwrap()
+                .permits_answer(77, &worker.pending[&key])
+        );
+        worker.flush_browser_media_with(
+            &state,
+            |_, _| panic!("unchanged card"),
+            |_, _| panic!("retry must wait"),
+        );
+        assert_eq!(
+            worker.browser.as_ref().unwrap().current_session(),
+            Some(state.sessions[0].key().as_str())
+        );
+    }
+
+    #[test]
+    fn panoramic_png_is_sent_as_a_document_and_standard_png_as_photo() {
+        let image =
+            crate::agents::codex::images::output_images(&crate::agents::codex::images::fixture())
+                .remove(0);
+        assert_eq!(image_method(&image), ("sendPhoto", "photo"));
+        let mut large = image.clone();
+        let mut data = large.data.to_vec();
+        data[16..20].copy_from_slice(&10001u32.to_be_bytes());
+        large.data = data.into();
+        assert_eq!(image_method(&large), ("sendDocument", "document"));
+    }
+
     #[test]
     fn browser_delivery_prevents_a_duplicate_notification_and_failed_delivery_stays_queued() {
         let mut request = pending(Interaction::allow());

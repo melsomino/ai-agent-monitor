@@ -274,6 +274,7 @@ pub fn snapshot(r: &Record) -> Session {
             _ => Activity::Unknown,
         },
         last_message: r.last_message.clone(),
+        images: vec![],
         approval: None,
     }
 }

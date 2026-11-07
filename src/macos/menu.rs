@@ -5800,6 +5800,7 @@ mod close_tests {
             "Latest message"
         );
         history.messages.push(crate::domain::history::Message {
+            images: vec![],
             cursor: "earlier".into(),
             text: "Previous message\n".into(),
         });
@@ -6131,6 +6132,7 @@ mod close_tests {
                 Activity::Idle
             },
             last_message: String::new(),
+            images: vec![],
             approval: approval.map(|path| crate::agents::sessions::Approval {
                 id: path.into(),
                 body: "Подтверждение".into(),
