@@ -14,7 +14,7 @@ const sessions = [
     {id:'cargo', app:'Codex', title:'Set up the local Cargo.lock', status:'idle', message:'Dependencies are pinned. The build is reproducible with the local Cargo.lock.', directory:'~/dev/ai-agent-monitor', branch:'main'}
   ];
  const frame=document.getElementById('monitor');
- let theme='dark',version='v0.2.0 · preview',context=1;
+ let theme='dark',version='v0.3.0 · preview',context=1;
  let preferences={login:false,animate:true,shortcut:'',applications:{}};
  const state=sessions.map(s=>({...s,appId:s.app,icon:applicationIcons[s.app],html:s.message,
    fullDirectory:s.directory,completion:s.status==='finished'?1:null,
