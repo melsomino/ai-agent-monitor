@@ -8,6 +8,8 @@
 <a id="parity-table"></a>
 ## Ambient surface and popup
 
+The [glass revision](components/glass-surfaces.md) supersedes the neutral H/M palette entries in this baseline. H has the full experimental presentation; M adopts the monitor layout and gradient surfaces with native controls and OS-owned menu decoration; G has not adopted the treatment. Native focus colors, OS decoration and transport behavior remain explicit platform differences.
+
 | ID | Behavior | H | M | G | Class / evidence |
 |---|---|---|---|---|---|
 | PA-01 |Robot identity |Embedded raster mask |Template PDF |Symbolic SVG |P,[indicator](components/indicator.md) |
@@ -53,12 +55,14 @@
 | PS-16 |Previous history |One simulated paragraph |Prepend,anchor,loading,error |Prepend,loading,error,no anchor |M/D |
 | PS-17 |Previous arrow hover |Yband anywhere product |First message/gutter bounds |First message event bounds |D,[D-06](discrepancies.md#d-06) |
 | PS-18 |Message thread/dots |CSS masked SVG contours |Cairo-equivalent native line15request |Cairo line16request |C/P |
-| PS-19 |Markdown |Fixture HTML only |Shared parser→attributed text |Shared parser→Pango |M/P |
+| PS-19 |Markdown |Fixture HTML only |Shared parser→attributed text; native table grid |Shared parser→Pango; tables as separated text rows |M/P; graphical tables missing in G |
 | PS-20 |Metadata |Home-like fixture,hide toggle |Selectable~+branch |Selectable~/+branch |C/D,exact home / toggle |
 | PS-21 |Empty list states |Absent |3states |3states,different priority |M/D |
 | PS-22 |Quota |Static |Remaining/date/expiry/tooltips |Same values,different alignment/tooltips |C/M/P |
-| PS-23 |Filter row |Absent |Footer query |Footer query |M |
+| PS-23 |Filter row |Footer query |Footer query |Footer query |C |
 | PS-24 |Footer power |Pause simulation |Quit |Quit |D,[D-12](discrepancies.md#d-12) |
+| PS-25 |[Session composer](components/sessions.md#sessions-composer) |Idle/finished field, mock send, retained drafts |Idle field, live actor delivery, pending/errors, native editing, retained drafts |Missing |M/D; real transport capability is not guaranteed by live observation |
+| PS-26 |[Current work caption](components/sessions.md#sessions-progress) |Fixture progress below message |Bounded live tool activity/public summaries, Working only |Missing |M/D; unsupported transport metadata omits caption |
 
 ## Requests and input
 
@@ -85,15 +89,15 @@
 | PR-19 |Unsupported request route |Absent |Open in editor |No card fallback action |M/D,[D-11](discrepancies.md#d-11) |
 | PR-20 |Multiple+actions mixed |Absent |Fallback normal window |Inline combined |P/D |
 | PK-01 |Single keyboard target |DOM activeElement |One logical target/editor |One GTK focus |C/P,[input](interactions/input-lifecycle.md#input-keyboard) |
-| PK-02 |Hover vs key color |Hover14%,fixedblue |Hover14%,systemaccent |Hover6%,systemtheme |D,[D-03](discrepancies.md#d-03) |
+| PK-02 |Hover vs key color |Title glass hover+outline focus |Glass hover+theme outline focus |Theme hover/focus |D,[D-03](discrepancies.md#d-03) |
 | PK-03 |Up/Down ends |Clamp |Clamp |Wrap |D |
 | PK-04 |Horizontal answer cycle |Absent |Same-y enabled controls |Horizontal box siblings |M/P |
 | PK-05 |Title Left/Right disclosure |Yes |Yes |Yes |C |
 | PK-06 |Preset Space |Browser radio |Explicit multi-preset select |Native toolkit |C/P |
-| PK-07 |Title Space |Simulated open |Filter space |Native button activation |D |
-| PK-08 |Type filter/AND words |Absent |Yes |Yes+IME |M |
-| PK-09 |Filter highlight |Absent |Merged UTF16 text emphasis |Underline |M/P |
-| PK-10 |Focus-on-open/reveal answer |Absent |Yes |Yes |M |
+| PK-07 |Title Space |Filter space |Filter space |Native button activation |D |
+| PK-08 |Type filter/AND words |Yes; no IME filter input |Yes |Yes+IME |C/P |
+| PK-09 |Filter highlight |Merged mark spans |Merged UTF16 text emphasis |Underline |C/P |
+| PK-10 |Focus-on-open/reveal answer |First title; no reveal-answer route |Yes |Yes |M/P |
 | PK-11 |Resolve clears key focus |Blur within form |Removed control clears |Removed card clears |C/P |
 | PK-12 |Caret blink |Browser |Tracking-time custom fallback |GTK entry |P |
 | PK-13 |Reduced motion |CSS transitions and working robot off |Menu-bar eyes and working robot off |Reveal and working robot off (panel eye pref separate) |D,[D-13](discrepancies.md#d-13) |
@@ -102,18 +106,18 @@
 
 | ID | Behavior | H | M | G | Class / evidence |
 |---|---|---|---|---|---|
-| PX-01 |Settings shell |Tiny overlay |4native toolbar panes460 |4GTK toolbar panes560 |M/P,[settings](components/settings.md) |
-| PX-02 |Login |Local checked only |SMAppService |XDG autostart |M/P |
-| PX-03 |Animation setting |Local checked only |Persisted |Persisted |M |
-| PX-04 |Global shortcut |Absent |Carbon/native menu |GNOME extension |M/P |
-| PX-05 |Application catalog |Absent |Learned switches/empty hint |Learned switches/no empty hint |M/P |
-| PX-06 |Integrations |Absent |Automatic install+retry |Startup check/manual install |M/D,[D-14](discrepancies.md#d-14) |
-| PX-07 |Telegram setup/connected |Absent |Same actor+native pane |Same actor+GTK pane |M/P |
-| PX-08 |BotFather/newbot |Absent |Prefilled command attempt |BotFather link only |M/P |
-| PX-09 |Username suggestion |Absent |Foundation transliteration,readonly |GLib transliteration,editable |M/P |
-| PX-10 |Setup Cancel |Absent |InitialDisconnect/replacementCancel |AlwaysCancelSetup |D,[D-15](discrepancies.md#d-15) |
-| PX-11 |Replacement preserves old |Absent |Yes |Yes shared worker |C/M |
-| PX-12 |Token store |Absent |Keychain |Secret Service |P/M |
+| PX-01 |Settings shell |Five in-popup panes (fixtures)|5inline native panes460 |4GTK toolbar panes560 |H/M inline, G separate; P,[settings](components/settings.md) |
+| PX-02 |Login |Mock switch only|SMAppService |XDG autostart |M/P |
+| PX-03 |Animation setting |Mock host animation flag|Persisted |Persisted |M |
+| PX-04 |Global shortcut |Mock recorder; no OS registration|Carbon/native menu |GNOME extension |M/P |
+| PX-05 |Application catalog |Fixture catalog; switches filter sessions|Learned switches/empty hint |Learned switches/no empty hint |M/P |
+| PX-06 |Agents |Mock installed rows and setup feedback|Automatic install+retry |Startup check/manual install |M/D,[D-14](discrepancies.md#d-14) |
+| PX-07 |Telegram setup/connected |Mock connected/setup screens|Same actor+native pane |Same actor+GTK pane |M/P |
+| PX-08 |BotFather/newbot |Simulated feedback only|Prefilled command attempt |BotFather link only |M/P |
+| PX-09 |Username suggestion |Editable demo name + regenerate|Foundation transliteration,readonly |GLib transliteration,editable |M/P |
+| PX-10 |Setup Cancel |Mock initial→General/replacement→connected|InitialDisconnect/replacementCancel |AlwaysCancelSetup |D,[D-15](discrepancies.md#d-15) |
+| PX-11 |Replacement preserves old |Yes, in mock state|Yes |Yes shared worker |C/M |
+| PX-12 |Token store |No token persistence|Keychain |Secret Service |P/M |
 | PX-13 |Notification action plan |Absent |4budget + More/text reply |4per actions/choices + Open, no text |P/M/D,[notifications](interactions/notifications.md) |
 | PX-14 |Notification filtering |Absent |All approvals |Visible/unexpired only |D |
 | PX-15 |Notification changed context |Absent |Rebind category/retry |New token,no retry |P/D |
@@ -125,3 +129,29 @@
 | TG-IMAGES |Codex embedded images |No backend media fixture |History placeholder; no native preview |History placeholder; no native preview |Telegram sends media from monitor state; [TG-IMAGE-01–03](interactions/telegram.md#tg-images); H/M/G native preview missing |
 
 External-channel cells are M because H has no implementation, not because desktop OS notifications should be emulated in a sandboxed prototype. The shared Rust Telegram channel is identical logic on M/G except host collation, credentials and native setup; duplication in the matrix intentionally makes its absence in H explicit.
+
+## Glass revision parity (2026-11-07)
+
+| Behavior | HTML | macOS | GNOME | Classification |
+|---|---|---|---|---|
+| Continuous document mesh and scrolling wave | SVG/CSS scene | Shared-source texture and AppKit wave, scrolling scene slices | Neutral theme surface | H/M consistent intent; G missing revision |
+| Scrolling brand header/version/utilities | Present; simulated pause | Present; real Settings/Quit | Earlier native structure | Platform actions differ; G missing visual revision |
+| Unboxed application headings | Icon/name | Icon/name | Earlier baseline | See glass geometry ledger |
+| Warm/violet request cards and secondary glass actions | Present | Native gradient drawing | Neutral cards/native actions | G missing visual revision |
+| Two-line command/caption disclosure | Measured overflow; click; excluded from Tab | Measured overflow; click; excluded from custom keyboard flow | Existing measured command disclosure | Consistent observable collapse; font metrics differ |
+| Native input editing/focus | Browser inputs | Native field editor over rounded surface; theme outline | GTK inputs/theme focus | Platform-native editing and accent |
+| Fading thread gradient with marker exclusions | Present | Present | Earlier neutral thread | G missing revision |
+| Continuous40px quota capsule/8px track | Fixed example85% | Actual reported windows,40pt panels/8pt tracks | Usage text | H/M visual adoption; backend fixture versus real data; G missing |
+| Outer gradient window rim | Custom CSS | OS-owned NSMenu rim/shadow | GTK/Cairo frame | Native shell difference; exact parity not claimed |
+
+Acceptance and source references: [glass surfaces](components/glass-surfaces.md). Native offscreen rendering is verified in both appearances; OS-owned frame/tracking, accessibility overrides and GNOME runtime remain separate checks.
+
+## HTML prototype component (2026-11-08)
+
+The H column uses the `src/web` component through a mock host. M remains AppKit and G remains GTK; neither application frontend embeds this HTML. The prototype implements single-question presets, disabled/in-flight states, secret inputs, direct finished acknowledgement, queued history loading and snapshot reconciliation. These are renderer branches with fixture-driven outcomes, not production transport evidence. See the [HTML supplement](platforms/html.md) for the host boundary and verification limits.
+
+### Activity model synchronization
+
+HTML, AppKit, GTK and human-channel consumers now project latest output/current action/oldest pending request from typed session activities. The prototype owns synthetic activity fixtures; native sources use provider identities and UTC times. AppKit rendering and shared behavior have automated macOS checks. GTK field migration is source-verified here; Linux compilation/desktop interaction requires separate verification. See [content state](state-models.md#state-content-timeline) and [adapter/retention contract](../session-activities.md).
+
+Web access revision: M adds a fifth settings pane with server switch, address selection and single-use pairing QR; G supports the same server through CLI but has no management pane. H preview now has five mock settings panes, including Web enable/disable, remote connection, inline addresses and a renewing QR countdown; the production HTTP host uses real snapshots and hides mock settings. See [Web access](../web-access.md) for tested transport behavior and remaining physical-device/GNOME checks.

@@ -1,5 +1,7 @@
 # Coverage, traceability and verification report
 
+The [2026-11-07 glass revision](components/glass-surfaces.md#glass-validation) was source-inspected and compiled on macOS. The offscreen WebKit prototype was visually inspected. The rebuilt native process and visible monitor window were observed, but native window capture failed. Tests (241 unit,4 integration,AppKit settings harness) and Clippy pass; they do not validate rendered native pixels. Aqua/Dark Aqua visual parity, accessibility appearance overrides and GNOME adoption remain unverified.
+
 <a id="coverage-method"></a>
 ## Method and evidence boundary
 
@@ -72,7 +74,7 @@ The table references behavioral source paths/symbols, not a line-by-line audit c
 
 **Verified structurally:** surfaces,controls,render branches,explicit handlers,tokens,snapshot transitions,validation,persistence keys and conditional copy listed in components. **Present but only statically verified:** AppKit/GTK native keyboard routing,caret/hover,window pinning/animation,OS callbacks,Secret Service/Keychain and Telegram HTTP effects. **Unknown runtime:** OS/menu focus transfer,real notification layout/icon caches/DND,VoiceOver/Orca,IME/full keyboard access,font/contrast scaling,actual Wayland panel anchoring under resize and version-specific agent/terminal behavior.
 
-**Absent in source inspected:** H real backend/discovery/single-question branch/notification/Telegram/full settings/typed session filter; G exact terminal tab selection/AppKit-like menu traversal/native notification text entry; universal accessibility semantics; complete reduced-motion policy; generic multi-select questions; native show-metadata preference; Telegram completion acknowledgment; unified changed same-ID Telegram request refresh. These are not merely “unverified,” and no contract silently supplies them.
+**Absent in source inspected:** H fixture-host discovery/notification/Telegram/full settings; G exact terminal tab selection/AppKit-like menu traversal/native notification text entry; universal accessibility semantics; complete reduced-motion policy; generic multi-select questions; native show-metadata preference; Telegram completion acknowledgment; unified changed same-ID Telegram request refresh. These are not merely “unverified,” and no contract silently supplies them.
 
 Potentially misleading existing prose: architecture model includes fields/identities richer than actual domain and retains historical Codex-hook discussion; integrations says notification body opens editor while current active binding default opens menu; Ubuntu says shared392width but actual GTK outer frame408 for margins; README calls broad automatic setup although G initial check is read-only. New specification records actual paths and [decisions](discrepancies.md), not literal inheritance.
 
@@ -89,3 +91,9 @@ Potentially misleading existing prose: architecture model includes fields/identi
 2026-11-03 implementation update: H/M/G now use scrolling application icon/name/separator headings and title-hover/focus destination hints (right arrow then app icon). Removed the old shared sticky-position helper and obsolete GTK pinned-artwork overlay. AppKit compilation/tests/Clippy are run locally; GTK runtime visual parity remains unverified on this macOS host.
 
 2026-11-03 motion/status revision: H/M/G robots now retain fixed size and animate only their eyes; working status is a stationary green disc with a small solid play triangle. The superseded breathing sampler and spinning status drawing/frame updates were removed. Shared eye-cycle tests cover brightness bounds, periodicity and reduced-motion behavior.
+
+2026-11-07 glass migration: the actual AppKit renderer now has an offscreen main-thread harness (`tests/visual_frontend.rs`, `src/macos/menu_visual_test.rs`). Aqua/Dark Aqua fixtures cover scene scrolling, command disclosure/collapse and target exclusion, questions, native field editor, working gradient thread and quota surfaces. This provides native rendered evidence without capturing user data; OS-owned menu outline/tracking and accessibility overrides remain outside this harness. See [glass acceptance](components/glass-surfaces.md#glass-validation).
+
+2026-11-08 prototype update: title type-to-filter, multiword matching, highlights, focus relocation, footer query and empty-group/empty-result rendering were exercised in hidden WebKit. Native Escape closes its menu; the persistent prototype clears the query. See [HTML keyboard/filter revision](platforms/html.md#prototype-keyboard-and-filtering-revision-2026-11-08).
+
+2026-11-08 prototype extraction: `src/web` owns the prototype document/styles/interactions; the design page supplies mock data and the fake panel. It has no resident bridge, native WebView host or application entry point. Hidden WebKit is used only as a development test tool for local preview rendering. AppKit and GTK remain production frontends. See [HTML supplement](platforms/html.md).

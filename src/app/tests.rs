@@ -14,13 +14,13 @@ fn title_uses_exact_session_and_renamed_title() {
     let db = Connection::open(home.path().join("state_5.sqlite")).unwrap();
     db.execute_batch(
         "CREATE TABLE threads (id TEXT, name TEXT, title TEXT);
-        INSERT INTO threads VALUES ('one', 'Новое название', 'Первый запрос');
-        INSERT INTO threads VALUES ('two', 'Чужой чат', 'Другой запрос');",
+        INSERT INTO threads VALUES ('one', 'New title', 'First request');
+        INSERT INTO threads VALUES ('two', 'Other chat', 'Other request');",
     )
     .unwrap();
     assert_eq!(
         core::chat_title(&json!({"session_id":"one"}), home.path()),
-        "Новое название"
+        "New title"
     );
     assert_eq!(
         core::chat_title(&json!({"session_id":"unknown"}), home.path()),
@@ -39,13 +39,13 @@ fn title_supports_old_schema_missing_names_and_corrupt_databases() {
     fs::write(home.path().join("state_6.sqlite"), "corrupt").unwrap();
     let db = Connection::open(home.path().join("state_5.sqlite")).unwrap();
     db.execute_batch(
-        "CREATE TABLE threads (id TEXT, title TEXT); INSERT INTO threads VALUES ('one', '  Название
-        чата  ');",
+        "CREATE TABLE threads (id TEXT, title TEXT); INSERT INTO threads VALUES ('one', '  Chat
+        title  ');",
     )
     .unwrap();
     assert_eq!(
         core::chat_title(&json!({"session_id":"one"}), home.path()),
-        "Название чата"
+        "Chat title"
     );
 }
 
@@ -67,7 +67,7 @@ fn title_prefers_newest_database_version_not_lexicographic_order() {
 
 #[test]
 fn unicode_text_is_shortened_on_word_boundaries() {
-    let text = "Длинная причина ".repeat(30);
+    let text = "Long reason 🌍 ".repeat(30);
     let short = core::shorten(&text, 100);
     assert!(short.chars().count() <= 100);
     assert!(short.ends_with('…'));

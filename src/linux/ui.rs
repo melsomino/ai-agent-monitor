@@ -413,7 +413,7 @@ impl Desktop {
                 self.rows
                     .borrow()
                     .get(*key)
-                    .is_some_and(|row| row.session.borrow().approval.is_some())
+                    .is_some_and(|row| row.session.borrow().approval().is_some())
             })
             .cloned();
         if let Some(key) = request {
@@ -967,7 +967,7 @@ impl Row {
                     }
                 }
             }
-            if row.session.borrow().approval.is_some() {
+            if row.session.borrow().approval().is_some() {
                 if let Some((_, y)) = row.card_slot.translate_coordinates(&row.root, 0, 0) {
                     let y = y as f64 + 20.0;
                     line_to(last, y - 8.0);
@@ -1100,7 +1100,7 @@ impl Row {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        messages.push(session.last_message.clone());
+        messages.push(session.last_message().to_owned());
         let token = format!("{:?}:{}", messages, style::dark(&ui.window));
         if *self.messages_token.borrow() != token {
             self.messages_token.replace(token);
@@ -1198,7 +1198,7 @@ impl Row {
                 self.messages.pack_start(&event, false, false, 0);
             }
         }
-        let request_token = format!("{:?}:{:?}", session.approval, session.interaction_data);
+        let request_token = format!("{:?}:{:?}", session.approval(), session.interaction());
         if *self.card_token.borrow() != request_token {
             self.card_token.replace(request_token);
             ui.clear_focus_inside(&self.card_slot.clone().upcast());
@@ -1206,7 +1206,7 @@ impl Row {
             for c in self.card_slot.children() {
                 self.card_slot.remove(&c);
             }
-            if session.approval.is_some() {
+            if session.approval().is_some() {
                 let card = requests::Card::new(session, &ui.handle);
                 self.card_slot.pack_start(&card.widget, false, false, 0);
                 self.card.replace(Some(card));
@@ -1216,20 +1216,24 @@ impl Row {
             .approval_key()
             .and_then(|key| state.submissions.get(&key));
         if let Some(card) = self.card.borrow().as_ref() {
+            let interaction = session.interaction();
+            let navigation_only =
+                interaction.actions.is_empty() && interaction.questions.is_empty();
             card.widget.set_sensitive(
-                session.authoritative
-                    && session
-                        .approval
-                        .as_ref()
-                        .is_none_or(|a| a.expires > monitor::now())
-                    && !matches!(
-                        submission,
-                        Some(monitor::Submission::Sending | monitor::Submission::Reconciling)
-                    ),
+                navigation_only
+                    || (session.authoritative()
+                        && session
+                            .approval()
+                            .as_ref()
+                            .is_none_or(|a| a.expires > monitor::now())
+                        && !matches!(
+                            submission,
+                            Some(monitor::Submission::Sending | monitor::Submission::Reconciling)
+                        ),),
             );
         }
         let feedback = if session
-            .approval
+            .approval()
             .as_ref()
             .is_some_and(|a| a.expires <= monitor::now())
         {
@@ -1286,7 +1290,31 @@ mod tests {
         session::{Approval, Client},
     };
     fn session(id: &str, title: &str, client: Client, activity: Activity) -> Session {
-        Session{agent:"codex",id:id.into(),title:title.into(),cwd:"/tmp/native-monitor".into(),workspace:None,git_branch:Some("ubuntu".into()),model:None,model_display_name:None,reasoning_effort:None,updated_at:1,client,activity,last_message:"## Native Rust interface\n\nThe **session** is ready. [Documentation](https://example.com)".into(),images:vec![],interaction_data:Interaction::default(),target:Some("vscode://file/tmp/native-monitor".into()),authoritative:true,approval:None}
+        {
+            let mut __session = Session {
+                agent: "codex",
+                id: id.into(),
+                title: title.into(),
+                cwd: "/tmp/native-monitor".into(),
+                workspace: None,
+                git_branch: Some("ubuntu".into()),
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 1,
+                client,
+                activity,
+                target: Some("vscode://file/tmp/native-monitor".into()),
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot("## Native Rust interface\n\nThe **session** is ready. [Documentation](https://example.com)".into(), vec![], None, None, Interaction::default());
+            __session
+        }
     }
     fn drain() {
         let until = std::time::Instant::now() + Duration::from_millis(350);
@@ -1319,13 +1347,13 @@ mod tests {
             Client::Terminal,
             Activity::Confirmation,
         );
-        request.approval = Some(Approval {
+        request.set_approval(Some(Approval {
             id: "request-one".into(),
             body: "Choose the test scope".into(),
             expires: u64::MAX,
             can_allow: false,
-        });
-        request.interaction_data = Interaction {
+        }));
+        request.set_interaction(Interaction {
             command: Some("cargo test --locked --workspace\necho next\necho more".into()),
             actions: vec![],
             questions: vec![Question {
@@ -1338,7 +1366,7 @@ mod tests {
                 freeform: true,
                 secret: false,
             }],
-        };
+        });
         let mut state = monitor::State::default();
         state.sessions = vec![
             request.clone(),
@@ -1527,7 +1555,7 @@ mod tests {
             }
         }
         let (snapshot, response) = submitted.expect("single-question preset submits directly");
-        assert_eq!(snapshot.approval, request.approval);
+        assert_eq!(snapshot.approval(), request.approval());
         assert!(
             matches!(response,crate::domain::interaction::Response::Answers(a) if a["scope"]==vec!["Full suite"])
         );
@@ -1555,8 +1583,8 @@ mod tests {
             }
         }
         let mut multi = request.clone();
-        multi.interaction_data.command = None;
-        multi.interaction_data.questions = vec![
+        multi.interaction_mut().command = None;
+        multi.interaction_mut().questions = vec![
             Question {
                 id: "interface".into(),
                 title: "Which interface should we refine next?".into(),
@@ -1590,7 +1618,7 @@ mod tests {
                 secret: false,
             },
         ];
-        multi.approval.as_mut().unwrap().body = multi.interaction_data.questions[0].title.clone();
+        multi.approval_mut().unwrap().body = multi.interaction().questions[0].title.clone();
         let card = requests::Card::new(&multi, &ui.handle);
         let preview = gtk::Window::new(gtk::WindowType::Toplevel);
         style::class(&preview, "monitor");
@@ -1655,7 +1683,7 @@ mod tests {
                     session,
                     response: crate::domain::interaction::Response::Answers(answers),
                 } => {
-                    assert_eq!(session.interaction_data, multi.interaction_data);
+                    assert_eq!(session.interaction(), multi.interaction());
                     Some(answers)
                 }
                 _ => None,

@@ -23,7 +23,7 @@ Sources: [M menu](../../../src/macos/menu.rs) `show`, `will_open`, `resize_conte
 | Click outside/switch app |OS NSMenu tracking |Focus-out delayed100ms; hide unless popup or settings active |No dismissal |
 | Show desktop |OS native behavior, runtime-dependent |Compositor focus-out behavior; not explicitly handled |N/A |
 | Open host title |Dismiss then command open |Command open; hide after successful activation/launch, error keeps window |Update version text only |
-| Settings |Dismiss then floating settings window |Open settings; active settings exempts focus-out hide |Toggle internal overlay |
+| Settings |Replace content inside existing status menu |Open settings; active settings exempts focus-out hide |In-popup settings screen |
 | Power |Shutdown monitor |gtk main quit then monitor shutdown |Toggle demo pause, no sessions stopped |
 
 **LC-02 (S):** Closing alone MUST NOT approve/deny or acknowledge completion. M clears keyboard focus, filter, disclosures, reveal/command expansion, local history and scroll-to-top; stops editing and timers. Active question-panel cache not explicitly emptied, so draft retention differs from documented “clear drafts” intent. G clears query/disclosure/focus and removes request cards/drafts, but shared Window history remains and scroll adjustment is not explicitly reset. H saved expansion uses widget state; no close lifecycle.

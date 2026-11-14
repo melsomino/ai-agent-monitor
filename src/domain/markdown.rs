@@ -12,6 +12,25 @@ pub(crate) struct Style {
     pub depth: usize,
     pub quote: bool,
     pub link: Option<String>,
+    pub table: Option<TableCell>,
+    pub table_cell_end: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TableCell {
+    pub table: usize,
+    pub row: usize,
+    pub column: usize,
+    pub columns: usize,
+    pub alignment: pulldown_cmark::Alignment,
+    pub header: bool,
+}
+struct TableState {
+    id: usize,
+    row: usize,
+    column: usize,
+    alignments: Vec<pulldown_cmark::Alignment>,
+    header: bool,
 }
 
 #[derive(Debug)]
@@ -44,9 +63,11 @@ pub(crate) fn parse(source: &str) -> Vec<Run> {
     let mut style = Style::default();
     let mut stack = Vec::new();
     let mut lists: Vec<Option<u64>> = Vec::new();
+    let mut table: Option<TableState> = None;
+    let mut table_id = 0;
     for event in Parser::new_ext(
         source.trim_end(),
-        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES,
     ) {
         match event {
             Event::Start(tag) => {
@@ -56,6 +77,30 @@ pub(crate) fn parse(source: &str) -> Vec<Run> {
                         newline(&mut runs, 2, &style);
                         style.heading = level as u8;
                         style.bold = true;
+                    }
+                    Tag::Table(alignments) => {
+                        newline(&mut runs, 2, &style);
+                        table_id += 1;
+                        table = Some(TableState {
+                            id: table_id,
+                            row: 0,
+                            column: 0,
+                            alignments,
+                            header: true,
+                        });
+                    }
+                    Tag::TableCell => {
+                        if let Some(table) = &table {
+                            style.table = Some(TableCell {
+                                table: table.id,
+                                row: table.row,
+                                column: table.column,
+                                columns: table.alignments.len(),
+                                alignment: table.alignments[table.column],
+                                header: table.header,
+                            });
+                            style.bold |= table.header;
+                        }
                     }
                     Tag::Paragraph => {}
                     Tag::Strong => style.bold = true,
@@ -109,6 +154,33 @@ pub(crate) fn parse(source: &str) -> Vec<Run> {
             }
             Event::End(tag) => {
                 match tag {
+                    TagEnd::TableCell => {
+                        if let Some(table) = &mut table {
+                            let mut separator = style.clone();
+                            separator.table_cell_end = true;
+                            push(
+                                &mut runs,
+                                if table.column + 1 == table.alignments.len() {
+                                    "\n"
+                                } else {
+                                    "  │  "
+                                },
+                                &separator,
+                            );
+                            table.column += 1;
+                        }
+                    }
+                    TagEnd::TableHead | TagEnd::TableRow => {
+                        if let Some(table) = &mut table {
+                            table.row += 1;
+                            table.column = 0;
+                            table.header = false;
+                        }
+                    }
+                    TagEnd::Table => {
+                        table = None;
+                        newline(&mut runs, 2, &Style::default());
+                    }
                     TagEnd::Heading(_) | TagEnd::CodeBlock => newline(&mut runs, 2, &style),
                     TagEnd::Paragraph => {
                         newline(&mut runs, if lists.is_empty() { 2 } else { 1 }, &style)
@@ -142,6 +214,9 @@ pub(crate) fn parse(source: &str) -> Vec<Run> {
         }
     }
     while let Some(last) = runs.last_mut() {
+        if last.style.table_cell_end {
+            break;
+        }
         last.text.truncate(last.text.trim_end().len());
         if !last.text.is_empty() {
             break;
@@ -161,14 +236,14 @@ mod tests {
     #[test]
     fn nested_styles_unicode_and_literal_code() {
         let runs =
-            parse("## Итог 🤖\n\n**жирный и *курсив*** `a ** b`\n\n```rust\nlet x = 1;\n```\n");
+            parse("## Summary 🤖\n\n**bold and *italic*** `a ** b`\n\n```rust\nlet x = 1;\n```\n");
         assert_eq!(
             plain(&runs),
-            "Итог 🤖\n\nжирный и курсив a ** b\n\nlet x = 1;"
+            "Summary 🤖\n\nbold and italic a ** b\n\nlet x = 1;"
         );
         assert!(
             runs.iter()
-                .any(|r| r.text == "курсив" && r.style.bold && r.style.italic)
+                .any(|r| r.text == "italic" && r.style.bold && r.style.italic)
         );
         assert!(runs.iter().any(|r| r.text == "a ** b" && r.style.code));
         assert_eq!(runs[0].style.heading, 2);
@@ -195,5 +270,58 @@ mod tests {
         );
         assert!(plain(&runs).contains("<script>"));
         assert_eq!(plain(&parse("**incomplete")), "**incomplete");
+    }
+    #[test]
+    fn tables_keep_columns_alignment_and_inline_styles() {
+        let runs = parse(
+            "Before\n\n| Process | Memory |\n| :--- | ---: |\n| Dart 8651 | **1.46 GB** |\n| rust-analyzer 8285 | `1.01 GB` |\n\nAfter",
+        );
+        assert_eq!(
+            plain(&runs),
+            "Before\n\nProcess  │  Memory\nDart 8651  │  1.46 GB\nrust-analyzer 8285  │  1.01 GB\n\nAfter"
+        );
+        assert!(runs.iter().any(|r| r.text == "Memory"
+            && r.style.bold
+            && r.style.table.as_ref().is_some_and(|c| c.header
+                && c.row == 0
+                && c.column == 1
+                && c.columns == 2
+                && c.alignment == pulldown_cmark::Alignment::Right)));
+        assert!(runs.iter().any(|r| r.text == "1.46 GB"
+            && r.style.bold
+            && r.style.table.as_ref().is_some_and(|c| c.row == 1)));
+        assert!(runs.iter().any(|r| r.text == "1.01 GB" && r.style.code));
+        assert_eq!(runs.iter().filter(|r| r.style.table_cell_end).count(), 6);
+    }
+    #[test]
+    fn tables_preserve_empty_cells_escaped_pipes_and_separate_table_identity() {
+        let runs = parse(
+            "| A | B |\n| --- | --- |\n| a \\| b | |\n\nBetween\n\n| C | D |\n| --- | --- |\n| x | y |",
+        );
+        assert!(plain(&runs).contains("a | b"));
+        assert!(runs.iter().any(|r| {
+            r.style.table_cell_end
+                && r.style
+                    .table
+                    .as_ref()
+                    .is_some_and(|c| c.table == 1 && c.row == 1 && c.column == 1)
+        }));
+        assert!(runs.iter().any(|r| {
+            r.text == "C"
+                && r.style
+                    .table
+                    .as_ref()
+                    .is_some_and(|c| c.table == 2 && c.row == 0)
+        }));
+        assert!(runs.last().unwrap().style.table_cell_end);
+    }
+    #[test]
+    fn code_and_malformed_pipes_are_not_tables() {
+        for text in [
+            "```text\n| A | B |\n| --- | --- |\n```",
+            "| A | B |\nordinary text",
+        ] {
+            assert!(parse(text).iter().all(|r| r.style.table.is_none()));
+        }
     }
 }

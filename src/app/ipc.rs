@@ -23,6 +23,9 @@ pub type Owner = (u32, String, String);
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    Web {
+        action: crate::web::Control,
+    },
     Sessions,
     ShowWindow,
     Setup,
@@ -206,6 +209,7 @@ pub fn start(
     listener.set_nonblocking(true)?;
     let _entered = runtime.enter();
     let listener = tokio::net::UnixListener::from_std(listener)?;
+    let web = std::sync::Arc::new(crate::web::Controller::new(handle.clone()));
     Ok(runtime.spawn(async move {
         let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
         while let Ok((stream, _)) = listener.accept().await {
@@ -213,14 +217,19 @@ pub fn start(
                 continue;
             };
             let handle = handle.clone();
+            let web = web.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = serve(stream, handle).await;
+                let _ = serve(stream, handle, web).await;
             });
         }
     }))
 }
-async fn serve(mut stream: tokio::net::UnixStream, monitor: monitor::Handle) -> Result<()> {
+async fn serve(
+    mut stream: tokio::net::UnixStream,
+    monitor: monitor::Handle,
+    web: std::sync::Arc<crate::web::Controller>,
+) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     trusted_fd(stream.as_raw_fd())?;
     let request = tokio::time::timeout(Duration::from_secs(3), async {
@@ -232,7 +241,10 @@ async fn serve(mut stream: tokio::net::UnixStream, monitor: monitor::Handle) -> 
     })
     .await??;
     let mut hook = None;
-    let result = handle_request(request, &monitor, &mut stream, &mut hook).await;
+    let result = match request {
+        Request::Web { action } => web.control(action).await,
+        request => handle_request(request, &monitor, &mut stream, &mut hook).await,
+    };
     let reply = match result {
         Ok(value) => Reply {
             result: Some(value),
@@ -318,6 +330,7 @@ async fn handle_request(
 ) -> Result<Value> {
     use serde_json::json;
     match request {
+        Request::Web { .. } => unreachable!("web management is handled by the IPC owner"),
         Request::ShowWindow => {
             monitor
                 .enqueue(monitor::Command::ShowWindow)
@@ -329,7 +342,7 @@ async fn handle_request(
             let state = monitor.snapshot();
             let telegram = crate::actors::human::telegram::diagnostics(&state.telegram);
             Ok(
-                json!({"monitor":{"pid":std::process::id(),"version":core::VERSION},"telegram":telegram,"sessions":state.sessions.iter().map(|s|json!({"agent":s.agent,"id":s.id,"title":s.title,"cwd":s.cwd,"workspace":s.workspace,"gitBranch":s.git_branch,"model":s.model,"modelDisplayName":s.model_display_name,"reasoningEffort":s.reasoning_effort,"modelLabel":s.model_label(),"client":s.client.label(),"status":s.activity.label(),"lastMessage":s.last_message,"updatedAt":s.updated_at,"approval":s.approval.as_ref().map(|a|json!({"id":a.id,"body":a.body,"expiresAt":a.expires,"canAllow":a.can_allow}))})).collect::<Vec<_>>()}),
+                json!({"monitor":{"pid":std::process::id(),"version":core::VERSION},"telegram":telegram,"sessions":state.sessions.iter().map(|s|json!({"agent":s.agent,"id":s.id,"title":s.title,"cwd":s.cwd,"workspace":s.workspace,"gitBranch":s.git_branch,"model":s.model,"modelDisplayName":s.model_display_name,"reasoningEffort":s.reasoning_effort,"modelLabel":s.model_label(),"client":s.client.label(),"status":s.activity.label(),"activities":s.activities.iter().map(activity_json).collect::<Vec<_>>(),"connection":{"live":s.authoritative(),"canSendMessage":s.can_send_message()},"progress":s.progress(),"workCaption":s.work_caption(),"lastMessage":s.last_message(),"updatedAt":s.updated_at,"approval":s.approval().map(|a|json!({"id":a.id,"body":a.body,"expiresAt":a.expires,"canAllow":a.can_allow}))})).collect::<Vec<_>>()}),
             )
         }
         Request::Test {
@@ -473,6 +486,26 @@ async fn handle_request(
             }
         }
     }
+}
+
+fn activity_json(activity: &crate::domain::session_activity::SessionActivity) -> Value {
+    use crate::domain::session_activity::SessionActivity;
+    use serde_json::json;
+    let mut value = match activity {
+        SessionActivity::Message(m) => {
+            json!({"type":"message","role":match m.role {crate::domain::session_activity::MessageRole::Agent=>"agent",crate::domain::session_activity::MessageRole::User=>"user"},"text":m.text,"images":m.images.iter().map(|i|json!({"id":i.id,"mime":i.mime,"bytes":i.data.len()})).collect::<Vec<_>>()})
+        }
+        SessionActivity::Action(a) => {
+            json!({"type":"action","kind":format!("{:?}",a.kind).to_lowercase(),"text":a.text,"status":format!("{:?}",a.status).to_lowercase(),"current":a.current})
+        }
+        SessionActivity::Request(r) => {
+            json!({"type":"request","status":format!("{:?}",r.status).to_lowercase(),"approval":{"id":r.approval.id,"body":r.approval.body,"expiresAt":r.approval.expires,"canAllow":r.approval.can_allow},"interaction":r.interaction})
+        }
+    };
+    value["id"] = json!(activity.id());
+    value["startedAt"] = json!(activity.started_at());
+    value["updatedAt"] = json!(activity.updated_at());
+    value
 }
 
 #[cfg(test)]

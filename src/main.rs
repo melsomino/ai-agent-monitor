@@ -8,6 +8,8 @@ mod linux;
 mod macos;
 mod platform;
 mod robot_motion;
+#[path = "web/server/mod.rs"]
+mod web;
 
 use app::{cli, core, tools};
 #[cfg(target_os = "macos")]
@@ -83,6 +85,15 @@ fn run(command: Option<Command>) -> Result<()> {
                     "no approval"
                 }
             );
+        }
+        Some(Command::Web { action }) => {
+            let result = app::ipc::request(&app::ipc::Request::Web { action })?;
+            if let Some(qr) = result["qr"].as_str() {
+                println!("{qr}");
+            }
+            let mut result = result;
+            result.as_object_mut().unwrap().remove("qr");
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Some(Command::Bundle) => tools::bundle()?,
         Some(Command::Dmg) => tools::dmg()?,

@@ -21,8 +21,8 @@ impl Agent {
     }
     pub fn next_step(self) -> &'static str {
         match self {
-            Self::Codex => "Direct local connection; no hooks required.",
-            Self::Claude => "Restart Claude Code to load the hooks.",
+            Self::Codex => "Direct local connection.",
+            Self::Claude => "Restart Claude Code to activate.",
             Self::Cline => {
                 "Turn on Enable Hooks in Cline, then reopen or resume a task. Approvals stay in Cline."
             }

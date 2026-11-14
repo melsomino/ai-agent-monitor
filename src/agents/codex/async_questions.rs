@@ -2,12 +2,23 @@
 use serde_json::{Value, json};
 
 pub const METHOD: &str = "agent-monitor/asyncUserInput";
+fn input(value: &Value) -> Value {
+    Value::Array(value.as_array().into_iter().flatten().map(part).collect())
+}
+fn part(value: &Value) -> Value {
+    // Keep positions for patches, but never retain image URLs/base64 payloads.
+    json!({"type": value["type"], "text": value["text"]})
+}
 fn item(value: &Value) -> Value {
     let mut result = json!({"type":value["type"],"id":value["id"],"questions":value["questions"]});
+    result
+        .as_object_mut()
+        .unwrap()
+        .extend(super::progress::fields(value));
     if value["type"] == "userMessage" {
-        result["content"] = value["content"].clone();
+        result["content"] = input(&value["content"]);
     } else if value["type"] == "steeringUserMessage" {
-        result["input"] = value["input"].clone();
+        result["input"] = input(&value["input"]);
         result["status"] = value["status"].clone();
     }
     result
@@ -72,11 +83,26 @@ pub fn project_patch(path: &[Value], value: &Value) -> Option<Value> {
         [field] if field == "turnId" || field == "turnStartedAtMs" => Some(value.clone()),
         [field] if field == "items" => Some(items(value)),
         [field, _] if field == "items" => Some(item(value)),
+        [field, _, attribute]
+            if field == "items" && (attribute == "content" || attribute == "input") =>
+        {
+            Some(input(value))
+        }
+        [field, _, attribute, _]
+            if field == "items" && (attribute == "content" || attribute == "input") =>
+        {
+            Some(part(value))
+        }
+        [field, _, attribute, _, leaf, ..]
+            if field == "items" && (attribute == "content" || attribute == "input") =>
+        {
+            matches!(leaf.as_str(), Some("type" | "text")).then(|| value.clone())
+        }
         [field, _, attribute, ..]
             if field == "items"
                 && matches!(
                     attribute.as_str(),
-                    Some("type" | "id" | "questions" | "content" | "input" | "status")
+                    Some("type" | "id" | "questions" | "status" | "command" | "tool" | "summary")
                 ) =>
         {
             Some(value.clone())
@@ -345,11 +371,11 @@ mod tests {
             .unwrap()
             .to_owned();
         let response = crate::agents::interaction::Response::Answers(
-            std::collections::BTreeMap::from([(id.clone(), vec!["Свой ответ".into()])]),
+            std::collections::BTreeMap::from([(id.clone(), vec!["Custom answer".into()])]),
         );
         let text = reply_text(&remaining, &response).unwrap();
         assert_eq!(reply_ids(&text), Some(vec![id]));
-        assert!(text.contains("Свой ответ"));
+        assert!(text.contains("Custom answer"));
         assert!(super::super::requests::wire_response(&remaining, &response).is_none());
     }
     #[test]

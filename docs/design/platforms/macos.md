@@ -1,15 +1,17 @@
 # macOS AppKit supplement
 
+The [2026-11-07 glass surface revision](../components/glass-surfaces.md) describes the current AppKit monitor layout, gradient drawing and remaining prototype differences. It supersedes older neutral surface colors and monitor geometry in this supplement.
+
 <a id="macos-shell"></a>
 ## Native shell contract (S/P; runtime outcome U where noted)
 
 Resident is an accessory NSApplication, no normal Dock/task-switcher app window for the session popup. NSStatusItem owns an attached NSMenu; menu view is a custom enabled item, autoenable off. Native menu tracking owns opening/dismissal/selected menu-bar background, rather than a manually activated standalone NSPanel. `performClick` opens it; `cancelTracking` dismisses. Native horizontal navigation passes through only when no session target owns Left/Right. Whether other apps' menu extras participate and exactly when selection clears remains an OS-runtime check.
 
-AppKit material is retained; a click-through MenuTintView/PanelView draws windowBackgroundColor at65% alpha over complete popup, with dynamic appearance and top extension. Footer opaque fill covers bottom OS padding. Correct before `viewWillDraw` and frame updates, rather than visible post-open jump. Work-area clamping and max-height described in [lifecycle](../interactions/input-lifecycle.md#life-open); OS corners/shadow not hardcoded to prototype18px.
+AppKit material is retained; a click-through MeshView samples the continuous scrolling scene over the complete popup, with dynamic appearance and matching slices over top/bottom OS padding. Correct before `viewWillDraw` and frame updates, rather than visible post-open jump. Work-area clamping and max-height described in [lifecycle](../interactions/input-lifecycle.md#life-open); OS corners/shadow not hardcoded to prototype18px.
 
 Scroll elasticity remains disabled. Application headings scroll with the document and are repositioned from their first session after disclosure layout changes. Reveal clip is not an inner scroller; outer list routes wheel. Main-thread pointer polling in common run-loop modes handles non-first-responder hover, button clipping and editing focus. Inline input uses field editor plus custom focus/caret decoration because menu tracking may not make its window key. This is not a recommended mechanism for future platforms—only the visible single-focus/editing result is shared.
 
-Sources: [native](../../../src/macos/native.rs) `run`, `MonitorApplication`, `NotificationDelegate`; [menu](../../../src/macos/menu.rs) `build_status_item`, `build_menu`, `PanelView`, `MenuTintView`, `OverlayView`, `close_panel`, `handle_session_key`; [pointer](../../../src/macos/pointer.rs); [hotkey](../../../src/macos/hotkey.rs); [inline fields](../../../src/macos/inline_questions.rs).
+Sources: [native](../../../src/macos/native.rs) `run`, `MonitorApplication`, `NotificationDelegate`; [menu](../../../src/macos/menu.rs) `build_status_item`, `build_menu`, `PanelView`, `sync_backdrop`, `OverlayView`, `close_panel`, `handle_session_key`; [pointer](../../../src/macos/pointer.rs); [hotkey](../../../src/macos/hotkey.rs); [inline fields](../../../src/macos/inline_questions.rs).
 
 <a id="macos-navigation"></a>
 ## Host navigation and permission prompts
@@ -23,9 +25,9 @@ Sources: [terminal](../../../src/macos/terminal.rs) `target`, `retain_live_codex
 <a id="macos-settings-access"></a>
 ## Settings, notifications, accessibility and system controls
 
-Settings normal floating window intentionally activates, stays above ordinary windows and does not hide when menu clicked. General uses native checkboxes; Applications native switches. Shortcut uses Carbon registration while menu closed, native menu key equivalent while open. Launch at login uses SMAppService, can require separate approval in macOS settings.
+Settings is an inline scrollable screen within the existing NSMenu host, with retained native panes, Sessions/Escape return and no separate settings window. See [settings shell](../components/settings.md#settings-shell) for geometry, focus and lifecycle. General uses native checkboxes; Applications native switches. Shortcut uses Carbon registration while menu closed, native menu key equivalent while open. Launch at login uses SMAppService, can require separate approval in macOS settings.
 
-Notifications use UserNotifications with dynamic request categories; OS policy controls actual banner action density. Notification permission asked after onboarding setup; denial note in Integrations. New bundle identity `com.melsomino.ai-agent-monitor` and legacy preference migration exist, but icon cache invalidation is OS-owned and cannot be guaranteed by these source paths.
+Notifications use UserNotifications with dynamic request categories; OS policy controls actual banner action density. Notification permission asked after onboarding setup; denial note in Agents. New bundle identity `com.melsomino.ai-agent-monitor` and legacy preference migration exist, but icon cache invalidation is OS-owned and cannot be guaranteed by these source paths.
 
 Accessibility source evidence: SF Symbol accessibility descriptions, button tooltips/labels, title captions, explicit application switch/shortcut-clear labels, system text controls; decorative hitTest None. There is no complete custom NSAccessibility outline/list/expanded-state implementation in these custom rows. Robot/chevron tooltips update; a generic Session details symbol description is not proof of VoiceOver announcement parity. Tab order, VoiceOver navigation, increased contrast, reduced transparency, full keyboard access, IME composition and high zoom require manual verification. Native system colors do not by themselves prove contrast compliance.
 
@@ -35,4 +37,10 @@ Acceptance supplement: actual side/bottom Dock and offset monitor; popup open wi
 
 Session robot motion follows [SE-ROBOT-01–03](../components/sessions.md#sessions-robot-motion): the existing popup tracking timer invalidates working robot drawings, sampling a controller-owned monotonic epoch. Reduced motion is read from NSWorkspace. Robot artwork and hit/hover geometry stay fixed; only eye brightness changes.
 
-Application headings are click-through 24-point document views with icon/name/separator; the first session reserves26 points above itself. `update_group_headings` uses document coordinates, never viewport pinning. Title destination hints share the title open target and hover/focus lifecycle; hidden hints reserve42 points, protecting status/disclosure controls. See [SE-02/SE-03](../components/sessions.md#sessions-header).
+Application headings are click-through 26-point document views with an unboxed icon/name; the first session reserves26 points above itself. `update_group_headings` uses document coordinates, never viewport pinning. Title destination hints share the title open target and hover/focus lifecycle; hidden hints reserve42 points, protecting status/disclosure controls. See [SE-02/SE-03](../components/sessions.md#sessions-header).
+
+## Visual asset maintenance and renderer verification
+
+[Glass surfaces](../components/glass-surfaces.md#glass-scene) owns current geometry and appearance. Production rendering remains AppKit. `src/macos/visual.rs` draws surfaces, wave, glyphs, progress and thread gradients. `assets/monitor-mesh.png` contains transparent decorative art only, generated from the prototype SVG by `swift scripts/render-monitor-mesh.swift`. WebKit is a development-only asset generator, not a production dependency. Regenerate after changing the prototype mesh geometry/blur.
+
+Run `AAM_VISUAL_PREVIEW_DIR=/tmp/aam-native-visual cargo test --offline --test visual_frontend` to export actual native view-tree PNGs in both appearances. The fixture exercises collapsed/expanded commands, questions, native field editing, working threads, quota, scrolling and all five inline settings tabs, including Web pairing QR, Telegram pane replacement, token editing and keyboard return. It does not start monitor actors or modify preferences. OS window outline, native menu tracking, VoiceOver, IME and increased contrast still require runtime checks.

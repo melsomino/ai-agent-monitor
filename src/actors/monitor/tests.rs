@@ -15,9 +15,9 @@ fn hook_session_preserves_command_for_approval_display() {
         "tool_input": {"command": command}
     });
     let session = hook_session(&content, &event, None, "test");
-    assert_eq!(session.interaction_data.command.as_deref(), Some(command));
+    assert_eq!(session.interaction().command.as_deref(), Some(command));
     let plain = hook_session(&content, &serde_json::json!({}), None, "plain");
-    assert_eq!(plain.interaction_data.command, None);
+    assert_eq!(plain.interaction().command, None);
     let choices = hook_session(
         &content,
         &serde_json::json!({"_test_extended_choices": true, "_test_always_command": "git -C /long/project/path log"}),
@@ -26,7 +26,7 @@ fn hook_session_preserves_command_for_approval_display() {
     );
     assert_eq!(
         choices
-            .interaction_data
+            .interaction()
             .actions
             .iter()
             .map(|a| a.label.as_str())
@@ -34,37 +34,48 @@ fn hook_session_preserves_command_for_approval_display() {
         vec!["Allow once", "Allow always", "Deny"]
     );
     assert_eq!(
-        choices.interaction_data.actions[1].detail,
+        choices.interaction().actions[1].detail,
         "git -C /long/project/path log"
     );
-    assert!(choices.interaction_data.actions[0].detail.is_empty());
+    assert!(choices.interaction().actions[0].detail.is_empty());
 }
 
 fn session(id: &str, request: &str) -> Session {
-    Session {
-        agent: "codex",
-        id: id.into(),
-        title: id.into(),
-        cwd: "/work".into(),
-        workspace: None,
-        git_branch: None,
-        model: None,
-        model_display_name: None,
-        reasoning_effort: None,
-        updated_at: 0,
-        client: Client::VSCode,
-        activity: Activity::Confirmation,
-        last_message: "Last message".into(),
-        images: vec![],
-        interaction_data: Interaction::allow(),
-        target: Some("vscode://file/work".into()),
-        authoritative: true,
-        approval: Some(Approval {
-            id: request.into(),
-            body: "Allow?".into(),
-            expires: u64::MAX,
-            can_allow: true,
-        }),
+    {
+        let mut __session = Session {
+            agent: "codex",
+            id: id.into(),
+            title: id.into(),
+            cwd: "/work".into(),
+            workspace: None,
+            git_branch: None,
+            model: None,
+            model_display_name: None,
+            reasoning_effort: None,
+            updated_at: 0,
+            client: Client::VSCode,
+            activity: Activity::Confirmation,
+            target: Some("vscode://file/work".into()),
+            connection: if true {
+                crate::domain::session::ConnectionState::live(true)
+            } else {
+                Default::default()
+            },
+            activities: Default::default(),
+        };
+        __session.seed_snapshot(
+            "Last message".into(),
+            vec![],
+            None,
+            Some(Approval {
+                id: request.into(),
+                body: "Allow?".into(),
+                expires: u64::MAX,
+                can_allow: true,
+            }),
+            Interaction::allow(),
+        );
+        __session
     }
 }
 struct Harness {
@@ -147,8 +158,8 @@ impl Drop for Harness {
 }
 fn active_session(id: &str, activity: Activity) -> Session {
     let mut value = session(id, "");
-    value.approval = None;
-    value.interaction_data = Interaction::default();
+    value.set_approval(None);
+    value.set_interaction(Interaction::default());
     value.activity = activity;
     value
 }
@@ -260,9 +271,9 @@ async fn unavailable_or_confirmation_sessions_do_not_report_finished() {
         .await;
     h.wait(|state| state.sessions.len() == 1).await;
     let mut idle = active_session("one", Activity::Idle);
-    idle.authoritative = false;
+    idle.set_authoritative(false);
     h.observe(vec![idle]).await;
-    let unavailable = h.wait(|state| !state.sessions[0].authoritative).await;
+    let unavailable = h.wait(|state| !state.sessions[0].authoritative()).await;
     assert!(unavailable.unseen_finished.is_empty());
     h.observe(vec![session("one", "request")]).await;
     h.wait(|state| state.sessions[0].activity == Activity::Confirmation)
@@ -285,13 +296,13 @@ async fn unseen_completion_survives_temporary_connection_loss_without_changing_g
     let generation = finished.unseen_finished["codex:one"];
     for activity in [Activity::Idle, Activity::Unknown, Activity::Working] {
         let mut disconnected = active_session("one", activity);
-        disconnected.authoritative = false;
+        disconnected.set_authoritative(false);
         h.observe(vec![disconnected]).await;
         let state = h.settle().await;
         assert_eq!(state.unseen_finished.get("codex:one"), Some(&generation));
     }
     h.observe(vec![active_session("one", Activity::Idle)]).await;
-    let restored = h.wait(|s| s.sessions[0].authoritative).await;
+    let restored = h.wait(|s| s.sessions[0].authoritative()).await;
     assert_eq!(restored.unseen_finished.get("codex:one"), Some(&generation));
     h.observe(vec![active_session("one", Activity::Working)])
         .await;
@@ -392,7 +403,7 @@ async fn history_requests_after_adapter_stop_publish_errors_for_both_clients() {
         })
         .await
         .unwrap();
-    h.wait(|s| !s.sessions[0].authoritative).await;
+    h.wait(|s| !s.sessions[0].authoritative()).await;
     let keys = [
         HistoryKey::window("codex:one".into()),
         HistoryKey::telegram("codex:one".into()),
@@ -454,7 +465,7 @@ async fn state_subscriptions_include_existing_questions_and_both_humans_see_reso
     h.handle
         .enqueue(Command::Delivery {
             key: s.key(),
-            approval: s.approval.clone().unwrap(),
+            approval: s.approval().cloned().unwrap(),
             delivery: Delivery::Confirmed,
         })
         .await
@@ -462,7 +473,7 @@ async fn state_subscriptions_include_existing_questions_and_both_humans_see_reso
     let state = h.wait(|state| state.pending_count() == 0).await;
     assert_eq!(late.borrow().revision, state.revision);
     assert!(
-        initial.sessions[0].approval.is_some(),
+        initial.sessions[0].approval().is_some(),
         "previous snapshots are immutable"
     );
 }
@@ -496,7 +507,7 @@ async fn invalid_answers_and_expired_or_stale_requests_never_reach_the_adapter()
         .submit(&stale, Response::Action("allow".into()))
         .unwrap();
     let mut expired = session("expired", "request2");
-    expired.approval.as_mut().unwrap().expires = 0;
+    expired.approval_mut().unwrap().expires = 0;
     h.observe(vec![s, expired.clone()]).await;
     h.wait(|s| s.sessions.len() == 2).await;
     h.handle
@@ -518,7 +529,7 @@ async fn uncertain_delivery_does_not_allow_an_automatic_or_duplicate_retry() {
     h.handle
         .enqueue(Command::Delivery {
             key: s.key(),
-            approval: s.approval.clone().unwrap(),
+            approval: s.approval().cloned().unwrap(),
             delivery: Delivery::Uncertain,
         })
         .await
@@ -534,7 +545,7 @@ async fn uncertain_delivery_does_not_allow_an_automatic_or_duplicate_retry() {
     h.wait(|state| state.revision > revision).await;
     assert!(h.agents.try_recv().is_err());
     let mut resolved = s;
-    resolved.approval = None;
+    resolved.set_approval(None);
     h.observe(vec![resolved]).await;
     h.wait(|state| state.pending_count() == 0).await;
 }
@@ -545,12 +556,12 @@ async fn missing_stream_observation_preserves_question_but_blocks_sending() {
     h.observe(vec![s.clone()]).await;
     h.wait(|s| s.pending_count() == 1).await;
     let mut uncertain = s.clone();
-    uncertain.authoritative = false;
-    uncertain.approval = None;
-    uncertain.interaction_data = Interaction::default();
+    uncertain.set_authoritative(false);
+    uncertain.set_approval(None);
+    uncertain.set_interaction(Interaction::default());
     h.observe(vec![uncertain]).await;
-    let state = h.wait(|s| !s.sessions[0].authoritative).await;
-    assert!(state.sessions[0].approval.is_some());
+    let state = h.wait(|s| !s.sessions[0].authoritative()).await;
+    assert!(state.sessions[0].approval().is_some());
     let rev = state.revision;
     h.handle
         .submit(&s, Response::Action("allow".into()))
@@ -595,18 +606,18 @@ async fn late_delivery_cannot_resolve_a_replacement_question() {
     h.wait(|s| s.pending_count() == 1).await;
     let new = session("one", "new");
     h.observe(vec![new.clone()]).await;
-    h.wait(|s| s.sessions[0].approval == new.approval).await;
+    h.wait(|s| s.sessions[0].approval() == new.approval()).await;
     let rev = h.handle.snapshot().revision;
     h.handle
         .enqueue(Command::Delivery {
             key: old.key(),
-            approval: old.approval.unwrap(),
+            approval: old.approval().unwrap().clone(),
             delivery: Delivery::Confirmed,
         })
         .await
         .unwrap();
     let state = h.wait(|s| s.revision > rev).await;
-    assert_eq!(state.sessions[0].approval, new.approval);
+    assert_eq!(state.sessions[0].approval(), new.approval());
 }
 #[tokio::test]
 async fn hooks_are_resolved_through_state_and_disconnect_revokes_the_request() {
@@ -770,7 +781,7 @@ async fn failed_delivery_stays_visible_and_requires_an_explicit_retry() {
     h.handle
         .enqueue(Command::Delivery {
             key: s.key(),
-            approval: s.approval.clone().unwrap(),
+            approval: s.approval().cloned().unwrap(),
             delivery: Delivery::NotSent,
         })
         .await
@@ -812,7 +823,7 @@ async fn stopped_adapter_marks_sessions_and_pending_operations_unavailable() {
         .await
         .unwrap();
     let state = h.wait(|s| s.agent_errors.contains_key("codex")).await;
-    assert!(!state.sessions[0].authoritative);
+    assert!(!state.sessions[0].authoritative());
     assert_eq!(state.sessions[0].activity, Activity::Unknown);
     assert!(matches!(
         state.submissions.get(&key),
@@ -821,7 +832,7 @@ async fn stopped_adapter_marks_sessions_and_pending_operations_unavailable() {
     h.observe(vec![s]).await;
     h.handle.enqueue(Command::Refresh).await.unwrap();
     let updated = h.wait(|s| s.revision > state.revision).await;
-    assert!(!updated.sessions[0].authoritative);
+    assert!(!updated.sessions[0].authoritative());
 }
 
 #[tokio::test]
@@ -921,7 +932,7 @@ async fn sending_chat_text_is_idempotent_and_delivery_is_published_in_state() {
 async fn stale_empty_and_disconnected_chat_messages_never_reach_an_agent() {
     let mut h = Harness::new();
     let mut s = session("one", "request");
-    s.authoritative = false;
+    s.set_authoritative(false);
     h.observe(vec![s.clone()]).await;
     h.wait(|state| state.sessions.len() == 1).await;
     for (id, target, text) in [
@@ -989,13 +1000,13 @@ async fn adapter_failure_clears_inflight_chat_sending_status() {
 async fn changed_request_context_rejects_an_old_control_even_when_approval_id_matches() {
     let mut h = Harness::new();
     let mut original = session("one", "approval");
-    original.interaction_data.command = Some("echo original".into());
+    original.interaction_mut().command = Some("echo original".into());
     h.observe(vec![original.clone()]).await;
     h.wait(|s| s.sessions.len() == 1).await;
     let mut current = original.clone();
-    current.interaction_data.command = Some("echo changed".into());
+    current.interaction_mut().command = Some("echo changed".into());
     h.observe(vec![current.clone()]).await;
-    h.wait(|s| s.sessions[0].interaction_data.command.as_deref() == Some("echo changed"))
+    h.wait(|s| s.sessions[0].interaction().command.as_deref() == Some("echo changed"))
         .await;
     h.handle
         .submit(&original, Response::Action("allow".into()))
@@ -1018,16 +1029,16 @@ async fn changed_request_context_rejects_an_old_control_even_when_approval_id_ma
 async fn refreshed_notification_submits_current_context_and_rejects_old_category() {
     let mut h = Harness::new();
     let mut original = session("one", "approval");
-    original.interaction_data.command = Some("echo original".into());
+    original.interaction_mut().command = Some("echo original".into());
     h.observe(vec![original.clone()]).await;
     h.wait(|state| state.sessions.len() == 1).await;
     let key = original.approval_key().unwrap();
     let mut bindings = crate::macos::notification_actions::Bindings::default();
     let old = bindings.bind(&original).unwrap();
     let mut current = original.clone();
-    current.interaction_data.command = Some("echo updated".into());
+    current.interaction_mut().command = Some("echo updated".into());
     h.observe(vec![current.clone()]).await;
-    h.wait(|state| state.sessions[0].interaction_data == current.interaction_data)
+    h.wait(|state| state.sessions[0].interaction() == current.interaction())
         .await;
     let plan = bindings.bind(&current).unwrap();
     assert!(bindings.lookup(&key, &old.category()).is_none());
@@ -1038,9 +1049,113 @@ async fn refreshed_notification_submits_current_context_and_rejects_old_category
     h.wait(|state| !state.submissions.is_empty()).await;
     match h.agents.recv().await.unwrap() {
         AgentCommand::Respond { session, response } => {
-            assert_eq!(session.interaction_data, current.interaction_data);
+            assert_eq!(session.interaction(), current.interaction());
             assert_eq!(response, Response::Action("allow".into()));
         }
         _ => panic!("The refreshed notification must forward the current answer"),
     }
+}
+
+#[tokio::test]
+async fn answering_one_request_keeps_its_sibling_pending_and_records_the_answer() {
+    use crate::domain::session_activity::*;
+    let h = Harness::new();
+    let mut initial = session("timeline", "first");
+    let time = seconds(1);
+    initial.upsert_activity(SessionActivity::Request(SessionRequest {
+        id: "request:second".into(),
+        started_at: time,
+        updated_at: time,
+        approval: Approval {
+            id: "second".into(),
+            body: "Second?".into(),
+            expires: u64::MAX,
+            can_allow: true,
+        },
+        interaction: Interaction::allow(),
+        status: RequestStatus::Pending,
+    }));
+    h.observe(vec![initial.clone()]).await;
+    h.wait(|s| s.sessions.len() == 1).await;
+    h.handle
+        .enqueue(Command::Delivery {
+            key: initial.key(),
+            approval: initial.approval().unwrap().clone(),
+            delivery: Delivery::Confirmed,
+        })
+        .await
+        .unwrap();
+    let done = h
+        .wait(|s| s.sessions[0].approval().is_some_and(|a| a.id == "second"))
+        .await;
+    assert!(done.sessions[0].activities.iter().any(|a|matches!(a,SessionActivity::Request(r) if r.approval.id=="first" && r.status==RequestStatus::Answered)));
+    // A delayed complete snapshot cannot bring the first question back.
+    h.observe(vec![initial]).await;
+    let replay = h.settle().await;
+    assert_eq!(replay.sessions[0].approval().unwrap().id, "second");
+    assert_eq!(replay.sessions[0].activity, Activity::Confirmation);
+}
+
+#[tokio::test]
+async fn confirmed_answer_clears_waiting_status_immediately_and_replays_cannot_restore_it() {
+    let h = Harness::new();
+    let waiting = session("status", "request");
+    h.observe(vec![waiting.clone()]).await;
+    h.wait(|s| s.pending_count() == 1).await;
+    h.handle
+        .enqueue(Command::Delivery {
+            key: waiting.key(),
+            approval: waiting.approval().unwrap().clone(),
+            delivery: Delivery::Confirmed,
+        })
+        .await
+        .unwrap();
+    let answered = h.wait(|s| s.sessions[0].approval().is_none()).await;
+    assert_eq!(answered.sessions[0].activity, Activity::Working);
+    h.observe(vec![waiting.clone()]).await;
+    let replay = h.settle().await;
+    assert!(replay.sessions[0].approval().is_none());
+    assert_eq!(replay.sessions[0].activity, Activity::Working);
+    // Request removal and the runtime waiting-flag update may arrive separately.
+    let mut flag_only = waiting.clone();
+    flag_only.set_approval(None);
+    h.observe(vec![flag_only]).await;
+    let between_patches = h.settle().await;
+    assert!(between_patches.sessions[0].approval().is_none());
+    assert_eq!(between_patches.sessions[0].activity, Activity::Working);
+    let mut idle = waiting;
+    idle.set_approval(None);
+    idle.activity = Activity::Idle;
+    h.observe(vec![idle]).await;
+    h.wait(|s| s.sessions[0].activity == Activity::Idle).await;
+    // A new waiting indication without an addressed request is independent evidence.
+    let mut unsupported = session("status", "other");
+    unsupported.activities.clear();
+    unsupported.activity = Activity::Confirmation;
+    h.observe(vec![unsupported]).await;
+    let pending = h
+        .wait(|s| s.sessions[0].activity == Activity::Confirmation)
+        .await;
+    assert!(pending.sessions[0].approval().is_none());
+}
+
+#[tokio::test]
+async fn transcript_question_is_visible_offline_and_explicit_reply_closes_it() {
+    let h = Harness::new();
+    let mut pending = session("offline", "transcript:call");
+    pending.set_authoritative(false);
+    pending.approval_mut().unwrap().can_allow = false;
+    pending.set_interaction(Interaction::default());
+    h.observe(vec![pending.clone()]).await;
+    let shown = h.wait(|s| s.pending_count() == 1).await;
+    assert!(!shown.sessions[0].authoritative());
+    let mut answered = pending;
+    let approval = answered.approval().unwrap().clone();
+    answered.settle_request(
+        &approval,
+        crate::domain::session_activity::RequestStatus::Answered,
+    );
+    answered.activity = Activity::Idle;
+    h.observe(vec![answered]).await;
+    h.wait(|s| s.pending_count() == 0).await;
 }

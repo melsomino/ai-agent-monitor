@@ -5,7 +5,7 @@ use crate::agents::{
     sessions::Session,
 };
 use objc2::{
-    ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    AnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
     sel,
@@ -22,7 +22,7 @@ fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
-fn begin_editing(field: &NSTextField, selection: Option<NSRange>) {
+pub(super) fn begin_editing(field: &NSTextField, selection: Option<NSRange>) {
     let Some(window) = field.window() else {
         return;
     };
@@ -53,6 +53,28 @@ fn begin_editing(field: &NSTextField, selection: Option<NSRange>) {
         }
     }
 }
+
+#[derive(Debug)]
+struct InputSurfaceState {
+    field: Retained<NSTextField>,
+}
+define_class!(
+    // SAFETY: Main-thread input container; padded clicks activate the same native editor.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars=InputSurfaceState]
+    struct InputSurface;
+    unsafe impl NSObjectProtocol for InputSurface {}
+    impl InputSurface {
+        #[unsafe(method(drawRect:))]
+        fn draw_surface(&self,_dirty:NSRect) {
+            super::visual::appearance_color([232.0,222.0,241.0],[61.0,53.0,75.0],1.0).setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(),9.0,9.0).fill();
+        }
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self,_event:&NSEvent) {begin_editing(&self.ivars().field,None);}
+    }
+);
 
 fn answer(question: &Question, selected: usize, custom: &str) -> Option<String> {
     if let Some(choice) = question.choices.get(selected) {
@@ -120,7 +142,8 @@ define_class!(
             NSBezierPath::bezierPathWithOvalInRect(self.bounds()).fill();
             if selected {
                 NSColor::whiteColor().setFill();
-                NSBezierPath::bezierPathWithOvalInRect(rect(5.0, 5.0, 6.0, 6.0)).fill();
+                let center=self.bounds().size.width/2.0;
+                NSBezierPath::bezierPathWithOvalInRect(rect(center-2.5,center-2.5,5.0,5.0)).fill();
             }
         }
     }
@@ -136,17 +159,11 @@ impl Radio {
             ring.ivars().focused.set(focused);
             ring.advance(Instant::now());
         }
-        let background = if focused {
-            NSColor::controlAccentColor()
-        } else {
-            super::menu::hover_fill_color()
-        };
-        self.focus.setFillColor(&background);
-        let color = if focused {
-            NSColor::selectedMenuItemTextColor()
-        } else {
-            NSColor::labelColor()
-        };
+        if let Some(surface) = self.focus.downcast_ref::<super::visual::GlassBox>() {
+            surface.ivars().focused.set(focused);
+            surface.ivars().hovered.set(hovered);
+        }
+        let color = super::visual::primary_text_color();
         self.label.setTextColor(Some(&color));
         self.mark.setNeedsDisplay(true);
     }
@@ -159,7 +176,7 @@ impl Radio {
     }
 }
 
-struct FieldFocusState {
+pub(super) struct FieldFocusState {
     field: Retained<NSTextField>,
     focused: Cell<bool>,
     caret: Cell<Option<NSRect>>,
@@ -187,7 +204,7 @@ define_class!(
     #[name = "AAMQuestionFieldFocusRing"]
     #[thread_kind = MainThreadOnly]
     #[ivars = FieldFocusState]
-    struct FieldFocusRing;
+    pub(super) struct FieldFocusRing;
     unsafe impl NSObjectProtocol for FieldFocusRing {}
     impl FieldFocusRing {
         #[unsafe(method_id(hitTest:))]
@@ -195,9 +212,10 @@ define_class!(
         #[unsafe(method(drawRect:))]
         fn draw(&self, _dirty: NSRect) {
             NSGraphicsContext::saveGraphicsState_class();
-            NSSetFocusRingStyle(NSFocusRingPlacement::Only);
             let bounds = self.bounds();
-            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect(6.0, 6.0, bounds.size.width - 12.0, bounds.size.height - 12.0), 5.0, 5.0).fill();
+            super::visual::draw_keyboard_outline(
+                rect(6.0, 6.0, bounds.size.width - 12.0, bounds.size.height - 12.0), 9.0,
+            );
             NSGraphicsContext::restoreGraphicsState_class();
             if let Some(caret) = self.ivars().caret.get() {
                 NSColor::labelColor().setFill();
@@ -208,6 +226,33 @@ define_class!(
 );
 
 impl FieldFocusRing {
+    pub(super) fn for_field(
+        mtm: MainThreadMarker,
+        field: &NSTextField,
+        frame: NSRect,
+    ) -> Retained<Self> {
+        let allocated = Self::alloc(mtm).set_ivars(FieldFocusState {
+            // SAFETY: The main-thread field remains retained by this overlay.
+            field: unsafe { Retained::retain(field as *const NSTextField as *mut NSTextField) }
+                .unwrap(),
+            focused: Cell::new(false),
+            caret: Cell::new(None),
+            blink: RefCell::new(CaretBlink {
+                position: None,
+                epoch: Instant::now(),
+            }),
+        });
+        // SAFETY: Fully initialized, UI-thread decorative overlay.
+        unsafe { msg_send![super(allocated), initWithFrame: frame] }
+    }
+
+    pub(super) fn paint(&self, focused: bool, now: Instant) {
+        if self.ivars().focused.replace(focused) != focused {
+            self.setNeedsDisplay(true);
+        }
+        self.advance(now);
+    }
+
     fn advance(&self, now: Instant) {
         let state = self.ivars();
         let field = &state.field;
@@ -387,7 +432,7 @@ impl Panel {
             .enumerate()
         {
             if q > 0 {
-                y += 14.0;
+                y += 20.0;
             }
             y += label(&view, &question.title, y, width, 13.0, color, mtm) + 10.0;
             // Separate superviews keep AppKit's radio grouping local to a question.
@@ -432,7 +477,7 @@ impl Panel {
                             }
                     })
                     .unwrap_or(BUTTON_MIN_HEIGHT)
-                    .max(BUTTON_MIN_HEIGHT);
+                    .max(if single { BUTTON_MIN_HEIGHT } else { 27.0 });
                 let radio = panel.button(
                     &group,
                     &choice.label,
@@ -472,9 +517,9 @@ impl Panel {
             }
             let field = if question.freeform {
                 let frame = if single {
-                    rect(4.0, row_y + 3.0, width - submit_width - 16.0, 27.0)
+                    rect(4.0, row_y + 3.0, width - submit_width - 16.0, 31.0)
                 } else {
-                    rect(26.0, row_y + 2.0, width - 30.0, 27.0)
+                    rect(21.0, row_y + 2.0, width - 21.0, 31.0)
                 };
                 let radio = panel.button(
                     &group,
@@ -499,15 +544,58 @@ impl Panel {
                 } else {
                     NSTextField::initWithFrame(NSTextField::alloc(mtm), frame)
                 };
-                field.setPlaceholderString(Some(ns_string!("Your own answer")));
+                let placeholder = NSMutableAttributedString::initWithString(
+                    NSMutableAttributedString::alloc(),
+                    ns_string!("Your own answer"),
+                );
+                // SAFETY: The attribute covers the exact UTF-16 placeholder string.
+                unsafe {
+                    placeholder.addAttribute_value_range(
+                        NSForegroundColorAttributeName,
+                        &super::visual::tertiary_text_color(),
+                        NSRange::new(0, 15),
+                    );
+                }
+                field.setPlaceholderAttributedString(Some(&placeholder));
                 field.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+                field.setBackgroundColor(Some(&super::visual::appearance_color(
+                    [232.0, 222.0, 241.0],
+                    [61.0, 53.0, 75.0],
+                    1.0,
+                )));
+                field.setTextColor(Some(&super::visual::primary_text_color()));
+                field.setBezeled(false);
+                field.setBordered(false);
+                field.setDrawsBackground(false);
+                field.setFocusRingType(NSFocusRingType::None);
+                if let Some(cell) = field.cell() {
+                    cell.setWraps(false);
+                    cell.setScrollable(true);
+                    cell.setUsesSingleLineMode(true);
+                }
                 field.setEditable(true);
                 field.setSelectable(true);
                 // SAFETY: The owning menu retains the delegate until the field is removed.
                 unsafe {
                     field.setDelegate(Some(ProtocolObject::from_ref(&*panel)));
                 }
-                group.addSubview(&field);
+                let text_height = field
+                    .font()
+                    .map(|font| (font.ascender() - font.descender() + font.leading()).ceil() + 2.0)
+                    .unwrap_or(18.0)
+                    .min(frame.size.height);
+                field.setFrame(rect(
+                    7.0,
+                    (frame.size.height - text_height) / 2.0,
+                    frame.size.width - 14.0,
+                    text_height,
+                ));
+                // SAFETY: Initialize the rounded surface with its retained native field.
+                let surface: Retained<InputSurface> = unsafe {
+                    msg_send![super(InputSurface::alloc(mtm).set_ivars(InputSurfaceState {field:field.clone()})),initWithFrame:frame]
+                };
+                surface.addSubview(&field);
+                group.addSubview(&surface);
                 {
                     let allocated = FieldFocusRing::alloc(mtm).set_ivars(FieldFocusState {
                         field: field.clone(),
@@ -551,7 +639,7 @@ impl Panel {
                     );
                     panel.ivars().submit.set(submit).unwrap();
                 }
-                row_y += 35.0;
+                row_y += 40.0;
                 Some(field)
             } else {
                 None
@@ -600,12 +688,26 @@ impl Panel {
         kind: ButtonKind,
     ) -> Retained<NSButton> {
         let mtm = self.mtm();
-        let background = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
+        let background = super::visual::glass_box(
+            mtm,
+            frame,
+            if kind == ButtonKind::Submit {
+                4
+            } else if kind == ButtonKind::Choice {
+                5
+            } else {
+                0
+            },
+        );
         background.setBoxType(NSBoxType::Custom);
         background.setTitlePosition(NSTitlePosition::NoTitle);
         background.setBorderWidth(0.0);
-        background.setCornerRadius(frame.size.width.min(frame.size.height) / 2.0);
-        background.setFillColor(&super::menu::hover_fill_color());
+        background.setCornerRadius(if matches!(kind, ButtonKind::Choice | ButtonKind::Submit) {
+            12.0
+        } else {
+            frame.size.width.min(frame.size.height) / 2.0
+        });
+        background.setFillColor(&super::visual::hover_fill_color());
         background.setHidden(matches!(kind, ButtonKind::Radio | ButtonKind::Field));
         view.addSubview(&background);
         // SAFETY: Both selectors are implemented by this retained controller.
@@ -634,18 +736,19 @@ impl Panel {
             natural.setFont(Some(&NSFont::systemFontOfSize(12.0)));
             natural.sizeToFit();
             let focus_width = if title.is_empty() {
-                view.frame().size.width - 22.0
+                view.frame().size.width - 21.0
             } else {
-                (natural.frame().size.width + 12.0).min(frame.size.width - 20.0)
+                (natural.frame().size.width + 14.0).min(frame.size.width - 14.0)
             };
-            let focus = NSBox::initWithFrame(
-                NSBox::alloc(mtm),
+            let focus = super::visual::glass_box(
+                mtm,
                 rect(
-                    frame.origin.x + 20.0,
+                    frame.origin.x + 14.0,
                     frame.origin.y - 1.0,
                     focus_width,
                     frame.size.height + 2.0,
                 ),
+                6,
             );
             focus.setBoxType(NSBoxType::Custom);
             focus.setTitlePosition(NSTitlePosition::NoTitle);
@@ -657,12 +760,12 @@ impl Panel {
             let allocated = RadioMark::alloc(mtm).set_ivars(RadioState::default());
             // SAFETY: NSView initializer after initializing the decoration's state.
             let mark: Retained<RadioMark> = unsafe {
-                msg_send![super(allocated), initWithFrame: rect(frame.origin.x, center - 8.0, 16.0, 16.0)]
+                msg_send![super(allocated), initWithFrame: rect(frame.origin.x, center - 7.0, 14.0, 14.0)]
             };
             view.addSubview(&mark);
             let label = wrapping_label(&NSString::from_str(title), mtm);
             label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
-            let label_width = (frame.size.width - 24.0).max(0.0);
+            let label_width = (frame.size.width - 21.0).max(0.0);
             let label_height = label
                 .cell()
                 .map(|cell| {
@@ -673,7 +776,7 @@ impl Panel {
                 .unwrap_or(16.0)
                 .min(frame.size.height);
             label.setFrame(rect(
-                frame.origin.x + 24.0,
+                frame.origin.x + 21.0,
                 center - label_height / 2.0,
                 label_width,
                 label_height,
@@ -732,7 +835,7 @@ impl Panel {
             base_alpha: if matches!(kind, ButtonKind::Radio | ButtonKind::Field) {
                 0.0
             } else {
-                0.5
+                1.0
             },
             radio,
             caption,
@@ -806,7 +909,12 @@ impl Panel {
             }
             if let Some(field) = &input.field {
                 field.setEnabled(enabled);
-                field.setTextColor(Some(&NSColor::labelColor()));
+                let color = if enabled {
+                    super::visual::primary_text_color()
+                } else {
+                    NSColor::disabledControlTextColor()
+                };
+                field.setTextColor(Some(&color));
             }
         }
         if let Some(submit) = self.ivars().submit.get() {
@@ -860,8 +968,8 @@ impl Panel {
     pub fn matches_request(&self, session: &Session) -> bool {
         let original = &self.ivars().session;
         original.key() == session.key()
-            && original.approval == session.approval
-            && original.interaction_data == session.interaction_data
+            && original.approval() == session.approval()
+            && original.interaction() == session.interaction()
     }
 
     pub fn reconcile(&self, enabled: bool, status: &str) {

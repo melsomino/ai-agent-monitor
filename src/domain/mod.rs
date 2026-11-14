@@ -6,6 +6,7 @@ pub mod interaction;
 pub mod markdown;
 pub mod preferences;
 pub mod session;
+pub mod session_activity;
 pub mod shortcut;
 pub mod telegram;
 pub mod usage;

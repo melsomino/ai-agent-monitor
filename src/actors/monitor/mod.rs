@@ -34,6 +34,7 @@ pub(crate) async fn run(
     while let Some(command) = rx.recv().await {
         let previous_sessions = state.sessions.clone();
         match command {
+            Command::ForgetHistory { client } => {state.history.retain(|key,_|key.client!=client);}
             Command::FinishedSeen { completions } => {
                 for (key, generation) in completions {
                     if state.unseen_finished.get(&key) == Some(&generation)
@@ -71,15 +72,25 @@ pub(crate) async fn run(
                         let observed = sessions
                             .into_iter()
                             .map(|mut session| {
-                                if !session.authoritative
-                                    && session.approval.is_none()
-                                    && let Some(old) =
-                                        previous.iter().find(|s| s.key() == session.key())
+                                if let Some(old) =
+                                    previous.iter().find(|s| s.key() == session.key())
                                 {
-                                    session.approval = old.approval.clone();
-                                    session.interaction_data = old.interaction_data.clone();
-                                    if session.approval.is_some() {
+                                    let replayed_closed_request = session.pending_request().is_some_and(|request| {
+                                        old.activities.iter().any(|activity| {
+                                            matches!(activity, crate::domain::session_activity::SessionActivity::Request(previous)
+                                                if previous.status != crate::domain::session_activity::RequestStatus::Pending
+                                                    && previous.approval == request.approval
+                                                    && previous.interaction == request.interaction)
+                                        })
+                                    });
+                                    session.merge_previous(old);
+                                    if session.approval().is_some() {
                                         session.activity = Activity::Confirmation;
+                                    } else if replayed_closed_request
+                                        && session.activity == Activity::Confirmation
+                                        && !resolved.contains_key(&session.key())
+                                    {
+                                        session.activity = Activity::Working;
                                     }
                                 }
                                 session
@@ -115,7 +126,7 @@ pub(crate) async fn run(
                 }
                 if let Some(sessions) = sources.get_mut(source) {
                     for session in sessions {
-                        session.authoritative = false;
+                        session.set_authoritative(false);
                         session.activity = Activity::Unknown;
                         if let Some(key) = session.approval_key() {
                             state
@@ -209,7 +220,7 @@ pub(crate) async fn run(
                     .enabled(current.as_ref().unwrap().client)
                 {
                     Some("This application is hidden in monitor settings.")
-                } else if !current.as_ref().unwrap().authoritative {
+                } else if !current.as_ref().unwrap().can_send_message() {
                     Some("No live message connection to this session. Open it in the agent app.")
                 } else if state.message_sends.len() >= 256 {
                     Some("Message queue is busy. Try again later.")
@@ -257,11 +268,11 @@ pub(crate) async fn run(
                     .iter()
                     .find(|s| {
                         s.key() == session.key()
-                            && s.approval.is_some()
-                            && s.approval == session.approval
-                            && s.interaction_data == session.interaction_data
-                            && s.authoritative
-                            && s.approval.as_ref().is_some_and(|a| a.expires > now())
+                            && s.approval().is_some()
+                            && s.approval() == session.approval()
+                            && s.interaction() == session.interaction()
+                            && s.authoritative()
+                            && s.approval().is_some_and(|a| a.expires > now())
                     })
                     .cloned()
                 {
@@ -271,9 +282,7 @@ pub(crate) async fn run(
                         Some(Submission::Sending | Submission::Reconciling)
                     ) && valid_response(&current, &response)
                     {
-                        if let Some(hook) =
-                            state.hooks.get_mut(&current.approval.as_ref().unwrap().id)
-                        {
+                        if let Some(hook) = state.hooks.get_mut(&current.approval().unwrap().id) {
                             if hook.decision.is_none() {
                                 hook.decision = Some(response);
                                 state.submissions.insert(key, Submission::Sending);
@@ -311,7 +320,7 @@ pub(crate) async fn run(
                 if let Some(session) = state
                     .sessions
                     .iter()
-                    .find(|s| s.key() == key && s.approval.as_ref() == Some(&approval))
+                    .find(|s| s.key() == key && s.approval() == Some(&approval))
                 {
                     let request = session.approval_key().unwrap();
                     if delivery == crate::agents::interaction::Delivery::Confirmed {
@@ -485,32 +494,38 @@ pub(crate) async fn run(
         }
         state.sessions = discovered.clone();
         for session in &mut state.sessions {
-            if resolved
-                .get(&session.key())
-                .is_some_and(|a| session.approval.as_ref() == Some(a))
-            {
-                session.approval = None;
-                session.interaction_data = Interaction::default();
+            if let Some(approval) = resolved.get(&session.key()) {
+                if session.approval() == Some(approval) {
+                    session.settle_request(
+                        approval,
+                        crate::domain::session_activity::RequestStatus::Answered,
+                    );
+                }
+                if session.activity == Activity::Confirmation && session.approval().is_none() {
+                    session.activity = Activity::Working;
+                }
             }
         }
         resolved.retain(|key, approval| {
-            discovered
-                .iter()
-                .any(|s| s.key() == *key && s.approval.as_ref() == Some(approval))
+            discovered.iter().any(|s| {
+                s.key() == *key
+                    && (s.approval() == Some(approval)
+                        || (s.approval().is_none() && s.activity == Activity::Confirmation))
+            })
         });
         let now = now();
         for hook in state.hooks.values().filter(|h| {
-            h.decision.is_none() && h.session.approval.as_ref().is_some_and(|a| a.expires > now)
+            h.decision.is_none() && h.session.approval().is_some_and(|a| a.expires > now)
         }) {
             if let Some(s) = state
                 .sessions
                 .iter_mut()
                 .find(|s| s.key() == hook.session.key())
             {
-                s.approval = hook.session.approval.clone();
-                s.interaction_data = hook.session.interaction_data.clone();
+                s.set_approval(hook.session.approval().cloned());
+                s.set_interaction(hook.session.interaction().clone());
                 s.activity = Activity::Confirmation;
-                s.authoritative = true;
+                s.connection = crate::domain::session::ConnectionState::live(false);
             } else {
                 state.sessions.push(hook.session.clone());
             }
@@ -556,65 +571,76 @@ pub fn hook_session(
     } else {
         "codex"
     };
-    Session {
-        authoritative: true,
-        agent,
-        id: event["session_id"].as_str().unwrap_or(key).into(),
-        title: content.title.clone(),
-        cwd: event["cwd"]
-            .as_str()
-            .map(Into::into)
-            .unwrap_or_else(core::home),
-        workspace: None,
-        git_branch: None,
-        model: None,
-        model_display_name: None,
-        reasoning_effort: None,
-        updated_at: now() as i64,
-        client: if owner.is_some_and(|o| o.2 == "vscode") {
-            Client::VSCode
-        } else {
-            Client::Terminal
-        },
-        activity: Activity::Confirmation,
-        last_message: String::new(),
-        images: vec![],
-        interaction_data: Interaction {
-            command: event["tool_input"]["command"].as_str().map(str::to_owned),
-            ..if event["_test_extended_choices"] == true {
-                Interaction {
-                    actions: [
-                        ("allow", "Allow once"),
-                        ("test:always", "Allow always"),
-                        ("test:deny", "Deny"),
-                    ]
-                    .into_iter()
-                    .map(|(id, label)| crate::domain::interaction::Action {
-                        id: id.into(),
-                        label: label.into(),
-                        detail: if id == "test:always" {
-                            event["_test_always_command"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .into()
-                        } else {
-                            String::new()
-                        },
-                    })
-                    .collect(),
-                    ..Interaction::default()
-                }
+    {
+        let mut __session = Session {
+            agent,
+            id: event["session_id"].as_str().unwrap_or(key).into(),
+            title: content.title.clone(),
+            cwd: event["cwd"]
+                .as_str()
+                .map(Into::into)
+                .unwrap_or_else(core::home),
+            workspace: None,
+            git_branch: None,
+            model: None,
+            model_display_name: None,
+            reasoning_effort: None,
+            updated_at: now() as i64,
+            client: if owner.is_some_and(|o| o.2 == "vscode") {
+                Client::VSCode
             } else {
-                Interaction::allow()
-            }
-        },
-        target: Some(content.target.clone()),
-        approval: Some(Approval {
-            id: key.into(),
-            body: content.body.clone(),
-            expires: now() + core::WAIT.as_secs(),
-            can_allow: true,
-        }),
+                Client::Terminal
+            },
+            activity: Activity::Confirmation,
+            target: Some(content.target.clone()),
+            connection: if true {
+                crate::domain::session::ConnectionState::live(true)
+            } else {
+                Default::default()
+            },
+            activities: Default::default(),
+        };
+        __session.seed_snapshot(
+            String::new(),
+            vec![],
+            None,
+            Some(Approval {
+                id: key.into(),
+                body: content.body.clone(),
+                expires: now() + core::WAIT.as_secs(),
+                can_allow: true,
+            }),
+            Interaction {
+                command: event["tool_input"]["command"].as_str().map(str::to_owned),
+                ..if event["_test_extended_choices"] == true {
+                    Interaction {
+                        actions: [
+                            ("allow", "Allow once"),
+                            ("test:always", "Allow always"),
+                            ("test:deny", "Deny"),
+                        ]
+                        .into_iter()
+                        .map(|(id, label)| crate::domain::interaction::Action {
+                            id: id.into(),
+                            label: label.into(),
+                            detail: if id == "test:always" {
+                                event["_test_always_command"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .into()
+                            } else {
+                                String::new()
+                            },
+                        })
+                        .collect(),
+                        ..Interaction::default()
+                    }
+                } else {
+                    Interaction::allow()
+                }
+            },
+        );
+        __session
     }
 }
 

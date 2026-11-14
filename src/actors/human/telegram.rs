@@ -308,7 +308,6 @@ struct Pending {
     question: usize,
     answers: BTreeMap<String, Vec<String>>,
     phase: Option<monitor::Submission>,
-    browser_delivered: bool,
 }
 impl Pending {
     fn new(session: Session) -> Result<Self> {
@@ -321,16 +320,15 @@ impl Pending {
             question: 0,
             answers: BTreeMap::new(),
             phase: None,
-            browser_delivered: false,
         })
     }
     fn delivered(&self) -> bool {
-        self.message.is_some() || self.browser_delivered
+        self.message.is_some()
     }
     fn body_content(&self) -> (text::Text, Value) {
         let body = self
             .session
-            .approval
+            .approval()
             .as_ref()
             .map(|a| a.body.trim())
             .unwrap_or_default();
@@ -842,9 +840,6 @@ impl Worker {
         }
         Ok(())
     }
-    fn edit(&self, pending: &Pending) -> Result<()> {
-        edit_pending(&self.token, self.config.chat, pending)
-    }
     fn forget(&mut self, key: &str, text: &str) {
         if let Some(pending) = self.pending.remove(key)
             && let Some(message) = pending.message
@@ -1120,41 +1115,12 @@ impl Worker {
         if self.token.is_empty() || self.config.chat.is_none() || Instant::now() < self.retry {
             return;
         }
-        // First present requests in the selected session. Only a successful
-        // presentation records delivery; a failed API call keeps the request queued.
-        if self.pending.values().any(|pending| {
-            !pending.browser_delivered
-                && self
-                    .browser
-                    .as_ref()
-                    .is_some_and(|browser| browser.can_present(pending))
-        }) {
-            self.flush_browser();
-            if Instant::now() < self.retry {
-                return;
-            }
-        }
-        // One request per pass avoids bursts and leaves time for local changes.
-        if let Some(key) = self.next_request_message() {
-            let mut payload = self.pending[&key].payload();
-            payload["chat_id"] = json!(self.config.chat);
-            match self.api("sendMessage", payload) {
-                Ok(result) => {
-                    if let Some(id) = result["message_id"].as_i64() {
-                        self.pending.get_mut(&key).unwrap().message = Some(id);
-                        self.config.messages.push(id);
-                        self.save();
-                        self.retry = Instant::now() + Duration::from_secs(1);
-                    }
-                }
-                Err(error) => {
-                    self.note(&error.to_string());
-                    self.retry = Instant::now() + Duration::from_secs(15);
-                }
-            }
+        // Requests own separate messages, independent of the selected session card.
+        let token = self.token.clone();
+        if self.flush_request_with(|payload| api(&token, "sendMessage", payload)) {
+            self.save();
             return;
         }
-        let token = self.token.clone();
         let chat = self.config.chat;
         if self.flush_edits_with(Instant::now(), |pending| {
             edit_pending(&token, chat, pending)
@@ -1187,38 +1153,33 @@ impl Worker {
     fn next_request_message(&self) -> Option<String> {
         self.pending
             .iter()
-            .find(|(_, p)| {
-                self.config.enabled
-                    && !p.delivered()
-                    && !self
-                        .browser
-                        .as_ref()
-                        .is_some_and(|browser| browser.can_present(p))
-            })
+            .find(|(_, p)| self.config.enabled && !p.delivered())
             .map(|(key, _)| key.clone())
     }
-    fn adopt_browser_requests(&mut self) {
-        let Some(browser) = &self.browser else {
-            return;
+    fn flush_request_with(&mut self, mut send: impl FnMut(Value) -> Result<Value>) -> bool {
+        let Some(key) = self.next_request_message() else {
+            return false;
         };
-        let Some(message) = browser.message else {
-            return;
-        };
-        let shown: Vec<_> = self
-            .pending
-            .iter()
-            .filter(|(_, p)| browser.permits_answer(message, p))
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in shown {
-            let pending = self.pending.get_mut(&key).unwrap();
-            pending.browser_delivered = true;
-            let old = pending.message.take();
-            self.edits.retain(|queued| *queued != key);
-            if let Some(old) = old.filter(|id| *id != message) {
-                self.finish(old, "This request is shown in the session message.");
+        let mut payload = self.pending[&key].payload();
+        payload["chat_id"] = json!(self.config.chat);
+        payload["disable_notification"] = json!(false);
+        match send(payload) {
+            Ok(result) if result["message_id"].as_i64().is_some() => {
+                let id = result["message_id"].as_i64().unwrap();
+                self.pending.get_mut(&key).unwrap().message = Some(id);
+                self.config.messages.push(id);
+                self.retry = Instant::now() + Duration::from_secs(1);
+            }
+            result => {
+                let error = result
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "Telegram did not confirm request delivery.".into());
+                self.note(&error);
+                self.retry = Instant::now() + Duration::from_secs(15);
             }
         }
+        true
     }
     fn flush_browser(&mut self) {
         let snapshot = self.monitor.snapshot();
@@ -1248,7 +1209,7 @@ impl Worker {
         let Some(browser) = self.browser.as_mut() else {
             return false;
         };
-        let content = browser.content(snapshot, &self.pending);
+        let content = browser.content(snapshot);
         if let Some((id, image, caption)) = browser.pending_image() {
             match upload(
                 &image,
@@ -1271,7 +1232,8 @@ impl Worker {
         }
         let browser = self.browser.as_mut().unwrap();
         // New agent text or a delivered image advances the chat. Request and
-        // status changes alone edit the current card and keep its answer buttons.
+        // status changes alone edit the current card and keep its navigation controls.
+        // Requests and their answer controls live in independent messages.
         if browser.needs_new_message() {
             let old = browser.message.unwrap();
             let cleanup = send(
@@ -1294,7 +1256,6 @@ impl Worker {
         }
         if content == browser.rendered {
             browser.commit(content);
-            self.adopt_browser_requests();
             return false;
         }
         let message = browser.message;
@@ -1324,7 +1285,6 @@ impl Worker {
                 } else if message.is_some() {
                     self.browser.as_mut().unwrap().detach_message();
                 }
-                self.adopt_browser_requests();
                 self.retry = Instant::now() + Duration::from_secs(1);
                 changed
             }
@@ -1437,18 +1397,6 @@ impl Worker {
                     .iter()
                     .find(|(_, p)| p.message == Some(message_id))
                     .map(|(k, _)| k.clone())
-                    .or_else(|| {
-                        let selected = self.browser.as_ref()?.selected(message_id)?;
-                        self.pending
-                            .iter()
-                            .find(|(_, p)| {
-                                p.session.key() == selected
-                                    && self.browser.as_ref().is_some_and(|browser| {
-                                        browser.permits_answer(message_id, p)
-                                    })
-                            })
-                            .map(|(key, _)| key.clone())
-                    })
             {
                 let result = self.answer(&key, None, Some(text));
                 if let Err(error) = result {
@@ -1559,14 +1507,7 @@ impl Worker {
         let message_id = message["message_id"].as_i64()?;
         self.pending
             .iter()
-            .find(|(_, p)| {
-                p.nonce == nonce
-                    && (p.message == Some(message_id)
-                        || self
-                            .browser
-                            .as_ref()
-                            .is_some_and(|browser| browser.permits_answer(message_id, p)))
-            })
+            .find(|(_, p)| p.nonce == nonce && p.message == Some(message_id))
             .map(|(key, _)| (key.clone(), index))
     }
     fn answer(&mut self, key: &str, index: Option<usize>, text: Option<&str>) -> Result<()> {
@@ -1578,7 +1519,9 @@ impl Worker {
         let current = snapshot
             .sessions
             .iter()
-            .find(|s| s.key() == pending.session.key() && s.approval == pending.session.approval)
+            .find(|s| {
+                s.key() == pending.session.key() && s.approval() == pending.session.approval()
+            })
             .cloned();
         let Some(current) = current else {
             self.forget(key, "Resolved or no longer pending.");
@@ -1589,7 +1532,7 @@ impl Worker {
             "The question changed. Answer it in the agent app."
         );
         anyhow::ensure!(
-            current.authoritative,
+            current.authoritative(),
             "The agent connection is being checked. Try again shortly."
         );
         anyhow::ensure!(
@@ -1607,10 +1550,9 @@ impl Worker {
                 .map_err(anyhow::Error::msg)?;
             // Do not resolve locally. Every channel observes the Monitor's next state.
         } else {
-            if pending.message.is_some() {
-                self.edit(&pending)?;
-            }
             self.pending.insert(key.to_owned(), pending);
+            self.edits.retain(|queued| queued != key);
+            self.edits.push(key.to_owned(), Instant::now());
         }
         Ok(())
     }
@@ -1667,30 +1609,41 @@ mod tests {
         sessions::{Activity, Approval, Client},
     };
     fn session() -> Session {
-        Session {
-            authoritative: true,
-            interaction_data: Default::default(),
-            target: None,
-            agent: "codex",
-            id: "session".into(),
-            title: "A chat".into(),
-            cwd: "/work".into(),
-            workspace: None,
-            git_branch: None,
-            model: None,
-            model_display_name: None,
-            reasoning_effort: None,
-            updated_at: 0,
-            client: Client::Terminal,
-            activity: Activity::Confirmation,
-            last_message: String::new(),
-            images: vec![],
-            approval: Some(Approval {
-                id: "request".into(),
-                body: "Choose carefully".into(),
-                expires: u64::MAX,
-                can_allow: true,
-            }),
+        {
+            let mut __session = Session {
+                target: None,
+                agent: "codex",
+                id: "session".into(),
+                title: "A chat".into(),
+                cwd: "/work".into(),
+                workspace: None,
+                git_branch: None,
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 0,
+                client: Client::Terminal,
+                activity: Activity::Confirmation,
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot(
+                String::new(),
+                vec![],
+                None,
+                Some(Approval {
+                    id: "request".into(),
+                    body: "Choose carefully".into(),
+                    expires: u64::MAX,
+                    can_allow: true,
+                }),
+                Default::default(),
+            );
+            __session
         }
     }
     fn pending(interaction: Interaction) -> Pending {
@@ -1702,7 +1655,6 @@ mod tests {
             question: 0,
             answers: BTreeMap::new(),
             phase: None,
-            browser_delivered: false,
         }
     }
     fn worker() -> Worker {
@@ -2096,10 +2048,10 @@ mod tests {
         assert!(worker.callback_key(&callback).is_none());
     }
     #[test]
-    fn browser_answers_require_the_delivered_request_and_its_message() {
+    fn only_the_separate_request_message_has_answer_authority() {
         let mut worker = worker();
         let mut request = pending(Interaction::allow());
-        request.session.interaction_data = request.interaction.clone();
+        request.session.set_interaction(request.interaction.clone());
         let key = request.session.approval_key().unwrap();
         let state = monitor::State {
             sessions: vec![request.session.clone()],
@@ -2109,7 +2061,7 @@ mod tests {
         worker.pending.insert(key.clone(), request);
         let mut browser = sessions::Browser::new().unwrap();
         browser.message = Some(77);
-        let list = browser.content(&state, &worker.pending);
+        let list = browser.content(&state);
         let select = list["reply_markup"]["inline_keyboard"]
             .as_array()
             .unwrap()
@@ -2121,11 +2073,14 @@ mod tests {
             })
             .unwrap();
         browser.navigate(77, select).unwrap();
-        let detail = browser.content(&state, &worker.pending);
+        let detail = browser.content(&state);
         worker.browser = Some(browser);
         let callback = json!({"from":{"id":42},"message":{"chat":{"id":42,"type":"private"},"message_id":77},"data":data});
         assert!(worker.callback_key(&callback).is_none());
         worker.browser.as_mut().unwrap().commit(detail);
+        assert!(worker.callback_key(&callback).is_none());
+        let mut callback = callback;
+        callback["message"]["message_id"] = json!(50);
         assert_eq!(worker.callback_key(&callback), Some((key.clone(), 0)));
         let mut wrong_message = callback.clone();
         wrong_message["message"]["message_id"] = json!(78);
@@ -2141,7 +2096,7 @@ mod tests {
             actions: vec![],
             questions: vec![question("one", true)],
         });
-        request.session.interaction_data = request.interaction.clone();
+        request.session.set_interaction(request.interaction.clone());
         request.message = Some(50);
         let state = monitor::State {
             sessions: vec![request.session.clone()],
@@ -2158,7 +2113,7 @@ mod tests {
             .insert(request.session.approval_key().unwrap(), request);
         let mut browser = sessions::Browser::new().unwrap();
         browser.message = Some(77);
-        let list = browser.content(&state, &worker.pending);
+        let list = browser.content(&state);
         let select = list["reply_markup"]["inline_keyboard"]
             .as_array()
             .unwrap()
@@ -2198,14 +2153,14 @@ mod tests {
         let mut worker = worker();
         let mut current = session();
         current.title = "Current session".into();
-        current.approval = None;
-        current.interaction_data = Interaction::default();
+        current.set_approval(None);
+        current.set_interaction(Interaction::default());
         let current_key = current.key();
         let mut other = pending(Interaction::allow());
         other.session.id = "other".into();
         other.session.title = "Other session".into();
-        other.session.approval.as_mut().unwrap().id = "other-request".into();
-        other.session.interaction_data = other.interaction.clone();
+        other.session.approval_mut().unwrap().id = "other-request".into();
+        other.session.set_interaction(other.interaction.clone());
         let other_key = other.session.approval_key().unwrap();
         let state = monitor::State {
             sessions: vec![current, other.session.clone()],
@@ -2219,7 +2174,7 @@ mod tests {
         };
         let mut browser = sessions::Browser::new().unwrap();
         browser.message = Some(77);
-        let list = browser.content(&state, &worker.pending);
+        let list = browser.content(&state);
         let select = list["reply_markup"]["inline_keyboard"]
             .as_array()
             .unwrap()
@@ -2230,7 +2185,7 @@ mod tests {
             .as_str()
             .unwrap();
         browser.navigate(77, select).unwrap();
-        let detail = browser.content(&state, &worker.pending);
+        let detail = browser.content(&state);
         browser.commit(detail);
         worker.browser = Some(browser);
         worker.event(Event::Observe(Box::new(other.session)));
@@ -2307,7 +2262,7 @@ mod tests {
     fn question_payload_formats_body_and_preserves_exact_button_captions() {
         let mut request = pending(Interaction::allow());
         request.session.title = "Chat 🤖".into();
-        request.session.approval.as_mut().unwrap().body = "Run **tests** in `some_dir`?".into();
+        request.session.approval_mut().unwrap().body = "Run **tests** in `some_dir`?".into();
         let payload = request.payload();
         assert_eq!(payload["text"], "Chat 🤖\nRun tests in some_dir?");
         assert_eq!(
@@ -2334,7 +2289,7 @@ mod tests {
     fn browsing_request(request: Pending) -> (Worker, monitor::State, String, String) {
         let mut worker = worker();
         let mut chat = request.session.clone();
-        chat.interaction_data = request.interaction.clone();
+        chat.set_interaction(request.interaction.clone());
         let key = chat.approval_key().unwrap();
         let state = monitor::State {
             sessions: vec![chat],
@@ -2343,7 +2298,7 @@ mod tests {
         worker.pending.insert(key.clone(), request);
         let mut browser = sessions::Browser::new().unwrap();
         browser.message = Some(77);
-        let list = browser.content(&state, &worker.pending);
+        let list = browser.content(&state);
         browser.commit(list.clone());
         let data = list["reply_markup"]["inline_keyboard"]
             .as_array()
@@ -2364,8 +2319,9 @@ mod tests {
     #[test]
     fn images_are_uploaded_once_before_the_new_card_and_answers_remain_bound() {
         let (mut worker, mut state, key, _) = browsing_request(pending(Interaction::allow()));
-        state.sessions[0].images =
-            crate::agents::codex::images::output_images(&crate::agents::codex::images::fixture());
+        state.sessions[0].set_images(crate::agents::codex::images::output_images(
+            &crate::agents::codex::images::fixture(),
+        ));
         let calls = RefCell::new(Vec::new());
         for _ in 0..4 {
             worker.flush_browser_media_with(
@@ -2395,7 +2351,7 @@ mod tests {
             ["sendPhoto", "editMessageReplyMarkup", "sendMessage"]
         );
         let browser = worker.browser.as_ref().unwrap();
-        assert!(browser.permits_answer(80, &worker.pending[&key]));
+        assert_eq!(worker.pending[&key].message, Some(50));
         assert_eq!(
             browser.current_session(),
             Some(state.sessions[0].key().as_str())
@@ -2405,8 +2361,9 @@ mod tests {
     #[test]
     fn failed_photo_upload_does_not_remove_the_question_controls_or_current_session() {
         let (mut worker, mut state, key, _) = browsing_request(pending(Interaction::allow()));
-        state.sessions[0].images =
-            crate::agents::codex::images::output_images(&crate::agents::codex::images::fixture());
+        state.sessions[0].set_images(crate::agents::codex::images::output_images(
+            &crate::agents::codex::images::fixture(),
+        ));
         worker.flush_browser_media_with(
             &state,
             |method, payload| {
@@ -2421,13 +2378,7 @@ mod tests {
             },
             |_, _| bail!("offline"),
         );
-        assert!(
-            worker
-                .browser
-                .as_ref()
-                .unwrap()
-                .permits_answer(77, &worker.pending[&key])
-        );
+        assert_eq!(worker.pending[&key].message, Some(50));
         worker.flush_browser_media_with(
             &state,
             |_, _| panic!("unchanged card"),
@@ -2453,64 +2404,46 @@ mod tests {
     }
 
     #[test]
-    fn browser_delivery_prevents_a_duplicate_notification_and_failed_delivery_stays_queued() {
+    fn browsing_a_session_does_not_deliver_or_suppress_its_request() {
         let mut request = pending(Interaction::allow());
         request.message = None;
-        let (mut worker, state, key, select) = browsing_request(request);
-        assert!(worker.next_request_message().is_none());
-        assert!(!worker.pending[&key].delivered());
-        worker.flush_browser_with(&state, |_, _| bail!("offline"));
-        assert!(!worker.pending[&key].browser_delivered);
-        let detail = worker
-            .browser
-            .as_mut()
-            .unwrap()
-            .content(&state, &worker.pending);
-        let back = detail["reply_markup"]["inline_keyboard"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|row| row.as_array().unwrap())
-            .find_map(|button| {
-                button["callback_data"]
-                    .as_str()
-                    .filter(|data| data.ends_with(":back"))
-            })
-            .unwrap()
-            .to_owned();
-        worker
-            .browser
-            .as_mut()
-            .unwrap()
-            .navigate(77, &back)
-            .unwrap();
+        let (mut worker, state, key, _) = browsing_request(request);
         assert_eq!(worker.next_request_message(), Some(key.clone()));
-        worker
-            .browser
-            .as_mut()
-            .unwrap()
-            .navigate(77, &select)
-            .unwrap();
-        worker.flush_browser_with(&state, |method, _| {
-            assert_eq!(method, "editMessageText");
-            Ok(json!({"message_id":77}))
-        });
-        assert!(worker.pending[&key].browser_delivered);
-        assert!(worker.pending[&key].message.is_none());
-        worker.update_counts();
-        assert_eq!(worker.status.borrow().queued, 0);
-        assert_eq!(worker.status.borrow().delivered, 1);
-        worker
-            .browser
-            .as_mut()
-            .unwrap()
-            .navigate(77, &back)
-            .unwrap();
-        assert!(
-            worker.next_request_message().is_none(),
-            "already shown requests must not notify again after Back"
+        worker.flush_browser_with(&state, |_, _| Ok(json!({"message_id":77})));
+        assert!(!worker.pending[&key].delivered());
+        assert_eq!(worker.next_request_message(), Some(key.clone()));
+        assert!(worker.flush_request_with(|payload| {
+            assert_eq!(payload["disable_notification"], false);
+            assert!(
+                payload["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Choose carefully")
+            );
+            assert!(
+                !payload["reply_markup"]["inline_keyboard"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            Ok(json!({"message_id":50}))
+        }));
+        assert!(worker.pending[&key].delivered());
+        assert_eq!(worker.pending[&key].message, Some(50));
+        assert!(!worker.flush_request_with(|_| panic!("must not send a duplicate")));
+        assert_eq!(worker.browser.as_ref().unwrap().message, Some(77));
+        worker.sync_sessions(&[]);
+        assert_eq!(
+            worker
+                .cleanup
+                .pop_ready(Instant::now() + Duration::from_secs(1))
+                .unwrap()
+                .0,
+            50
         );
+        assert_eq!(worker.browser.as_ref().unwrap().message, Some(77));
     }
+
     #[test]
     fn consecutive_approvals_do_not_archive_copies_of_the_same_agent_reply() {
         fn flush(
@@ -2541,21 +2474,21 @@ mod tests {
             });
         }
         let (mut worker, mut state, _, _) = browsing_request(pending(Interaction::allow()));
-        state.sessions[0].approval = None;
+        state.sessions[0].set_approval(None);
         state.sessions[0].activity = Activity::Working;
-        state.sessions[0].last_message = "I will commit and push the changes.".into();
+        state.sessions[0].set_last_message("I will commit and push the changes.".into());
         worker.pending.clear();
         let mut messages = BTreeMap::new();
         let mut next = 78;
         flush(&mut worker, &state, &mut messages, &mut next);
         assert_eq!(messages.len(), 1);
         for question in ["Commit?", "Push?"] {
-            state.sessions[0].approval = Some(Approval {
+            state.sessions[0].set_approval(Some(Approval {
                 id: question.into(),
                 body: question.into(),
                 expires: u64::MAX,
                 can_allow: true,
-            });
+            }));
             state.sessions[0].activity = Activity::Confirmation;
             let request = Pending::new(state.sessions[0].clone()).unwrap();
             worker
@@ -2565,16 +2498,20 @@ mod tests {
             flush(&mut worker, &state, &mut messages, &mut next);
             assert!(messages.contains_key(&old));
             assert_eq!(worker.browser.as_ref().unwrap().message, Some(old));
-            assert_eq!(next, 78, "requests must edit, never send a new message");
+            assert_eq!(next, 78, "session cards must not advance for a request");
             flush(&mut worker, &state, &mut messages, &mut next);
             assert_eq!(messages.len(), 1);
             assert!(
-                messages.values().next().unwrap()["text"]
+                !messages.values().next().unwrap()["text"]
                     .as_str()
                     .unwrap()
                     .contains(question)
             );
-            state.sessions[0].approval = None;
+            assert!(
+                worker.next_request_message().is_some(),
+                "request must have its own delivery"
+            );
+            state.sessions[0].set_approval(None);
             state.sessions[0].activity = Activity::Working;
             worker.pending.clear();
             flush(&mut worker, &state, &mut messages, &mut next);
@@ -2586,7 +2523,7 @@ mod tests {
                     .contains(question)
             );
         }
-        state.sessions[0].last_message = "Pushed to main.".into();
+        state.sessions[0].set_last_message("Pushed to main.".into());
         state.sessions[0].activity = Activity::Idle;
         flush(&mut worker, &state, &mut messages, &mut next);
         flush(&mut worker, &state, &mut messages, &mut next);
@@ -2609,56 +2546,47 @@ mod tests {
     }
 
     #[test]
-    fn failed_request_card_edit_keeps_ownership_until_retry() {
-        let (mut worker, mut state, _, _) = browsing_request(pending(Interaction::allow()));
-        state.sessions[0].approval = None;
-        worker.pending.clear();
+    fn failed_request_delivery_retries_independently_of_the_card() {
+        let mut request = pending(Interaction::allow());
+        request.message = None;
+        let (mut worker, state, key, _) = browsing_request(request);
         worker.flush_browser_with(&state, |_, _| Ok(json!({"message_id":77})));
-        state.sessions[0].approval = Some(Approval {
-            id: "next".into(),
-            body: "Next?".into(),
-            expires: u64::MAX,
-            can_allow: true,
-        });
-        let key = state.sessions[0].approval_key().unwrap();
-        worker.pending.insert(
-            key.clone(),
-            Pending::new(state.sessions[0].clone()).unwrap(),
-        );
-        worker.flush_browser_with(&state, |method, _| {
-            assert_eq!(method, "editMessageText");
-            bail!("offline")
-        });
-        assert_eq!(worker.browser.as_ref().unwrap().message, Some(77));
+        assert!(worker.flush_request_with(|_| bail!("offline")));
         assert!(!worker.pending[&key].delivered());
-        worker.flush_browser_with(&state, |method, payload| {
-            assert_eq!(method, "editMessageText");
-            assert_eq!(payload["message_id"], 77);
-            Ok(json!({"message_id":77}))
-        });
+        assert!(worker.flush_request_with(|_| Ok(json!(true))));
+        assert!(!worker.pending[&key].delivered());
+        assert!(worker.flush_request_with(|_| Ok(json!({"message_id":50}))));
+        assert!(worker.pending[&key].delivered());
         assert_eq!(worker.browser.as_ref().unwrap().message, Some(77));
-        assert!(worker.pending[&key].browser_delivered);
     }
 
     #[test]
-    fn showing_a_request_in_the_session_retires_its_old_standalone_notification() {
-        let request = pending(Interaction::allow());
-        let (mut worker, state, key, _) = browsing_request(request);
-        worker.flush_browser_with(&state, |_, _| Ok(json!({"message_id":77})));
-        assert!(worker.pending[&key].browser_delivered);
-        assert!(worker.pending[&key].message.is_none());
-        let (id, _) = worker
-            .cleanup
-            .pop_ready(Instant::now() + Duration::from_secs(1))
-            .unwrap();
-        assert_eq!(id, 50);
+    fn opening_the_session_preserves_the_separate_request_and_its_buttons() {
+        let (mut worker, state, key, _) = browsing_request(pending(Interaction::allow()));
+        worker.flush_browser_with(&state, |_, payload| {
+            assert!(
+                !payload["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Choose carefully")
+            );
+            Ok(json!({"message_id":77}))
+        });
+        assert_eq!(worker.pending[&key].message, Some(50));
+        assert!(
+            worker
+                .cleanup
+                .pop_ready(Instant::now() + Duration::from_secs(1))
+                .is_none()
+        );
         assert!(worker.next_request_message().is_none());
-        let old = json!({"from":{"id":42},"message":{"message_id":50,"chat":{"id":42,"type":"private"}},"data":"random-opaque-value:0"});
-        assert!(worker.callback_key(&old).is_none());
-        let mut current = old;
-        current["message"]["message_id"] = json!(77);
-        assert_eq!(worker.callback_key(&current), Some((key, 0)));
+        let request = json!({"from":{"id":42},"message":{"message_id":50,"chat":{"id":42,"type":"private"}},"data":"random-opaque-value:0"});
+        assert_eq!(worker.callback_key(&request), Some((key, 0)));
+        let mut card = request;
+        card["message"]["message_id"] = json!(77);
+        assert!(worker.callback_key(&card).is_none());
     }
+
     #[test]
     fn hidden_session_does_not_suppress_an_undelivered_question() {
         let mut request = pending(Interaction::allow());
@@ -2672,45 +2600,63 @@ mod tests {
             &crate::agents::sessions::Client::Terminal.application_id(),
             false,
         );
-        worker
-            .browser
-            .as_mut()
-            .unwrap()
-            .content(&state, &worker.pending);
-        assert!(!worker.pending[&key].browser_delivered);
+        worker.browser.as_mut().unwrap().content(&state);
+        assert!(!worker.pending[&key].delivered());
         assert_eq!(worker.next_request_message(), Some(key));
     }
     #[test]
-    fn multi_question_browser_answers_advance_without_editing_a_missing_notification() {
-        let mut request = pending(Interaction {
+    fn question_steps_edit_the_request_message_and_retry_without_touching_the_card() {
+        let request = pending(Interaction {
             command: None,
             actions: vec![],
             questions: vec![question("one", false), question("two", false)],
         });
-        request.message = None;
         let (mut worker, state, key, _) = browsing_request(request);
-        let (_, snapshots) = tokio::sync::watch::channel(std::sync::Arc::new(state.clone()));
+        let (tx, mut commands) = tokio::sync::mpsc::channel(8);
+        let (_published, snapshots) =
+            tokio::sync::watch::channel(std::sync::Arc::new(state.clone()));
         worker.monitor = monitor::Handle {
-            tx: tokio::sync::mpsc::channel(8).0,
+            tx,
             state: snapshots,
         };
         worker.flush_browser_with(&state, |_, _| Ok(json!({"message_id":77})));
-        assert!(worker.answer(&key, Some(0), None).is_ok());
+        let old = worker.pending[&key].nonce.clone();
+        worker.answer(&key, Some(0), None).unwrap();
         assert_eq!(worker.pending[&key].question, 1);
+        assert_ne!(worker.pending[&key].nonce, old);
+        assert!(
+            commands.try_recv().is_err(),
+            "do not submit a partial answer"
+        );
+        let now = Instant::now();
+        assert!(worker.flush_edits_with(now, |p| {
+            assert_eq!(p.message, Some(50));
+            bail!("offline")
+        }));
+        assert!(worker.flush_edits_with(now + Duration::from_secs(16), |p| {
+            assert_eq!(p.message, Some(50));
+            assert!(
+                p.payload()["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Question two")
+            );
+            Ok(())
+        }));
+        assert_eq!(worker.browser.as_ref().unwrap().message, Some(77));
+        worker.answer(&key, Some(0), None).unwrap();
+        assert!(
+            matches!(commands.try_recv(),Ok(monitor::Command::Submit{response:Response::Answers(values),..})if values.len()==2)
+        );
         assert!(worker.next_request_message().is_none());
-        worker.flush_browser_with(&state, |method, payload| {
-            assert_eq!(method, "editMessageText");
-            assert!(payload["text"].as_str().unwrap().contains("Question two"));
-            Ok(json!({"message_id":77}))
-        });
-        assert!(worker.pending[&key].browser_delivered);
     }
+
     #[test]
     fn new_agent_message_removes_old_controls_before_posting_the_new_message() {
         let mut worker = worker();
         let mut chat = session();
-        chat.approval = None;
-        chat.last_message = "First message".into();
+        chat.set_approval(None);
+        chat.set_last_message("First message".into());
         chat.activity = crate::agents::sessions::Activity::Idle;
         let mut state = monitor::State {
             sessions: vec![chat],
@@ -2718,7 +2664,7 @@ mod tests {
         };
         let mut browser = sessions::Browser::new().unwrap();
         browser.message = Some(77);
-        let list = browser.content(&state, &worker.pending);
+        let list = browser.content(&state);
         let select = list["reply_markup"]["inline_keyboard"]
             .as_array()
             .unwrap()
@@ -2731,11 +2677,11 @@ mod tests {
             })
             .unwrap();
         browser.navigate(77, select).unwrap();
-        let detail = browser.content(&state, &worker.pending);
+        let detail = browser.content(&state);
         browser.commit(detail);
         worker.browser = Some(browser);
         worker.config.messages = vec![50, 77];
-        state.sessions[0].last_message = "Second **message**".into();
+        state.sessions[0].set_last_message("Second **message**".into());
         assert!(!worker.flush_browser_with(&state, |method, payload| {
             assert_eq!(method, "editMessageReplyMarkup");
             assert_eq!(payload["message_id"], 77);
@@ -2819,7 +2765,7 @@ mod tests {
         let request = pending(interaction);
         let payload = request.payload();
         let text = payload["text"].as_str().unwrap();
-        let question = request.session.approval.as_ref().unwrap().body.as_str();
+        let question = request.session.approval().unwrap().body.as_str();
         assert!(text.find(question).unwrap() < text.find(command).unwrap());
         assert!(
             payload["entities"]

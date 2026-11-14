@@ -82,10 +82,13 @@ mod tests {
     fn readable_usernames_transliterate_full_names() {
         for (name, expected) in [
             ("Alex Morgan", "aiagmon_alex_morgan_bot"),
-            ("Иван Петров", "aiagmon_ivan_petrov_bot"),
+            (
+                "\u{418}\u{432}\u{430}\u{43d} \u{41f}\u{435}\u{442}\u{440}\u{43e}\u{432}",
+                "aiagmon_ivan_petrov_bot",
+            ),
             ("José García", "aiagmon_jose_garcia_bot"),
             ("John Smith", "aiagmon_john_smith_bot"),
-            ("张伟", "aiagmon_zhang_wei_bot"),
+            ("\u{5f20}\u{4f1f}", "aiagmon_zhang_wei_bot"),
             ("  John --- Smith__ ", "aiagmon_john_smith_bot"),
             ("", "aiagmon_my_bot"),
             ("___", "aiagmon_my_bot"),

@@ -144,7 +144,7 @@ impl Panel {
             ),
             (
                 "Pending".into(),
-                (sessions.iter().filter(|s| s.approval.is_some()).count() as u32).to_variant(),
+                (sessions.iter().filter(|s| s.approval().is_some()).count() as u32).to_variant(),
             ),
             (
                 "Finished".into(),

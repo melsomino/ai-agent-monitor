@@ -1,5 +1,7 @@
 # Visual foundations and component tokens
 
+The [2026-11-07 glass surface revision](glass-surfaces.md) overrides the older H/M surface palette below and records the current prototype geometry and remaining native differences. The ledger below otherwise retains the earlier baseline.
+
 <a id="visual-units"></a>
 ## Units, references, and hierarchy
 

@@ -1,6 +1,6 @@
 //! Observe the existing owner without resuming threads. Explicit replies are forwarded
 //! to that owner; async question replies use its normal user-message admission.
-use super::{async_questions, requests};
+use super::{async_questions, projection, requests};
 use crate::agents::interaction::{Interaction, Response};
 use crate::agents::sessions::{Activity, Approval};
 use anyhow::{Context, Result};
@@ -9,7 +9,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::{Read, Write},
+    io::{self, BufReader, Read, Write},
     os::unix::{
         fs::{FileTypeExt, MetadataExt},
         net::UnixStream,
@@ -19,8 +19,23 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
 const STREAM_VERSION: u64 = 11;
-const MAX_FRAME: usize = 32 * 1024 * 1024;
+
+// Verified against the installed Codex 26.1106 (v11) and 26.1111 (v13)
+// implementations: the projected state fields and snapshot/patch envelopes are
+// compatible. Do not accept arbitrary future versions on permission paths.
+fn supported_stream(message: &Value) -> bool {
+    message["method"] == "thread-stream-state-changed"
+        && matches!(message["version"].as_u64(), Some(11 | 13))
+}
+// Owners include embedded tool images in snapshots, even though the observer
+// projects them out. Receive bounded large snapshots without widening send limits.
+const MAX_FRAME: usize = 256 * 1024 * 1024;
+const MAX_REQUEST: usize = 32 * 1024 * 1024;
+// Large owner snapshots can take several seconds to transfer and decode.
+// This budget applies both before sending and while verifying resolution.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 struct Live {
     owner: String,
@@ -37,6 +52,7 @@ struct Ticket {
 struct State {
     tickets: HashMap<String, Ticket>,
     next_ticket: u64,
+    activities: HashMap<String, VecDeque<crate::domain::session_activity::SessionActivity>>,
 }
 pub struct Runtime {
     socket: std::path::PathBuf,
@@ -47,6 +63,11 @@ pub struct Runtime {
 }
 impl Default for Runtime {
     fn default() -> Self {
+        Self::with_updates(Arc::new(tokio::sync::Notify::new()))
+    }
+}
+impl Runtime {
+    pub(super) fn with_updates(updates: Arc<tokio::sync::Notify>) -> Self {
         let socket = socket_path(&crate::app::core::codex_home());
         let watched_socket = socket.clone();
         let (wanted, mut requests) = tokio::sync::watch::channel(HashSet::new());
@@ -57,8 +78,9 @@ impl Default for Runtime {
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
-                if watch(&mut requests, &published, &watched_socket).is_err() {
-                    published.send_replace(Arc::new(HashMap::new()));
+                if let Err(error) = watch(&mut requests, &published, &watched_socket, &updates) {
+                    eprintln!("Codex observer disconnected: {error:#}");
+                    publish_live(&published, &HashMap::new(), &updates);
                 }
                 if requests.has_changed().is_err() {
                     break;
@@ -81,7 +103,9 @@ impl Default for Runtime {
 #[derive(Clone)]
 pub struct View {
     pub activity: Activity,
+    #[cfg(test)]
     pub approval: Option<Approval>,
+    pub activities: VecDeque<crate::domain::session_activity::SessionActivity>,
 }
 
 impl Runtime {
@@ -92,15 +116,19 @@ impl Runtime {
         let current = self.observed.borrow().clone();
         let mut state = self.state.borrow_mut();
         state.tickets.retain(|_, t| {
-            current.get(&t.session).is_some_and(|s| {
-                s.owner == t.owner
-                    && s.state["requests"]
-                        .as_array()
-                        .is_some_and(|requests| requests.contains(&t.request))
-                    || (s.owner == t.owner
-                        && async_questions::pending(&s.state).as_ref() == Some(&t.request))
-            })
+            // Missing transport state is not evidence that the owner resolved
+            // or edited a request. Keep its identity through reconnects, but
+            // expose no authoritative view until a fresh snapshot arrives.
+            ids.contains(&t.session)
+                && current.get(&t.session).is_none_or(|s| {
+                    s.owner == t.owner
+                        && (s.state["requests"]
+                            .as_array()
+                            .is_some_and(|requests| requests.contains(&t.request))
+                            || async_questions::pending(&s.state).as_ref() == Some(&t.request))
+                })
         });
+        state.activities.retain(|id, _| ids.contains(id));
         let mut result = HashMap::new();
         for id in ids {
             let Some(live) = current.get(id) else {
@@ -110,25 +138,29 @@ impl Runtime {
                 continue;
             };
             let async_request = async_questions::pending(&live.state);
-            let request = live.state["requests"]
+            use crate::domain::session_activity::*;
+            let addressed: Vec<_> = live.state["requests"]
                 .as_array()
-                .and_then(|requests| {
-                    requests.iter().find(|r| {
-                        matches!(
-                            r["method"].as_str(),
-                            Some(
-                                "item/commandExecution/requestApproval"
-                                    | "item/fileChange/requestApproval"
-                                    | "item/permissions/requestApproval"
-                                    | "item/tool/requestUserInput"
-                                    | "item/tool/requestOptionPicker"
-                                    | "mcpServer/elicitation/request"
-                            )
+                .into_iter()
+                .flatten()
+                .filter(|r| {
+                    matches!(
+                        r["method"].as_str(),
+                        Some(
+                            "item/commandExecution/requestApproval"
+                                | "item/fileChange/requestApproval"
+                                | "item/permissions/requestApproval"
+                                | "item/tool/requestUserInput"
+                                | "item/tool/requestOptionPicker"
+                                | "mcpServer/elicitation/request"
                         )
-                    })
+                    )
                 })
-                .or(async_request.as_ref());
-            let approval = if let Some(request) = request {
+                .chain(async_request.as_ref())
+                .take(128)
+                .collect();
+            let mut active_requests = Vec::new();
+            for request in addressed {
                 let token = state
                     .tickets
                     .iter()
@@ -154,33 +186,117 @@ impl Runtime {
                         );
                         token
                     });
-                Some(Approval {
+                let approval = Approval {
                     id: token,
                     body: body(request),
                     expires: u64::MAX,
                     can_allow: requests::interaction(request)
                         .actions
                         .iter()
-                        .any(|action| action.id == "allow"),
-                })
-            } else if activity == Activity::Confirmation {
-                Some(Approval {
-                    id: format!("ipc-view:{id}"),
-                    body: "Codex is waiting for your confirmation or input.".into(),
-                    expires: u64::MAX,
-                    can_allow: false,
-                })
+                        .any(|a| a.id == "allow"),
+                };
+                let time = now();
+                active_requests.push(SessionActivity::Request(SessionRequest {
+                    id: format!(
+                        "codex-request:{}:{}:{}",
+                        request["params"]["turnId"], request["method"], request["id"]
+                    ),
+                    started_at: time,
+                    updated_at: time,
+                    approval,
+                    interaction: requests::interaction(request),
+                    status: RequestStatus::Pending,
+                }));
+            }
+            let recent = state.activities.entry(id.clone()).or_default();
+            let current_action = if activity == Activity::Working {
+                super::progress::current_event(&live.state)
             } else {
                 None
             };
+            for mut incoming in super::progress::recent_events(&live.state) {
+                if current_action
+                    .as_ref()
+                    .is_some_and(|a| a.id == incoming.id())
+                {
+                    continue;
+                }
+                if let Some(old) = recent.iter().find(|a| a.id() == incoming.id()) {
+                    let updated =
+                        if let (SessionActivity::Action(old), SessionActivity::Action(next)) =
+                            (old, &incoming)
+                        {
+                            if old.text == next.text && old.status == next.status {
+                                old.updated_at
+                            } else {
+                                now()
+                            }
+                        } else {
+                            incoming.updated_at()
+                        };
+                    incoming.set_times(old.started_at(), updated);
+                }
+                upsert(recent, incoming);
+            }
+            for a in recent.iter_mut() {
+                if let SessionActivity::Action(a) = a {
+                    a.current = current_action
+                        .as_ref()
+                        .is_some_and(|current| current.id == a.id);
+                }
+            }
+            if let Some(mut action) = current_action {
+                if let Some(SessionActivity::Action(old)) =
+                    recent.iter().find(|a| a.id() == action.id)
+                {
+                    action.started_at = old.started_at;
+                    if action.text == old.text && action.status == old.status {
+                        action.updated_at = old.updated_at;
+                    }
+                }
+                upsert(recent, SessionActivity::Action(action));
+            }
+            for old in recent.iter_mut() {
+                if let SessionActivity::Request(r) = old
+                    && r.status == RequestStatus::Pending
+                    && !active_requests.iter().any(|a| a.id() == r.id)
+                {
+                    r.status = RequestStatus::Resolved;
+                    r.updated_at = now();
+                }
+            }
+            for mut incoming in active_requests {
+                if let Some(old) = recent.iter().find(|a| a.id() == incoming.id()) {
+                    incoming.set_times(old.started_at(), old.updated_at());
+                    if let (SessionActivity::Request(old), SessionActivity::Request(next)) =
+                        (old, &mut incoming)
+                        && (old.approval != next.approval || old.interaction != next.interaction)
+                    {
+                        next.updated_at = now();
+                    }
+                }
+                upsert(recent, incoming);
+            }
+            trim(recent);
+            let approval = recent.iter().find_map(|a| {
+                if let SessionActivity::Request(r) = a
+                    && r.status == RequestStatus::Pending
+                {
+                    Some(r.approval.clone())
+                } else {
+                    None
+                }
+            });
             result.insert(
                 id.clone(),
                 View {
+                    activities: recent.clone(),
                     activity: if approval.is_some() {
                         Activity::Confirmation
                     } else {
                         activity
                     },
+                    #[cfg(test)]
                     approval,
                 },
             );
@@ -188,7 +304,7 @@ impl Runtime {
         result
     }
 }
-fn activity(status: &Value) -> Option<Activity> {
+pub(super) fn activity(status: &Value) -> Option<Activity> {
     match status["type"].as_str()? {
         "idle" => Some(Activity::Idle),
         "active" => Some(
@@ -206,7 +322,7 @@ fn activity(status: &Value) -> Option<Activity> {
         _ => None,
     }
 }
-fn body(request: &Value) -> String {
+pub(super) fn body(request: &Value) -> String {
     let p = &request["params"];
     if request["method"] == "item/tool/requestUserInput"
         || request["method"] == async_questions::METHOD
@@ -283,7 +399,7 @@ impl Runtime {
             .unwrap_or(false)
     }
     pub fn allow_for(&self, session: &crate::agents::sessions::Session) -> bool {
-        let Some(approval) = &session.approval else {
+        let Some(approval) = &session.approval() else {
             return false;
         };
         let valid = self
@@ -305,14 +421,13 @@ impl Runtime {
             let mut connection = Connection::connect(&self.socket)?;
             let owner = connection.owner(session)?;
             connection.follow(session, &owner, true)?;
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
             while Instant::now() < deadline {
                 let Some(message) = connection.next()? else {
                     continue;
                 };
-                if message["method"] != "thread-stream-state-changed"
+                if !supported_stream(&message)
                     || message["sourceClientId"] != owner
-                    || message["version"] != STREAM_VERSION
                     || message["params"]["conversationId"] != session
                     || message["params"]["hostId"] != "local"
                     || message["params"]["change"]["type"] != "snapshot"
@@ -346,7 +461,7 @@ impl Runtime {
         }
     }
     pub fn interaction_for(&self, session: &crate::agents::sessions::Session) -> Interaction {
-        let Some(approval) = &session.approval else {
+        let Some(approval) = &session.approval() else {
             return Interaction::default();
         };
         self.state
@@ -362,7 +477,7 @@ impl Runtime {
         session: &crate::agents::sessions::Session,
         response: &Response,
     ) -> bool {
-        let Some(approval) = &session.approval else {
+        let Some(approval) = &session.approval() else {
             return false;
         };
         let valid = self
@@ -384,7 +499,7 @@ impl Runtime {
         response: &Response,
     ) -> crate::agents::interaction::Delivery {
         use crate::agents::interaction::Delivery;
-        let Some(approval) = &session.approval else {
+        let Some(approval) = &session.approval() else {
             return Delivery::NotSent;
         };
         if !self
@@ -428,14 +543,13 @@ impl Runtime {
             return Ok(false);
         }
         connection.follow(&ticket.session, &owner, true)?;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
         while Instant::now() < deadline {
             let Some(message) = connection.next()? else {
                 continue;
             };
-            if message["method"] != "thread-stream-state-changed"
+            if !supported_stream(&message)
                 || message["sourceClientId"] != owner
-                || message["version"] != STREAM_VERSION
                 || message["params"]["conversationId"] != ticket.session
                 || message["params"]["hostId"] != "local"
             {
@@ -476,14 +590,13 @@ impl Runtime {
             // The owner returns ok even when its strict request lookup finds nothing.
             // A transport acknowledgement alone must not make the UI report Sent.
             connection.follow(&ticket.session, &owner, true)?;
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
             while Instant::now() < deadline {
                 let Some(message) = connection.next()? else {
                     continue;
                 };
-                if message["method"] != "thread-stream-state-changed"
+                if !supported_stream(&message)
                     || message["sourceClientId"] != owner
-                    || message["version"] != STREAM_VERSION
                     || message["params"]["conversationId"] != ticket.session
                     || message["params"]["hostId"] != "local"
                 {
@@ -525,7 +638,7 @@ fn socket_path(home: &std::path::Path) -> std::path::PathBuf {
 }
 
 // A received rejection proves non-admission. A missing/malformed response does not.
-fn client_message_id() -> Result<String> {
+pub(super) fn client_message_id() -> Result<String> {
     let mut random = [0u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
     random[6] = (random[6] & 0x0f) | 0x40;
@@ -558,7 +671,11 @@ fn admission(result: &Value, approval: bool, attempted: &mut bool) -> bool {
 
 struct Connection {
     socket: UnixStream,
-    bytes: Vec<u8>,
+    input: BufReader<UnixStream>,
+    header: [u8; 4],
+    header_len: usize,
+    header_started: Option<Instant>,
+    failed: bool,
     queued: VecDeque<Value>,
     client: String,
     next_id: u64,
@@ -574,17 +691,7 @@ impl Connection {
                 && meta.mode() & 0o077 == 0,
             "Untrusted Codex IPC endpoint"
         );
-        let socket = UnixStream::connect(path)?;
-        socket.set_read_timeout(Some(Duration::from_millis(50)))?;
-        socket.set_write_timeout(Some(Duration::from_millis(250)))?;
-        let mut connection = Self {
-            socket,
-            bytes: Vec::new(),
-            queued: VecDeque::new(),
-            client: format!("agent-monitor-{}", std::process::id()),
-            next_id: 0,
-            follows: HashMap::new(),
-        };
+        let mut connection = Self::from_socket(UnixStream::connect(path)?)?;
         let reply =
             connection.request("initialize", json!({"clientType":"agent-monitor"}), 0, None)?;
         connection.client = reply["result"]["clientId"]
@@ -593,40 +700,79 @@ impl Connection {
             .into();
         Ok(connection)
     }
+    fn from_socket(socket: UnixStream) -> Result<Self> {
+        socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+        socket.set_write_timeout(Some(Duration::from_millis(250)))?;
+        Ok(Self {
+            input: BufReader::with_capacity(65536, socket.try_clone()?),
+            socket,
+            header: [0; 4],
+            header_len: 0,
+            header_started: None,
+            failed: false,
+            queued: VecDeque::new(),
+            client: format!("agent-monitor-{}", std::process::id()),
+            next_id: 0,
+            follows: HashMap::new(),
+        })
+    }
     fn send(&mut self, value: Value) -> Result<()> {
+        anyhow::ensure!(!self.failed, "IPC connection is unusable");
         let data = serde_json::to_vec(&value)?;
-        anyhow::ensure!(data.len() <= MAX_FRAME, "IPC message too large");
+        anyhow::ensure!(data.len() <= MAX_REQUEST, "IPC message too large");
         self.socket.write_all(&(data.len() as u32).to_le_bytes())?;
         self.socket.write_all(&data)?;
         Ok(())
     }
     fn read(&mut self) -> Result<Option<Value>> {
-        if self.bytes.len() >= 4 {
-            let length = u32::from_le_bytes(self.bytes[..4].try_into().unwrap()) as usize;
-            anyhow::ensure!(length <= MAX_FRAME, "IPC snapshot too large");
-            if self.bytes.len() >= length + 4 {
-                let value = serde_json::from_slice(&self.bytes[4..length + 4])?;
-                self.bytes.drain(..length + 4);
-                return Ok(Some(value));
+        anyhow::ensure!(!self.failed, "IPC connection is unusable");
+        let result = self.read_frame();
+        if result.is_err() {
+            // A partial JSON decoder cannot be resumed after an error. Never
+            // interpret leftover frame bytes as another header/request.
+            self.failed = true;
+        }
+        result
+    }
+    fn read_frame(&mut self) -> Result<Option<Value>> {
+        if let Some(started) = self.header_started {
+            anyhow::ensure!(started.elapsed() < SNAPSHOT_TIMEOUT, "IPC header timed out");
+        }
+        if self.header_len < 4 {
+            match self.input.read(&mut self.header[self.header_len..]) {
+                Ok(0) => anyhow::bail!("IPC disconnected"),
+                Ok(size) => {
+                    self.header_started.get_or_insert_with(Instant::now);
+                    self.header_len += size;
+                    if self.header_len < 4 {
+                        return Ok(None);
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
             }
         }
-        let mut data = [0u8; 65536];
-        match self.socket.read(&mut data) {
-            Ok(0) => anyhow::bail!("IPC disconnected"),
-            Ok(size) => {
-                self.bytes.extend_from_slice(&data[..size]);
-                Ok(None)
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(e) => Err(e.into()),
-        }
+        let length = u32::from_le_bytes(self.header) as usize;
+        anyhow::ensure!(length <= MAX_FRAME, "IPC snapshot too large");
+        // Limit before buffering: the JSON decoder cannot eat the next frame.
+        // Short socket timeouts are retried inside one bounded decode; restarting
+        // a serde decoder after a timeout would lose its position in the JSON.
+        let mut frame = (&mut self.input).take(length as u64);
+        let value = projection::decode_reader(FrameRead {
+            input: &mut frame,
+            deadline: Instant::now() + SNAPSHOT_TIMEOUT,
+        })?;
+        anyhow::ensure!(frame.limit() == 0, "Truncated IPC frame");
+        self.header_len = 0;
+        self.header_started = None;
+        Ok(Some(value))
     }
     fn handle_discovery(&mut self, message: &Value) -> Result<bool> {
         if message["type"] == "client-discovery-request" {
@@ -653,13 +799,13 @@ impl Connection {
             Ok(Some(message))
         }
     }
-    fn request(
+    fn begin_request(
         &mut self,
         method: &str,
         params: Value,
         version: u64,
         target: Option<&str>,
-    ) -> Result<Value> {
+    ) -> Result<(String, Instant)> {
         self.next_id += 1;
         let id = format!("aim-{}", self.next_id);
         let timeout = if matches!(
@@ -667,6 +813,10 @@ impl Connection {
             "thread-follower-start-turn" | "thread-follower-steer-turn"
         ) {
             8000
+        } else if method == "thread-owner-discovery" {
+            // A response can arrive behind an image-heavy snapshot on the
+            // same framed stream; allow time to drain and project that frame.
+            5000
         } else {
             1000
         };
@@ -676,6 +826,16 @@ impl Connection {
         }
         self.send(message)?;
         let deadline = Instant::now() + Duration::from_millis(timeout + 500);
+        Ok((id, deadline))
+    }
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        version: u64,
+        target: Option<&str>,
+    ) -> Result<Value> {
+        let (id, deadline) = self.begin_request(method, params, version, target)?;
         while Instant::now() < deadline {
             let Some(message) = self.read()? else {
                 continue;
@@ -716,6 +876,37 @@ impl Connection {
         Ok(())
     }
 }
+/// A partial frame owns the decoder until completion or its absolute deadline.
+/// This runs on the observer/provider worker, never on the UI/monitor thread.
+struct FrameRead<R> {
+    input: R,
+    deadline: Instant,
+}
+impl<R: Read> Read for FrameRead<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "IPC frame timed out",
+                ));
+            }
+            match self.input.read(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+}
 impl Drop for Connection {
     fn drop(&mut self) {
         for (session, owner) in self.follows.clone() {
@@ -727,10 +918,13 @@ fn watch(
     wanted_receiver: &mut tokio::sync::watch::Receiver<HashSet<String>>,
     published: &tokio::sync::watch::Sender<Arc<HashMap<String, Live>>>,
     socket: &std::path::Path,
+    updates: &tokio::sync::Notify,
 ) -> Result<()> {
     let mut connection = Connection::connect(socket)?;
     let mut live = HashMap::<String, Live>::new();
     let mut owners: HashMap<String, String> = HashMap::new();
+    let mut awaiting_snapshot: HashMap<String, Instant> = HashMap::new();
+    let mut owner_requests: HashMap<String, (String, Instant)> = HashMap::new();
     let mut checked = Instant::now() - Duration::from_secs(6);
     let mut last_wanted = HashSet::new();
     loop {
@@ -753,33 +947,72 @@ fn watch(
                     connection.follow(&session, &owner, false)?;
                 }
                 live.remove(&session);
+                awaiting_snapshot.remove(&session);
             }
+            owner_requests.retain(|_, (session, deadline)| {
+                wanted.contains(session) && Instant::now() < *deadline
+            });
             for session in wanted {
-                if let Ok(owner) = connection.owner(&session) {
-                    if owners.get(&session) != Some(&owner) {
-                        if let Some(old) = owners.insert(session.clone(), owner.clone()) {
-                            connection.follow(&session, &old, false)?;
-                        }
-                        live.remove(&session);
-                    }
-                    // Reaffirming a subscription also requests a fresh snapshot.
-                    // A missed patch or an owner-side subscription reset must not
-                    // leave a resolved approval cached indefinitely.
-                    connection.follow(&session, &owner, true)?;
-                } else {
-                    owners.remove(&session);
-                    live.remove(&session);
+                if owner_requests
+                    .values()
+                    .any(|(pending, _)| pending == &session)
+                {
+                    continue;
                 }
+                let (request, deadline) = connection.begin_request(
+                    "thread-owner-discovery",
+                    json!({"hostId":"local","conversationId":session}),
+                    1,
+                    None,
+                )?;
+                owner_requests.insert(request, (session, deadline));
             }
             checked = Instant::now();
         }
-        published.send_replace(Arc::new(live.clone()));
+        publish_live(published, &live, updates);
         let Some(message) = connection.next()? else {
             continue;
         };
-        if message["method"] == "ipc-connection-reset" {
+        if message["type"] == "response" {
+            let Some((session, _)) = message["requestId"]
+                .as_str()
+                .and_then(|id| owner_requests.remove(id))
+            else {
+                continue;
+            };
+            if !wanted_receiver.borrow().contains(&session) {
+                continue;
+            }
+            if message["resultType"] == "success"
+                && let Some(owner) = message["handledByClientId"].as_str()
+            {
+                if owners.get(&session).map(String::as_str) != Some(owner) {
+                    if let Some(old) = owners.insert(session.clone(), owner.into()) {
+                        connection.follow(&session, &old, false)?;
+                    }
+                    live.remove(&session);
+                    awaiting_snapshot.remove(&session);
+                }
+                if needs_snapshot(
+                    live.contains_key(&session),
+                    awaiting_snapshot.get(&session).copied(),
+                    Instant::now(),
+                ) {
+                    connection.follow(&session, owner, true)?;
+                    awaiting_snapshot.insert(session, Instant::now());
+                }
+            } else {
+                if let Some(owner) = owners.remove(&session) {
+                    connection.follow(&session, &owner, false)?;
+                }
+                live.remove(&session);
+                awaiting_snapshot.remove(&session);
+            }
+        } else if message["method"] == "ipc-connection-reset" {
             owners.clear();
+            owner_requests.clear();
             live.clear();
+            awaiting_snapshot.clear();
             checked = Instant::now() - Duration::from_secs(6);
         } else if message["method"] == "thread-stream-following-status-requested" {
             if let Some(session) = message["params"]["conversationId"].as_str()
@@ -788,6 +1021,7 @@ fn watch(
                 && message["sourceClientId"] == *owner
             {
                 connection.follow(session, owner, true)?;
+                awaiting_snapshot.insert(session.into(), Instant::now());
             }
         } else if message["method"] == "client-status-changed"
             && message["params"]["status"] == "disconnected"
@@ -795,11 +1029,10 @@ fn watch(
             if let Some(client) = message["params"]["clientId"].as_str() {
                 owners.retain(|_, owner| owner != client);
                 live.retain(|_, s| s.owner != client);
+                awaiting_snapshot.retain(|session, _| owners.contains_key(session));
                 checked = Instant::now() - Duration::from_secs(6);
             }
-        } else if message["method"] == "thread-stream-state-changed"
-            && message["version"] == STREAM_VERSION
-        {
+        } else if supported_stream(&message) {
             let Some(session) = message["params"]["conversationId"].as_str() else {
                 continue;
             };
@@ -813,11 +1046,38 @@ fn watch(
                 continue;
             }
             if !apply_change(&mut live, session, owner, &message["params"]["change"]) {
+                awaiting_snapshot.remove(session);
                 checked = Instant::now() - Duration::from_secs(6);
+            } else {
+                awaiting_snapshot.remove(session);
             }
-            published.send_replace(Arc::new(live.clone()));
+            publish_live(published, &live, updates);
         }
     }
+}
+fn publish_live(
+    published: &tokio::sync::watch::Sender<Arc<HashMap<String, Live>>>,
+    live: &HashMap<String, Live>,
+    updates: &tokio::sync::Notify,
+) {
+    let changed = {
+        let old = published.borrow();
+        old.len() != live.len()
+            || live.iter().any(|(id, view)| {
+                old.get(id).is_none_or(|before| {
+                    before.owner != view.owner
+                        || before.revision != view.revision
+                        || !Arc::ptr_eq(&before.state, &view.state)
+                })
+            })
+    };
+    if changed {
+        published.send_replace(Arc::new(live.clone()));
+        updates.notify_one();
+    }
+}
+fn needs_snapshot(has_live: bool, awaiting: Option<Instant>, now: Instant) -> bool {
+    !has_live && awaiting.is_none_or(|sent| now.duration_since(sent) >= SNAPSHOT_TIMEOUT)
 }
 fn apply_change(
     live: &mut HashMap<String, Live>,
@@ -960,11 +1220,15 @@ mod tests {
                 .unwrap();
             stream.write_all(&data).unwrap();
         }
-        for (status, outcome) in [
-            ("idle", "success"),
-            ("active", "success"),
-            ("active", "error"),
-            ("idle", "disconnect"),
+        for (version, status, outcome) in [
+            (11, "idle", "success"),
+            (11, "active", "success"),
+            (11, "active", "error"),
+            (11, "idle", "disconnect"),
+            (13, "idle", "success"),
+            (13, "active", "success"),
+            (13, "active", "error"),
+            (13, "idle", "disconnect"),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("ipc.sock");
@@ -993,7 +1257,7 @@ mod tests {
                 assert_eq!(follow["targetClientIds"], json!(["owner"]));
                 write(
                     &mut socket,
-                    json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner","version":STREAM_VERSION,"params":{"hostId":"local","conversationId":"chat","change":{"type":"snapshot","revision":1,"conversationState":{"id":"chat","requests":[],"threadRuntimeStatus":{"type":status}}}}}),
+                    json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner","version":version,"params":{"hostId":"local","conversationId":"chat","change":{"type":"snapshot","revision":1,"conversationState":{"id":"chat","requests":[],"threadRuntimeStatus":{"type":status}}}}}),
                 );
                 let request = read(&mut socket);
                 assert_eq!(request["targetClientId"], "owner");
@@ -1082,6 +1346,96 @@ mod tests {
     use super::*;
     fn request() -> Value {
         json!({"method":"item/commandExecution/requestApproval","id":82,"params":{"threadId":"chat","turnId":"turn","reason":"Allow file update?","command":"original"}})
+    }
+    #[test]
+    fn waiting_flag_without_an_addressed_request_does_not_invent_an_approval() {
+        let mut live = HashMap::new();
+        let mut update = snapshot();
+        update["conversationState"]["requests"] = json!([]);
+        apply_change(&mut live, "chat", "owner", &update);
+        let (published, observed) = tokio::sync::watch::channel(Arc::new(live.clone()));
+        let (wanted, _requests) = tokio::sync::watch::channel(HashSet::new());
+        let runtime = Runtime {
+            socket: Default::default(),
+            wanted,
+            observed,
+            state: RefCell::new(State::default()),
+            epoch: 0,
+        };
+        let ids = HashSet::from(["chat".to_owned()]);
+        let view = runtime.views(&ids).remove("chat").unwrap();
+        assert_eq!(view.activity, Activity::Confirmation);
+        assert!(view.approval.is_none());
+        update["revision"] = json!(5);
+        update["conversationState"]["requests"] = json!([request()]);
+        apply_change(&mut live, "chat", "owner", &update);
+        published.send_replace(Arc::new(live));
+        assert!(
+            runtime.views(&ids)["chat"].approval.is_some(),
+            "real requests must still arrive"
+        );
+    }
+    #[test]
+    fn owner_wire_patches_retain_the_last_caption_until_the_next_agent_message() {
+        fn wire(change: Value) -> Value {
+            projection::decode(&serde_json::to_vec(&json!({"params":{"change":change}})).unwrap())
+                .unwrap()["params"]["change"]
+                .clone()
+        }
+        let mut live = HashMap::new();
+        let snapshot = wire(
+            json!({"type":"snapshot","revision":1,"conversationState":{"id":"chat","requests":[],"threadRuntimeStatus":{"type":"active","activeFlags":[]},"turns":[],"turnHistory":{"history":{"entitiesByKey":{"turn:live":{"turnId":"live","turnStartedAtMs":1,"items":[{"type":"commandExecution","id":"command","command":"cargo test --offline","status":"inProgress"}]}}}}}}),
+        );
+        assert!(apply_change(&mut live, "chat", "owner", &snapshot));
+        let base = vec![
+            json!("turnHistory"),
+            json!("history"),
+            json!("entitiesByKey"),
+            json!("turn:live"),
+            json!("items"),
+        ];
+        let mut status = base.clone();
+        status.extend([json!(0), json!("status")]);
+        let mut thought = base.clone();
+        thought.push(json!(1));
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &wire(
+                json!({"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"replace","path":status,"value":"completed"},{"op":"add","path":thought,"value":{"id":"thought","type":"reasoning","summary":[],"content":["RAW REASONING"]}}]})
+            )
+        ));
+        assert_eq!(
+            super::super::progress::current(&live["chat"].state).as_deref(),
+            Some("Running cargo test --offline")
+        );
+        let mut message = base;
+        message.push(json!(2));
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &wire(
+                json!({"type":"patches","baseRevision":2,"revision":3,"patches":[{"op":"add","path":message,"value":{"type":"agentMessage","id":"answer","text":"New message"}}]})
+            )
+        ));
+        assert!(super::super::progress::current(&live["chat"].state).is_none());
+        assert!(!live["chat"].state.to_string().contains("RAW REASONING"));
+    }
+    #[test]
+    fn stream_versions_are_explicit_for_observation_and_response_validation() {
+        for version in [json!(11), json!(13)] {
+            let mut message = json!({"method":"thread-stream-state-changed","version":version});
+            assert!(supported_stream(&message));
+            message["method"] = json!("unrelated-event");
+            assert!(!supported_stream(&message));
+        }
+        for version in [json!(10), json!(12), json!(14), json!("13"), Value::Null] {
+            assert!(!supported_stream(
+                &json!({"method":"thread-stream-state-changed","version":version})
+            ));
+        }
     }
     fn snapshot() -> Value {
         json!({"type":"snapshot","revision":4,"conversationState":{"id":"chat","requests":[request()],"threadRuntimeStatus":{"type":"active","activeFlags":["waitingOnApproval"]},"turnHistory":{"ignored":"large history"}}})
@@ -1278,16 +1632,175 @@ mod tests {
         assert!(approval_method(&json!({"id":82,"method":"item/tool/requestUserInput"})).is_none());
     }
     #[test]
+    fn approval_waits_for_slow_fresh_snapshot_and_resolution_before_reporting_success() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        fn read(socket: &mut UnixStream) -> Value {
+            let mut header = [0; 4];
+            socket.read_exact(&mut header).unwrap();
+            let mut bytes = vec![0; u32::from_le_bytes(header) as usize];
+            socket.read_exact(&mut bytes).unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        fn write(socket: &mut UnixStream, value: Value) {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            socket
+                .write_all(&(bytes.len() as u32).to_le_bytes())
+                .unwrap();
+            socket.write_all(&bytes).unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ipc.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(12)))
+                .unwrap();
+            let init = read(&mut socket);
+            write(
+                &mut socket,
+                json!({"type":"response","requestId":init["requestId"],"resultType":"success","result":{"clientId":"monitor"}}),
+            );
+            let discovery = read(&mut socket);
+            assert_eq!(discovery["method"], "thread-owner-discovery");
+            write(
+                &mut socket,
+                json!({"type":"response","requestId":discovery["requestId"],"resultType":"success","handledByClientId":"owner"}),
+            );
+            let follow = read(&mut socket);
+            assert_eq!(follow["params"]["following"], true);
+            // Exceeds the old two-second cutoff before any permission is sent.
+            thread::sleep(Duration::from_millis(2200));
+            write(
+                &mut socket,
+                json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner","version":13,"params":{"hostId":"local","conversationId":"chat","change":snapshot()}}),
+            );
+            let decision = read(&mut socket);
+            assert_eq!(
+                decision["method"],
+                "thread-follower-command-approval-decision"
+            );
+            assert_eq!(decision["targetClientId"], "owner");
+            assert_eq!(decision["params"]["requestId"], 82);
+            assert_eq!(decision["params"]["decision"], "accept");
+            write(
+                &mut socket,
+                json!({"type":"response","requestId":decision["requestId"],"resultType":"success","result":{"ok":true}}),
+            );
+            let follow = read(&mut socket);
+            assert_eq!(follow["params"]["following"], true);
+            // An RPC acknowledgement is insufficient; wait for owner evidence.
+            thread::sleep(Duration::from_millis(2200));
+            let mut resolved = snapshot();
+            resolved["revision"] = 5.into();
+            resolved["conversationState"]["requests"] = json!([]);
+            write(
+                &mut socket,
+                json!({"type":"broadcast","method":"thread-stream-state-changed","sourceClientId":"owner","version":13,"params":{"hostId":"local","conversationId":"chat","change":resolved}}),
+            );
+        });
+        let (wanted, _requests) = tokio::sync::watch::channel(HashSet::new());
+        let (_published, observed) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
+        let runtime = Runtime {
+            socket: path,
+            wanted,
+            observed,
+            state: RefCell::new(State::default()),
+            epoch: 0,
+        };
+        runtime.state.borrow_mut().tickets.insert(
+            "ticket".into(),
+            Ticket {
+                session: "chat".into(),
+                owner: "owner".into(),
+                request: request(),
+            },
+        );
+        let mut attempted = false;
+        let start = Instant::now();
+        assert!(
+            runtime
+                .respond_inner("ticket", &Response::Action("allow".into()), &mut attempted)
+                .unwrap()
+        );
+        assert!(attempted);
+        assert!(start.elapsed() >= Duration::from_millis(4400));
+        server.join().unwrap();
+    }
+    #[test]
+    fn reconnect_preserves_ticket_identity_without_authorizing_stale_state() {
+        let (wanted, _requests) = tokio::sync::watch::channel(HashSet::new());
+        let (published, observed) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
+        let runtime = Runtime {
+            socket: std::path::PathBuf::new(),
+            wanted,
+            observed,
+            state: RefCell::new(State::default()),
+            epoch: 0,
+        };
+        let ids = HashSet::from(["chat".to_owned()]);
+        let mut live = HashMap::new();
+        assert!(apply_change(&mut live, "chat", "owner", &snapshot()));
+        published.send_replace(Arc::new(live.clone()));
+        let token = runtime.views(&ids)["chat"]
+            .approval
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        published.send_replace(Arc::new(HashMap::new()));
+        assert!(runtime.views(&ids).is_empty());
+        published.send_replace(Arc::new(live.clone()));
+        assert_eq!(
+            runtime.views(&ids)["chat"].approval.as_ref().unwrap().id,
+            token
+        );
+        // A changed command must acquire a new identity, even with the same wire id.
+        Arc::make_mut(&mut live.get_mut("chat").unwrap().state)["requests"][0]["params"]["command"] =
+            "changed".into();
+        published.send_replace(Arc::new(live.clone()));
+        assert_ne!(
+            runtime.views(&ids)["chat"].approval.as_ref().unwrap().id,
+            token
+        );
+        Arc::make_mut(&mut live.get_mut("chat").unwrap().state)["requests"] = json!([]);
+        published.send_replace(Arc::new(live));
+        runtime.views(&ids);
+        assert!(runtime.state.borrow().tickets.is_empty());
+    }
+    #[test]
+    fn observer_streams_image_heavy_frames_above_outgoing_limit() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let prefix = br#"{"method":"thread-stream-state-changed","params":{"change":{"type":"snapshot","conversationState":{"id":"chat","requests":[],"turns":[{"items":[{"type":"tool","output":""#;
+        let suffix = br#""}]}]}}}}"#;
+        let image_size = 33 * 1024 * 1024;
+        let length = prefix.len() + image_size + suffix.len();
+        assert!(length > MAX_REQUEST && length < MAX_FRAME);
+        let writer = thread::spawn(move || {
+            peer.write_all(&(length as u32).to_le_bytes()).unwrap();
+            peer.write_all(prefix).unwrap();
+            let chunk = [b'x'; 65536];
+            for _ in 0..image_size / chunk.len() {
+                peer.write_all(&chunk).unwrap();
+            }
+            peer.write_all(suffix).unwrap();
+        });
+        let mut connection = Connection::from_socket(socket).unwrap();
+        let value = connection.read().unwrap().unwrap();
+        writer.join().unwrap();
+        assert!(serde_json::to_vec(&value).unwrap().len() < 1024);
+        assert_eq!(connection.input.capacity(), 65536);
+        let oversized = json!({"image":"x".repeat(MAX_REQUEST)});
+        assert!(
+            connection.send(oversized).is_err(),
+            "outgoing limit must remain unchanged"
+        );
+    }
+    #[test]
     fn framed_reader_handles_fragmented_headers_and_rejects_oversized_messages() {
         let (socket, mut peer) = UnixStream::pair().unwrap();
-        let mut c = Connection {
-            socket,
-            bytes: Vec::new(),
-            queued: VecDeque::new(),
-            client: "test".into(),
-            next_id: 0,
-            follows: HashMap::new(),
-        };
+        let mut c = Connection::from_socket(socket).unwrap();
         let value = json!({"type":"response","requestId":"test"});
         let data = serde_json::to_vec(&value).unwrap();
         let header = (data.len() as u32).to_le_bytes();
@@ -1295,10 +1808,74 @@ mod tests {
         assert!(c.read().unwrap().is_none());
         peer.write_all(&header[2..]).unwrap();
         peer.write_all(&data).unwrap();
-        assert!(c.read().unwrap().is_none());
         assert_eq!(c.read().unwrap(), Some(value));
-        c.bytes = ((MAX_FRAME + 1) as u32).to_le_bytes().to_vec();
+        peer.write_all(&((MAX_FRAME + 1) as u32).to_le_bytes())
+            .unwrap();
         assert!(c.read().is_err());
+    }
+
+    #[test]
+    fn streamed_frames_retry_short_timeouts_and_leave_the_next_frame_intact() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::from_socket(socket).unwrap();
+        let first = json!({"type":"response","requestId":"one","result":{"ok":true}});
+        let second = json!({"type":"response","requestId":"two"});
+        let a = serde_json::to_vec(&first).unwrap();
+        let b = serde_json::to_vec(&second).unwrap();
+        let writer = thread::spawn(move || {
+            peer.write_all(&(a.len() as u32).to_le_bytes()).unwrap();
+            peer.write_all(&a[..3]).unwrap();
+            thread::sleep(Duration::from_millis(150)); // exceeds socket timeout
+            peer.write_all(&a[3..]).unwrap();
+            peer.write_all(&(b.len() as u32).to_le_bytes()).unwrap();
+            peer.write_all(&b).unwrap();
+        });
+        assert_eq!(connection.read().unwrap(), Some(first));
+        assert_eq!(connection.read().unwrap(), Some(second));
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_truncated_and_stalled_streams_cannot_be_reused() {
+        for (body, extra) in [(b"{}".as_slice(), 1), (b"{invalid}".as_slice(), 0)] {
+            let (socket, mut peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::from_socket(socket).unwrap();
+            peer.write_all(&((body.len() + extra) as u32).to_le_bytes())
+                .unwrap();
+            peer.write_all(body).unwrap();
+            drop(peer);
+            assert!(connection.read().is_err());
+            assert!(connection.failed);
+            assert!(
+                connection
+                    .read()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unusable")
+            );
+            assert!(connection.send(json!({})).is_err());
+        }
+        struct Stalled;
+        impl Read for Stalled {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+        }
+        let mut frame = FrameRead {
+            input: Stalled,
+            deadline: Instant::now() + Duration::from_millis(10),
+        };
+        assert_eq!(
+            frame.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mut connection = Connection::from_socket(socket).unwrap();
+        peer.write_all(&[5]).unwrap();
+        assert!(connection.read().unwrap().is_none());
+        connection.header_started = Some(Instant::now() - SNAPSHOT_TIMEOUT);
+        assert!(connection.read().is_err());
+        assert!(connection.failed);
     }
     #[test]
     fn an_rpc_acknowledgement_is_not_resolution_until_the_exact_request_is_gone() {
@@ -1318,5 +1895,322 @@ mod tests {
         assert!(Runtime::request_resolved(&live, &ticket));
         live.get_mut("chat").unwrap().owner = "other owner".into();
         assert!(!Runtime::request_resolved(&live, &ticket));
+    }
+
+    #[test]
+    fn only_missing_or_timed_out_snapshots_are_retried() {
+        let now = Instant::now();
+        assert!(needs_snapshot(false, None, now));
+        assert!(!needs_snapshot(false, Some(now), now));
+        assert!(needs_snapshot(false, Some(now - SNAPSHOT_TIMEOUT), now));
+        assert!(!needs_snapshot(true, None, now));
+        assert!(!needs_snapshot(true, Some(now - SNAPSHOT_TIMEOUT), now));
+    }
+
+    #[test]
+    fn projected_frames_preserve_async_replies_and_indices_through_ignored_deltas() {
+        fn decoded(change: Value) -> Value {
+            let frame = projection::decode(&serde_json::to_vec(&json!({"type":"broadcast","method":"thread-stream-state-changed","params":{"change":change}})).unwrap()).unwrap();
+            frame["params"]["change"].clone()
+        }
+        let raw = json!({"id":"chat","requests":[],"threadRuntimeStatus":{"type":"idle"},"turns":[{"turnId":"one","turnStartedAtMs":1,"items":[
+            {"type":"tool","output":"discarded tool text","content":[{"type":"image","url":"discarded image"}]},
+            {"type":"agentMessage","id":"call","text":"discarded prose","questions":[{"title":"First?","options":["A","B"]},{"title":"Second?","options":["C","D"]}]}
+        ]}]});
+        let mut live = HashMap::new();
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &decoded(json!({"type":"snapshot","revision":1,"conversationState":raw}))
+        ));
+        let request = async_questions::pending(&live["chat"].state).unwrap();
+        let questions = request["params"]["questions"].as_array().unwrap();
+        assert_eq!(questions.len(), 2);
+        // An ignored tool delta still advances the revision; item1 remains item1.
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &decoded(
+                json!({"type":"patches","baseRevision":1,"revision":2,"patches":[{"op":"replace","path":["turns",0,"items",0,"output"],"value":"more tool text"}]})
+            )
+        ));
+        assert_eq!(
+            async_questions::pending(&live["chat"].state),
+            Some(request.clone())
+        );
+        let reply = format!(
+            "<send_user_message_question_reply>{}</send_user_message_question_reply>",
+            json!([{"questionItemId":questions[0]["id"],"answer":"A"}])
+        );
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &decoded(
+                json!({"type":"patches","baseRevision":2,"revision":3,"patches":[{"op":"add","path":["turns",0,"items",2],"value":{"type":"steeringUserMessage","id":"reply","status":"pending","input":[{"type":"image","url":"discarded image"},{"type":"text","text":reply}]}}]})
+            )
+        ));
+        assert_eq!(async_questions::pending(&live["chat"].state), Some(request));
+        assert!(apply_change(
+            &mut live,
+            "chat",
+            "owner",
+            &decoded(
+                json!({"type":"patches","baseRevision":3,"revision":4,"patches":[{"op":"replace","path":["turns",0,"items",2,"status"],"value":"accepted"}]})
+            )
+        ));
+        let remaining = async_questions::pending(&live["chat"].state).unwrap();
+        assert_eq!(
+            remaining["params"]["questions"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(remaining["params"]["questions"][0]["question"], "Second?");
+        let state = serde_json::to_string(live["chat"].state.as_ref()).unwrap();
+        assert!(!state.contains("discarded"));
+        assert!(!state.contains("more tool text"));
+    }
+
+    #[test]
+    fn a_silent_owner_does_not_delay_other_subscriptions_or_request_patches() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        fn read(stream: &mut UnixStream) -> Value {
+            let mut size = [0; 4];
+            stream.read_exact(&mut size).unwrap();
+            let mut bytes = vec![0; u32::from_le_bytes(size) as usize];
+            stream.read_exact(&mut bytes).unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        fn write(stream: &mut UnixStream, value: Value) {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            stream
+                .write_all(&(bytes.len() as u32).to_le_bytes())
+                .unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ipc.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (wanted, mut requests) =
+            tokio::sync::watch::channel(HashSet::from(["silent".into(), "healthy".into()]));
+        let (published, observed) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
+        let worker = thread::spawn(move || {
+            watch(
+                &mut requests,
+                &published,
+                &path,
+                &tokio::sync::Notify::new(),
+            )
+        });
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let init = read(&mut socket);
+        write(
+            &mut socket,
+            json!({"type":"response","requestId":init["requestId"],"resultType":"success","result":{"clientId":"observer"}}),
+        );
+        for _ in 0..2 {
+            let request = read(&mut socket);
+            assert_eq!(request["method"], "thread-owner-discovery");
+            if request["params"]["conversationId"] == "healthy" {
+                write(
+                    &mut socket,
+                    json!({"type":"response","requestId":request["requestId"],"resultType":"success","handledByClientId":"owner"}),
+                );
+            }
+        }
+        let follow = read(&mut socket);
+        assert_eq!(follow["method"], "thread-stream-following-changed");
+        assert_eq!(follow["params"]["conversationId"], "healthy");
+        let mut snapshot = snapshot();
+        snapshot["conversationState"]["id"] = json!("healthy");
+        write(
+            &mut socket,
+            json!({"type":"broadcast","method":"thread-stream-state-changed","version":13,"sourceClientId":"owner","params":{"conversationId":"healthy","hostId":"local","change":snapshot}}),
+        );
+        write(
+            &mut socket,
+            json!({"type":"broadcast","method":"thread-stream-state-changed","version":13,"sourceClientId":"owner","params":{"conversationId":"healthy","hostId":"local","change":{"type":"patches","baseRevision":4,"revision":5,"patches":[{"op":"replace","path":["requests",0,"params","reason"],"value":"Latest approval"}]}}}),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !observed
+            .borrow()
+            .get("healthy")
+            .is_some_and(|s| s.revision == 5)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "silent discovery blocked the healthy request stream"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!observed.borrow().contains_key("silent"));
+        drop(wanted);
+        worker.join().unwrap().unwrap();
+    }
+    #[test]
+    fn subscription_uses_patches_and_resynchronizes_gaps_resets_and_owner_changes() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        fn read(stream: &mut UnixStream) -> Value {
+            let mut size = [0; 4];
+            stream.read_exact(&mut size).unwrap();
+            let mut bytes = vec![0; u32::from_le_bytes(size) as usize];
+            stream.read_exact(&mut bytes).unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        fn write(stream: &mut UnixStream, value: Value) {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            stream
+                .write_all(&(bytes.len() as u32).to_le_bytes())
+                .unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+        fn discover(stream: &mut UnixStream, owner: &str) {
+            let request = read(stream);
+            assert_eq!(request["method"], "thread-owner-discovery");
+            write(
+                stream,
+                json!({"type":"response","requestId":request["requestId"],"resultType":"success","handledByClientId":owner}),
+            );
+        }
+        fn follow(stream: &mut UnixStream, owner: &str) {
+            let request = read(stream);
+            assert_eq!(request["method"], "thread-stream-following-changed");
+            assert_eq!(request["params"]["following"], true);
+            assert_eq!(request["targetClientIds"], json!([owner]));
+        }
+        fn state(stream: &mut UnixStream, owner: &str, change: Value) {
+            write(
+                stream,
+                json!({"type":"broadcast","method":"thread-stream-state-changed","version":STREAM_VERSION,"sourceClientId":owner,"params":{"conversationId":"chat","hostId":"local","change":change}}),
+            );
+        }
+        fn wait_revision(
+            observed: &tokio::sync::watch::Receiver<Arc<HashMap<String, Live>>>,
+            revision: u64,
+            owner: &str,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if observed
+                    .borrow()
+                    .get("chat")
+                    .is_some_and(|live| live.revision == revision && live.owner == owner)
+                {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "observer did not reach {owner}:{revision}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ipc.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (wanted, mut requests) = tokio::sync::watch::channel(HashSet::from(["chat".into()]));
+        let (published, observed) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
+        let worker = thread::spawn(move || {
+            watch(
+                &mut requests,
+                &published,
+                &path,
+                &tokio::sync::Notify::new(),
+            )
+        });
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(7)))
+            .unwrap();
+        let init = read(&mut socket);
+        write(
+            &mut socket,
+            json!({"type":"response","requestId":init["requestId"],"resultType":"success","result":{"clientId":"observer"}}),
+        );
+        discover(&mut socket, "owner");
+        follow(&mut socket, "owner");
+        state(&mut socket, "owner", snapshot());
+        wait_revision(&observed, 4, "owner");
+
+        // Lightweight periodic owner discovery must NOT reaffirm a healthy
+        // subscription or trigger another large snapshot, even with a request.
+        discover(&mut socket, "owner");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        assert!(
+            matches!(socket.read(&mut [0u8; 1]), Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+        );
+        socket
+            .set_read_timeout(Some(Duration::from_secs(7)))
+            .unwrap();
+        state(
+            &mut socket,
+            "owner",
+            json!({"type":"patches","baseRevision":4,"revision":5,"patches":[{"op":"remove","path":["requests",0]}]}),
+        );
+        wait_revision(&observed, 5, "owner");
+        assert!(
+            observed.borrow()["chat"].state["requests"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        // An undelivered revision invalidates the cached permission and requests
+        // exactly a replacement snapshot, rather than guessing a patch result.
+        state(
+            &mut socket,
+            "owner",
+            json!({"type":"patches","baseRevision":6,"revision":7,"patches":[]}),
+        );
+        discover(&mut socket, "owner");
+        follow(&mut socket, "owner");
+        let mut resolved = snapshot();
+        resolved["revision"] = json!(8);
+        resolved["conversationState"]["requests"] = json!([]);
+        state(&mut socket, "owner", resolved.clone());
+        wait_revision(&observed, 8, "owner");
+
+        // Owner-side subscription recovery is explicit, not a timer snapshot.
+        write(
+            &mut socket,
+            json!({"type":"broadcast","method":"thread-stream-following-status-requested","sourceClientId":"owner","params":{"conversationId":"chat","hostId":"local"}}),
+        );
+        follow(&mut socket, "owner");
+        state(&mut socket, "owner", resolved.clone());
+
+        write(
+            &mut socket,
+            json!({"type":"broadcast","method":"client-status-changed","params":{"status":"disconnected","clientId":"owner"}}),
+        );
+        discover(&mut socket, "new-owner");
+        follow(&mut socket, "new-owner");
+        state(&mut socket, "owner", snapshot()); // stale owner cannot revive it
+        state(&mut socket, "new-owner", resolved.clone());
+        wait_revision(&observed, 8, "new-owner");
+        assert!(
+            observed.borrow()["chat"].state["requests"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        write(
+            &mut socket,
+            json!({"type":"broadcast","method":"ipc-connection-reset"}),
+        );
+        discover(&mut socket, "new-owner");
+        follow(&mut socket, "new-owner");
+        state(&mut socket, "new-owner", resolved);
+        wait_revision(&observed, 8, "new-owner");
+        wanted.send_replace(HashSet::new());
+        worker.join().unwrap().unwrap();
     }
 }

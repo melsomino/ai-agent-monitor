@@ -56,7 +56,10 @@ mod tests {
     fn every_word_must_match_regardless_of_case_order_or_repeated_spaces() {
         assert!(matches("Message DELIVERY", "  delivery  Mess "));
         assert!(!matches("message", "message delivery"));
-        assert!(matches("Исправить доставку", "ДОСТ испр"));
+        assert!(matches(
+            "\u{418}\u{441}\u{43f}\u{440}\u{430}\u{432}\u{438}\u{442}\u{44c} \u{434}\u{43e}\u{441}\u{442}\u{430}\u{432}\u{43a}\u{443}",
+            "\u{414}\u{41e}\u{421}\u{422} \u{438}\u{441}\u{43f}\u{440}"
+        ));
         assert!(matches("Anything", "   "));
     }
     #[test]
@@ -77,9 +80,17 @@ mod tests {
     }
     #[test]
     fn highlight_offsets_survive_emoji_cyrillic_and_case_expansion() {
-        assert_eq!(highlights("🤖 Доставка", "ДОСТ"), vec![3..7]);
+        assert_eq!(
+            highlights(
+                "🤖 \u{414}\u{43e}\u{441}\u{442}\u{430}\u{432}\u{43a}\u{430}",
+                "\u{414}\u{41e}\u{421}\u{422}"
+            ),
+            vec![3..7]
+        );
         assert_eq!(highlights("İstanbul", "i"), vec![0..1]);
-        assert!(printable(" delivery Привет"));
+        assert!(printable(
+            " delivery \u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}"
+        ));
         assert!(!printable("\u{f700}"));
         assert!(!printable("\r"));
         assert!(!printable(""));

@@ -1,8 +1,12 @@
 //! Codex backend with direct client and VS Code integrations.
+mod app_server;
 pub(crate) mod async_questions;
 pub(crate) mod images;
 mod models;
+mod progress;
+mod projection;
 pub(crate) mod requests;
+mod rollout_questions;
 pub(crate) mod runtime;
 pub(crate) mod usage;
 pub(crate) mod vscode;
@@ -24,12 +28,30 @@ use std::{
 };
 
 /// Codex database, transcript, direct client and VS Code integration.
-#[derive(Default)]
 pub struct Codex {
     runtime: runtime::Runtime,
+    app_server: app_server::Runtime,
+    updates: std::sync::Arc<tokio::sync::Notify>,
     activity: std::cell::RefCell<HashMap<PathBuf, ActivityCheckpoint>>,
     images: std::cell::RefCell<images::Cache>,
     vscode: std::cell::RefCell<vscode::LogCache>,
+}
+
+impl Default for Codex {
+    fn default() -> Self {
+        let updates = std::sync::Arc::new(tokio::sync::Notify::new());
+        Self {
+            runtime: runtime::Runtime::with_updates(updates.clone()),
+            app_server: app_server::Runtime::with_updates(
+                crate::app::core::codex_home().join("app-server-control/app-server-control.sock"),
+                updates.clone(),
+            ),
+            updates,
+            activity: Default::default(),
+            images: Default::default(),
+            vscode: Default::default(),
+        }
+    }
 }
 
 const DESKTOP: Client = Client::Desktop {
@@ -43,13 +65,37 @@ impl SessionProvider for Codex {
     }
 
     fn sessions(&self) -> Result<Vec<Session>> {
-        open(
+        let mut sessions = open(
             &crate::app::core::codex_home(),
             &self.runtime,
             &self.activity,
             &self.vscode,
             &self.images,
-        )
+        )?;
+        self.app_server.observe(&mut sessions);
+        Ok(sessions)
+    }
+
+    fn live_updates(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        Some(self.updates.clone())
+    }
+    fn refresh_live(&self, sessions: &mut [Session]) {
+        let ids = sessions.iter().map(|s| s.id.clone()).collect();
+        let mut live = self.runtime.views(&ids);
+        for session in sessions.iter_mut() {
+            if let Some(view) = live.remove(&session.id) {
+                session.set_authoritative(true);
+                session.activity = view.activity;
+                session.observe_activities(view.activities);
+            } else {
+                session.set_authoritative(false);
+                session.clear_current_action();
+            }
+        }
+        self.app_server.observe(sessions);
+        for session in sessions {
+            session.set_interaction(self.interaction(session));
+        }
     }
 
     fn previous_message(
@@ -61,7 +107,7 @@ impl SessionProvider for Codex {
         crate::agents::history::jsonl(
             &path,
             before,
-            Some(session.last_message.as_str()),
+            Some(session.last_message()),
             crate::agents::history::codex,
         )
     }
@@ -71,7 +117,7 @@ impl SessionProvider for Codex {
         self.sessions()
             .unwrap_or_default()
             .iter()
-            .filter(|s| s.approval.is_some())
+            .filter(|s| s.approval().is_some())
             .count()
     }
 
@@ -85,23 +131,47 @@ impl SessionProvider for Codex {
     }
 
     fn send_message(&self, session: &Session, text: &str) -> Result<()> {
-        self.runtime.send_message(&session.id, text)
+        if session.client == Client::Terminal {
+            self.app_server.send_message(session, text)
+        } else {
+            self.runtime.send_message(&session.id, text)
+        }
     }
     fn interaction(&self, session: &Session) -> crate::agents::interaction::Interaction {
-        self.runtime.interaction_for(session)
+        if app_server::Runtime::owns_approval(session) {
+            self.app_server.interaction(session)
+        } else {
+            self.runtime.interaction_for(session)
+        }
     }
     fn deliver(
         &self,
         session: &Session,
         response: &crate::agents::interaction::Response,
     ) -> crate::agents::interaction::Delivery {
-        self.runtime.deliver_for(session, response)
+        if app_server::Runtime::owns_approval(session) {
+            self.app_server.deliver(session, response)
+        } else {
+            self.runtime.deliver_for(session, response)
+        }
     }
     fn respond(&self, session: &Session, response: &crate::agents::interaction::Response) -> bool {
-        self.runtime.respond_for(session, response)
+        if app_server::Runtime::owns_approval(session) {
+            self.app_server.deliver(session, response)
+                == crate::agents::interaction::Delivery::Confirmed
+        } else {
+            self.runtime.respond_for(session, response)
+        }
     }
     fn allow(&self, session: &Session) -> bool {
-        self.runtime.allow_for(session)
+        if app_server::Runtime::owns_approval(session) {
+            self.app_server.deliver(
+                session,
+                &crate::agents::interaction::Response::Action("allow".into()),
+            ) == crate::agents::interaction::Delivery::Confirmed
+        } else {
+            self.runtime.allow_for(session)
+        }
     }
 }
 
@@ -129,7 +199,7 @@ fn open(
     for session in &mut sessions {
         if let Some(path) = files.get(&session.id) {
             enrich_cached(session, path, &mut cache.borrow_mut());
-            session.images = image_cache.borrow_mut().latest(path);
+            session.set_images(image_cache.borrow_mut().latest(path));
         }
     }
     let names = models::display_names(home);
@@ -165,12 +235,12 @@ fn open(
     for session in &mut sessions {
         if let Some(live) = runtime.remove(&session.id) {
             session.activity = live.activity;
-            session.approval = live.approval;
-            session.authoritative = true;
+            session.observe_activities(live.activities);
+            session.set_authoritative(true);
         } else {
-            session.authoritative = false;
+            session.set_authoritative(false);
         }
-        if session.approval.is_some() {
+        if session.approval().is_some() {
             session.activity = Activity::Confirmation;
         }
     }
@@ -380,25 +450,30 @@ fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
     let mut statement = db.prepare(&sql)?;
     statement
         .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
-            Ok(Session {
-                authoritative: true,
-                interaction_data: Default::default(),
-                target: None,
-                agent: "codex",
-                id: row.get(0)?,
-                title: row.get(1)?,
-                cwd: PathBuf::from(row.get::<_, String>(2)?),
-                workspace: None,
-                git_branch: None,
-                model: row.get(4)?,
-                model_display_name: None,
-                reasoning_effort: row.get(5)?,
-                updated_at: row.get(3)?,
-                client: Client::Unknown,
-                activity: Activity::Unknown,
-                last_message: String::new(),
-                images: vec![],
-                approval: None,
+            Ok({
+                let mut __session = Session {
+                    target: None,
+                    agent: "codex",
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    cwd: PathBuf::from(row.get::<_, String>(2)?),
+                    workspace: None,
+                    git_branch: None,
+                    model: row.get(4)?,
+                    model_display_name: None,
+                    reasoning_effort: row.get(5)?,
+                    updated_at: row.get(3)?,
+                    client: Client::Unknown,
+                    activity: Activity::Unknown,
+                    connection: if true {
+                        crate::domain::session::ConnectionState::live(true)
+                    } else {
+                        Default::default()
+                    },
+                    activities: Default::default(),
+                };
+                __session.seed_snapshot(String::new(), vec![], None, None, Default::default());
+                __session
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -428,9 +503,14 @@ fn enrich_cached(
             .is_some_and(|s| s.contains("Desktop"))
         {
             DESKTOP
-        } else if meta["originator"].as_str() == Some("codex-tui") {
-            // A terminal client using the shared app-server can retain a
-            // "vscode" source. Its explicit TUI origin identifies the host.
+        } else if matches!(
+            meta["originator"].as_str(),
+            Some("codex-tui" | "ai_agent_monitor")
+        ) {
+            // The shared daemon can record source=vscode for terminal threads.
+            // After our observer joins, new threads can also carry our client
+            // name as originator. We only use App Server for terminal sessions;
+            // macOS still requires a matching foreground TTY client below.
             Client::Terminal
         } else {
             match meta["source"].as_str() {
@@ -459,9 +539,17 @@ fn enrich_cached(
     {
         return;
     }
-    tail.push_str(&String::from_utf8_lossy(&bytes));
+    let skip = if start > 0 {
+        bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| i + 1)
+    } else {
+        0
+    };
+    tail.push_str(&String::from_utf8_lossy(&bytes[skip..]));
     session.activity = Activity::Unknown;
-    parse_events(session, &tail);
+    parse_events_at(session, &tail, start + skip as u64);
     session.activity = recover_activity(
         &mut file,
         path,
@@ -630,14 +718,44 @@ fn last_activity_before(
     }
 }
 
+#[cfg(test)]
 fn parse_events(session: &mut Session, tail: &str) {
+    parse_events_at(session, tail, 0);
+}
+fn parse_events_at(session: &mut Session, tail: &str, mut offset: u64) {
+    use crate::domain::session_activity::*;
+    // response_item is the canonical transcript. event_msg mirrors its assistant
+    // message; only use the legacy representation when no canonical one exists.
+    let canonical = tail
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| {
+            v["type"] == "response_item"
+                && v["payload"]["type"] == "message"
+                && v["payload"]["role"] == "assistant"
+        });
+    let mut questions = rollout_questions::Reader::default();
     let mut reported_model = None;
     let mut reported_effort = None;
-    for line in tail.lines() {
+    for line in tail.split_inclusive('\n') {
+        let source_offset = offset;
+        offset += line.len() as u64;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         let payload = &value["payload"];
+        if matches!(payload["type"].as_str(), Some("message" | "agent_message"))
+            && (payload["channel"] == "analysis" || payload["phase"] == "analysis")
+        {
+            continue;
+        }
+        let time = timestamp(&value["timestamp"]).unwrap_or_else(|| seconds(session.updated_at));
+        questions.consume(&value, time);
+        let source_id = payload["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("offset:{source_offset}"));
         match value["type"].as_str() {
             Some("turn_context") => {
                 if let Some(model) = payload["model"]
@@ -658,15 +776,23 @@ fn parse_events(session: &mut Session, tail: &str) {
                 Some("task_complete" | "turn_complete" | "turn_aborted") => {
                     session.activity = Activity::Idle
                 }
-                Some("agent_message") => {
+                Some("agent_message") if !canonical => {
                     if let Some(text) = payload["message"].as_str().filter(|s| !s.is_empty()) {
-                        session.last_message = text.to_owned();
+                        session.upsert_activity(SessionActivity::Message(SessionMessage {
+                            id: format!("rollout-message:{source_id}"),
+                            started_at: time,
+                            updated_at: time,
+                            role: MessageRole::Agent,
+                            text: text.to_owned(),
+                            images: vec![],
+                        }));
                     }
                 }
                 _ => {}
             },
             Some("response_item")
-                if payload["type"] == "message" && payload["role"] == "assistant" =>
+                if payload["type"] == "message"
+                    && matches!(payload["role"].as_str(), Some("assistant" | "user")) =>
             {
                 if let Some(content) = payload["content"].as_array() {
                     let text = content
@@ -675,12 +801,83 @@ fn parse_events(session: &mut Session, tail: &str) {
                         .collect::<Vec<_>>()
                         .join("\n");
                     if !text.is_empty() {
-                        session.last_message = text;
+                        session.upsert_activity(SessionActivity::Message(SessionMessage {
+                            id: format!("rollout-message:{source_id}"),
+                            started_at: time,
+                            updated_at: time,
+                            role: if payload["role"] == "user" {
+                                MessageRole::User
+                            } else {
+                                MessageRole::Agent
+                            },
+                            text,
+                            images: vec![],
+                        }));
                     }
+                }
+            }
+            Some("response_item")
+                if matches!(
+                    payload["type"].as_str(),
+                    Some("function_call" | "custom_tool_call" | "reasoning")
+                ) =>
+            {
+                let kind = if payload["type"] == "reasoning" {
+                    ActionKind::Reasoning
+                } else {
+                    ActionKind::Tool
+                };
+                let text = if kind == ActionKind::Reasoning {
+                    payload["summary"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    payload["name"].as_str().unwrap_or("Tool").to_owned()
+                };
+                if !text.is_empty() {
+                    session.upsert_activity(SessionActivity::Action(SessionAction {
+                        id: format!(
+                            "rollout-action:{}",
+                            payload["call_id"].as_str().unwrap_or(&source_id)
+                        ),
+                        started_at: time,
+                        updated_at: time,
+                        kind,
+                        current: false,
+                        text: progress::bounded(&text),
+                        status: ActionStatus::Running,
+                    }));
+                }
+            }
+            Some("response_item")
+                if matches!(
+                    payload["type"].as_str(),
+                    Some("function_call_output" | "custom_tool_call_output")
+                ) =>
+            {
+                let id = format!(
+                    "rollout-action:{}",
+                    payload["call_id"].as_str().unwrap_or(&source_id)
+                );
+                if let Some(SessionActivity::Action(action)) =
+                    session.activities.iter_mut().find(|a| a.id() == id)
+                {
+                    action.status = ActionStatus::Completed;
+                    action.updated_at = time;
                 }
             }
             _ => {}
         }
+    }
+    for activity in questions.activities() {
+        session.upsert_activity(activity);
+    }
+    if session.approval().is_some() {
+        session.activity = Activity::Confirmation;
     }
     if session.model.is_none() {
         session.model = reported_model;
@@ -697,6 +894,40 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn rollout_keeps_identical_messages_and_offset_identity_across_tail_windows() {
+        use crate::domain::session_activity::*;
+        let mut session = Session {
+            agent: "codex",
+            id: "timeline".into(),
+            title: "Timeline".into(),
+            cwd: PathBuf::new(),
+            workspace: None,
+            git_branch: None,
+            model: None,
+            model_display_name: None,
+            reasoning_effort: None,
+            updated_at: 0,
+            client: Client::Unknown,
+            activity: Activity::Idle,
+            target: None,
+            connection: Default::default(),
+            activities: Default::default(),
+        };
+        let line=serde_json::json!({"timestamp":"2026-11-09T10:00:00.123456789Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Repeated"}]}}).to_string()+"\n";
+        parse_events_at(&mut session, &line.repeat(2), 100);
+        let ids: Vec<_> = session
+            .activities
+            .iter()
+            .filter(|a| matches!(a,SessionActivity::Message(m) if m.text=="Repeated"))
+            .map(|a| a.id().to_owned())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        let before = session.activities.clone();
+        parse_events_at(&mut session, &line, 100 + line.len() as u64);
+        assert_eq!(session.activities, before);
+    }
     #[test]
     fn model_is_session_specific_and_refreshes_without_global_defaults() {
         let home = tempfile::tempdir().unwrap();
@@ -776,37 +1007,48 @@ mod tests {
             .into_iter()
             .find(|request| request.response == response)
             .unwrap();
-        let mut session = Session {
-            authoritative: true,
-            interaction_data: Default::default(),
-            target: None,
-            agent: "codex",
-            id: "other".into(),
-            title: "Chat".into(),
-            cwd: PathBuf::new(),
-            workspace: None,
-            git_branch: None,
-            model: None,
-            model_display_name: None,
-            reasoning_effort: None,
-            updated_at: 0,
-            client: Client::Terminal,
-            activity: Activity::Confirmation,
-            last_message: String::new(),
-            images: vec![],
-            approval: Some(crate::agents::sessions::Approval {
-                id: response.to_string_lossy().into_owned(),
-                body: request.body.clone(),
-                expires: request.expires,
-                can_allow: true,
-            }),
+        let mut session = {
+            let mut __session = Session {
+                target: None,
+                agent: "codex",
+                id: "other".into(),
+                title: "Chat".into(),
+                cwd: PathBuf::new(),
+                workspace: None,
+                git_branch: None,
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 0,
+                client: Client::Terminal,
+                activity: Activity::Confirmation,
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot(
+                String::new(),
+                vec![],
+                None,
+                Some(crate::agents::sessions::Approval {
+                    id: response.to_string_lossy().into_owned(),
+                    body: request.body.clone(),
+                    expires: request.expires,
+                    can_allow: true,
+                }),
+                Default::default(),
+            );
+            __session
         };
         assert!(!Codex::default().allow(&session));
         session.id = "original".into();
         let codex = Codex::default();
         assert!(!codex.allow(&session));
         assert!(codex.interaction(&session).actions.is_empty());
-        session.approval.as_mut().unwrap().body = "Changed".into();
+        session.approval_mut().unwrap().body = "Changed".into();
         assert!(!Codex::default().allow(&session));
         assert!(!response.exists());
         assert!(crate::agents::pending::allow(&request));
@@ -816,25 +1058,30 @@ mod tests {
     fn activity_survives_oversized_records_and_cached_gaps_without_guessing_from_tool_output() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("large.jsonl");
-        let mut session = Session {
-            authoritative: true,
-            interaction_data: Default::default(),
-            target: None,
-            agent: "codex",
-            id: "one".into(),
-            title: "Chat".into(),
-            cwd: PathBuf::new(),
-            workspace: None,
-            git_branch: None,
-            model: None,
-            model_display_name: None,
-            reasoning_effort: None,
-            updated_at: 0,
-            client: Client::Unknown,
-            activity: Activity::Unknown,
-            last_message: String::new(),
-            images: vec![],
-            approval: None,
+        let mut session = {
+            let mut __session = Session {
+                target: None,
+                agent: "codex",
+                id: "one".into(),
+                title: "Chat".into(),
+                cwd: PathBuf::new(),
+                workspace: None,
+                git_branch: None,
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 0,
+                client: Client::Unknown,
+                activity: Activity::Unknown,
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot(String::new(), vec![], None, None, Default::default());
+            __session
         };
         let oversized = serde_json::json!({"type":"response_item", "payload":{
             "type":"function_call_output", "output": "x".repeat(5 * 1024 * 1024)
@@ -879,25 +1126,30 @@ mod tests {
 
     #[test]
     fn reads_activity_and_last_assistant_message_without_tool_output() {
-        let mut session = Session {
-            authoritative: true,
-            interaction_data: Default::default(),
-            target: None,
-            agent: "codex",
-            id: "one".into(),
-            title: "Chat".into(),
-            cwd: PathBuf::new(),
-            workspace: None,
-            git_branch: None,
-            model: None,
-            model_display_name: None,
-            reasoning_effort: None,
-            updated_at: 0,
-            client: Client::Unknown,
-            activity: Activity::Unknown,
-            last_message: String::new(),
-            images: vec![],
-            approval: None,
+        let mut session = {
+            let mut __session = Session {
+                target: None,
+                agent: "codex",
+                id: "one".into(),
+                title: "Chat".into(),
+                cwd: PathBuf::new(),
+                workspace: None,
+                git_branch: None,
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 0,
+                client: Client::Unknown,
+                activity: Activity::Unknown,
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot(String::new(), vec![], None, None, Default::default());
+            __session
         };
         parse_events(
             &mut session,
@@ -909,7 +1161,7 @@ mod tests {
 "#,
         );
         assert_eq!(session.activity, Activity::Working);
-        assert_eq!(session.last_message, "Last answer");
+        assert_eq!(session.last_message(), "Last answer");
         parse_events(
             &mut session,
             r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
@@ -937,6 +1189,7 @@ mod tests {
         for (source, originator, client) in [
             ("cli", "codex-tui", Client::Terminal),
             ("vscode", "codex-tui", Client::Terminal),
+            ("vscode", "ai_agent_monitor", Client::Terminal),
             ("vscode", "codex_vscode", Client::VSCode),
             ("vscode", "Codex Desktop", DESKTOP),
         ] {
@@ -952,13 +1205,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let db = Connection::open(home.path().join("state_5.sqlite")).unwrap();
         db.execute_batch("CREATE TABLE threads (id TEXT, name TEXT, title TEXT, cwd TEXT, updated_at INT, updated_at_ms INT, archived INT);
-            INSERT INTO threads VALUES ('old', NULL, 'Старый', '/work/one', 10, NULL, 0);
-            INSERT INTO threads VALUES ('new', 'Переименованный', 'Initial', '/work/two', 20, 25000, 0);
+            INSERT INTO threads VALUES ('old', NULL, 'Old', '/work/one', 10, NULL, 0);
+            INSERT INTO threads VALUES ('new', 'Renamed', 'Initial', '/work/two', 20, 25000, 0);
             INSERT INTO threads VALUES ('archived', NULL, 'Archived', '/work', 100, NULL, 1);").unwrap();
         let sessions = read_open(home.path(), &HashSet::from(["new".into()])).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "new");
-        assert_eq!(sessions[0].title, "Переименованный");
+        assert_eq!(sessions[0].title, "Renamed");
         assert_eq!(sessions[0].updated_at, 25);
         assert_eq!(
             read_open(

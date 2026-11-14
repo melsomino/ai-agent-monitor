@@ -1,4 +1,5 @@
 //! Provider-neutral actions and structured questions for a pending agent request.
+use serde::Serialize;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7,12 +8,12 @@ pub enum Response {
     Answers(BTreeMap<String, Vec<String>>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Choice {
     pub label: String,
     pub description: String,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Question {
     pub id: String,
     pub title: String,
@@ -20,13 +21,13 @@ pub struct Question {
     pub freeform: bool,
     pub secret: bool,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Action {
     pub id: String,
     pub label: String,
     pub detail: String,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Interaction {
     /// Exact command shown for review, separate from permission scope and wire decisions.
     pub command: Option<String>,

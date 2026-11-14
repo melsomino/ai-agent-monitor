@@ -647,25 +647,30 @@ mod tests {
         let result = resolve(&storage, &ids, &live, &mut cache);
         assert_eq!(result.get(CHAT), Some(&workspace));
         assert!(!result.contains_key(OTHER));
-        let session = crate::agents::sessions::Session {
-            authoritative: true,
-            interaction_data: Default::default(),
-            target: None,
-            agent: "codex",
-            id: CHAT.into(),
-            title: "Chat".into(),
-            cwd: temp.path().join("deleted"),
-            workspace: Some(workspace.clone()),
-            git_branch: None,
-            model: None,
-            model_display_name: None,
-            reasoning_effort: None,
-            updated_at: 0,
-            client: crate::agents::sessions::Client::VSCode,
-            activity: crate::agents::sessions::Activity::Idle,
-            last_message: String::new(),
-            images: vec![],
-            approval: None,
+        let session = {
+            let mut __session = crate::agents::sessions::Session {
+                target: None,
+                agent: "codex",
+                id: CHAT.into(),
+                title: "Chat".into(),
+                cwd: temp.path().join("deleted"),
+                workspace: Some(workspace.clone()),
+                git_branch: None,
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 0,
+                client: crate::agents::sessions::Client::VSCode,
+                activity: crate::agents::sessions::Activity::Idle,
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot(String::new(), vec![], None, None, Default::default());
+            __session
         };
         assert_eq!(
             crate::app::core::vscode_path(&crate::agents::sessions::SessionProvider::open_target(

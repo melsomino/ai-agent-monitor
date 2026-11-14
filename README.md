@@ -97,7 +97,7 @@ The monitor appears as a robot icon in the menu bar.
 
 On first launch, it detects supported agents and sets up the required integrations. Codex needs no additional configuration. Claude Code may need to be restarted, and Cline requires hooks to be enabled.
 
-You can check or repeat setup under **Settings → Integrations**.
+You can check or repeat setup under **Settings → Agents**.
 
 Release preparation includes Developer ID signing and Apple notarization. Check the selected release notes for the signing and notarization status of that download.
 
@@ -107,7 +107,7 @@ Prebuilt releases require macOS 13 or later and Apple Silicon. Intel builds are 
 
 [Build and install from source](#build-from-source-ubuntu), including the companion GNOME Shell extension. There is no prebuilt Ubuntu package yet.
 
-Codex connects automatically. For Claude Code or Cline, open **Settings → Integrations → Check & set up** to install the required hooks.
+Codex connects automatically. For Claude Code or Cline, open **Settings → Agents → Check & set up** to install the required hooks.
 
 ![AI Agent Monitor on Ubuntu GNOME showing Codex sessions over VS Code](docs/images/ubuntu.png)
 
@@ -149,11 +149,13 @@ You can:
 
 The selected session stays available between messages. Session views update automatically as the agent's state changes.
 
+Requests arrive as separate messages with their own answer buttons. Session cards show agent messages and navigation; answering another session's request does not change the selected session.
+
 ### Telegram sessions and replies
 
 In a selected Codex session, embedded images from agent tool results are forwarded as photos or files. **Previous message** can also show images from earlier history. User-uploaded images and links to local files are not forwarded automatically.
 
-![Telegram bot showing the session list and an approval request with response buttons](docs/images/telegram.png)
+![Telegram bot showing demo agent messages and the session list](docs/images/telegram.png)
 
 ### Why a personal bot?
 
@@ -194,16 +196,19 @@ The monitor does not transmit your project files to a separate monitoring servic
 
 ## Settings
 
-The settings window has four sections:
+Settings has five sections on macOS (four on Ubuntu). On macOS, it opens inside the menu popup; use Sessions or Escape to return. Ubuntu uses a separate settings window.
 
 | Section | Options |
 |---|---|
 | General | Launch at login, menu bar animation, keyboard shortcut |
 | Applications | Show or hide sessions from individual applications |
-| Integrations | Agent detection, hook setup, integration status |
+| Agents | Agent detection, hook setup, integration status |
 | Telegram | Bot setup, connection, testing, replacement, unlinking |
+| Web (macOS) | Enable browser access, select a local address, pair a phone by QR |
 
 Application visibility preferences are retained across restarts.
+
+For phone access, open **Settings → Web**, enable the server and scan its QR code. Web access is off by default and uses HTTP on your local network. [Setup, CLI and limitations](docs/web-access.md).
 
 ## Limitations
 
@@ -290,6 +295,10 @@ Additional technical documentation:
 
 - [Actor architecture](docs/actor-architecture.md)
 - [Agent integrations](docs/integrations.md)
+
+## Interactive UI prototype
+
+The [interactive HTML prototype](design/previews/monitor-ui.html) uses the HTML/CSS/JavaScript in `src/web/` with separate mock data. Open the preview directly from the repository; it requires no server. It is a design reference and does not connect to the running monitor. The application uses native AppKit on macOS and GTK on Ubuntu.
 
 ## License
 

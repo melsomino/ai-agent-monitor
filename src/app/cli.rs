@@ -27,6 +27,11 @@ impl AgentKind {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Manage the optional HTTP frontend and phone pairing.
+    Web {
+        #[command(subcommand)]
+        action: crate::web::Control,
+    },
     /// Start the Ubuntu monitor without opening the session panel.
     #[cfg(target_os = "linux")]
     Background,
@@ -137,7 +142,7 @@ mod tests {
             "--send-approval",
             "--help",
             "",
-            "--example\nТекст",
+            "--example\nText",
             "",
             "",
         ])
@@ -146,7 +151,7 @@ mod tests {
             Command::SendApproval { message, response } => {
                 assert_eq!(message.title, "--help");
                 assert!(message.subtitle.is_empty());
-                assert_eq!(message.body, "--example\nТекст");
+                assert_eq!(message.body, "--example\nText");
                 assert!(message.target.is_empty());
                 assert!(response.is_empty());
             }

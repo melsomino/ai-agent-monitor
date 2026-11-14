@@ -1,5 +1,5 @@
 //! A bounded, state-driven Telegram view of the native sessions list.
-use super::{Pending, Session, nonce, short, text::Text};
+use super::{Session, nonce, short, text::Text};
 use crate::{
     actors::monitor,
     agents::sessions::{Activity, Client},
@@ -21,11 +21,8 @@ pub(super) struct Browser {
     nonce: String,
     page: usize,
     selected: Option<String>,
-    selected_available: bool,
     // IDs never change when sessions are reordered or removed.
     keys: Vec<String>,
-    active_request: Option<(String, String)>,
-    staged_request: Option<(String, String)>,
     previous_requested: bool,
     earlier: Option<crate::domain::history::Message>,
     history_waiting: Option<(u64, Instant)>,
@@ -55,10 +52,7 @@ impl Browser {
             nonce: nonce()?,
             page: 0,
             selected: None,
-            selected_available: false,
             keys: vec![],
-            active_request: None,
-            staged_request: None,
             previous_requested: false,
             earlier: None,
             history_waiting: None,
@@ -75,6 +69,7 @@ impl Browser {
             media_caption: String::new(),
         })
     }
+    #[cfg(test)]
     pub fn selected(&self, message: i64) -> Option<&str> {
         (self.message == Some(message))
             .then_some(self.selected.as_deref())
@@ -182,12 +177,10 @@ impl Browser {
     pub fn detach_message(&mut self) {
         self.message = None;
         self.rendered = Value::Null;
-        self.active_request = None;
     }
     pub fn commit(&mut self, content: Value) {
         self.media_advanced = false;
         self.rendered = content;
-        self.active_request = self.staged_request.clone();
         self.delivered_agent = self.staged_agent.clone();
     }
     pub fn pending_image(&self) -> Option<(String, crate::domain::media::Image, String)> {
@@ -217,22 +210,6 @@ impl Browser {
         self.failed_images
             .insert(id, Instant::now() + Duration::from_secs(15));
     }
-    pub fn can_present(&self, pending: &Pending) -> bool {
-        self.selected_available
-            && !self.show_info
-            && self
-                .current_session()
-                .is_some_and(|key| key == pending.session.key())
-    }
-    pub fn permits_answer(&self, message: i64, pending: &Pending) -> bool {
-        !self.show_info
-            && self
-                .selected(message)
-                .is_some_and(|key| key == pending.session.key())
-            && self.active_request.as_ref().is_some_and(|(key, nonce)| {
-                pending.session.approval_key().as_ref() == Some(key) && *nonce == pending.nonce
-            })
-    }
     pub fn navigate(&mut self, message: i64, data: &str) -> Result<bool> {
         let Some(command) = data.strip_prefix(&format!("{}:", self.nonce)) else {
             return Ok(false);
@@ -248,8 +225,6 @@ impl Browser {
                     .ok_or_else(|| anyhow::anyhow!("Session unavailable."))?
                     .clone(),
             );
-
-            self.selected_available = true;
         } else if let Some(page) = command.strip_prefix("p:") {
             self.page = page.parse::<usize>()?;
             self.selected = None;
@@ -272,7 +247,7 @@ impl Browser {
     fn button(&self, text: &str, command: &str) -> Value {
         json!({"text":short(text,79),"callback_data":format!("{}:{command}",self.nonce)})
     }
-    pub fn content(&mut self, state: &monitor::State, pending: &HashMap<String, Pending>) -> Value {
+    pub fn content(&mut self, state: &monitor::State) -> Value {
         self.reconcile_history(state);
         let mut sessions: Vec<_> = state
             .sessions
@@ -304,18 +279,14 @@ impl Browser {
                     }
                 })
         });
-        self.selected_available = self
-            .selected
-            .as_ref()
-            .is_some_and(|key| sessions.iter().any(|session| session.key() == *key));
         self.staged_agent = self.selected.as_ref().and_then(|selected| {
             let session = sessions.iter().find(|s| s.key() == *selected)?;
-            if session.last_message.is_empty() {
+            if session.last_message().is_empty() {
                 self.delivered_agent
                     .clone()
                     .filter(|(key, _)| key == selected)
             } else {
-                Some((selected.clone(), session.last_message.clone()))
+                Some((selected.clone(), session.last_message().to_owned()))
             }
         });
         self.staged_images.clear();
@@ -328,34 +299,19 @@ impl Browser {
             let images = self
                 .earlier
                 .as_ref()
-                .map_or(session.images.as_slice(), |message| {
-                    message.images.as_slice()
-                });
+                .map_or(session.images(), |message| message.images.as_slice());
             self.staged_images = images
                 .iter()
                 .map(|image| (format!("{}:{}", session.key(), image.id), image.clone()))
                 .collect();
             self.media_caption = short(&session.title, 200);
         }
-        let pending_request = self.selected.as_ref().and_then(|selected| {
-            sessions
-                .iter()
-                .find(|session| session.key() == *selected)?
-                .approval_key()
-                .and_then(|key| pending.get(&key).map(|p| (key, p.nonce.clone())))
-        });
-        self.staged_request = if self.show_info {
-            None
-        } else {
-            pending_request.clone()
-        };
         if self.needs_new_message() {
             // New agent output must notify, not just silently edit
             // the previous message while Telegram may be in the background.
             let outgoing = self.outgoing.take();
             self.reset_detail();
             self.outgoing = outgoing;
-            self.staged_request = pending_request;
         }
         let mut rows = Vec::new();
         let text;
@@ -364,7 +320,7 @@ impl Browser {
                 text = if self.show_info {
                     self.info(session)
                 } else {
-                    self.detail(session, state, pending, &mut rows)
+                    self.detail(session, state)
                 };
             } else {
                 let mut value = Text::default();
@@ -449,20 +405,12 @@ impl Browser {
         }
         text.payload(json!({"inline_keyboard":rows}))
     }
-    fn detail(
-        &self,
-        session: &Session,
-        state: &monitor::State,
-        pending: &HashMap<String, Pending>,
-        rows: &mut Vec<Value>,
-    ) -> Text {
+    fn detail(&self, session: &Session, state: &monitor::State) -> Text {
         let mut text = self.header(session);
         let message = self
             .earlier
             .as_ref()
-            .map_or(session.last_message.as_str(), |message| {
-                message.text.as_str()
-            });
+            .map_or(session.last_message(), |message| message.text.as_str());
         if self.earlier.is_some() {
             text.plain("\n\nEarlier message");
         }
@@ -485,20 +433,6 @@ impl Browser {
                     text.plain(&format!("\n\n{}", short(error, 300)))
                 }
             }
-        }
-        if let Some(request) = session.approval_key().and_then(|key| pending.get(&key)) {
-            let (body, keyboard) = request.body_content();
-            text.plain("\n\n");
-            text.append_limited(body, 1500);
-            rows.extend(
-                keyboard["inline_keyboard"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-        } else if let Some(approval) = &session.approval {
-            text.plain("\n\n");
-            text.markdown(&approval.body, 1500);
         }
         text
     }
@@ -554,7 +488,7 @@ fn client_order(client: Client) -> u8 {
     }
 }
 fn status_symbol(session: &Session) -> &'static str {
-    if session.approval.is_some() || session.activity == Activity::Confirmation {
+    if session.approval().is_some() || session.activity == Activity::Confirmation {
         "🟠 "
     } else if session.activity == Activity::Working {
         "🟢 "
@@ -568,25 +502,36 @@ mod tests {
     use super::*;
     use crate::agents::sessions::Approval;
     fn session(id: &str, title: &str, client: Client) -> Session {
-        Session {
-            authoritative: true,
-            agent: "codex",
-            id: id.into(),
-            title: title.into(),
-            cwd: "/work/project".into(),
-            workspace: None,
-            git_branch: Some("main".into()),
-            model: None,
-            model_display_name: None,
-            reasoning_effort: None,
-            updated_at: 0,
-            client,
-            activity: Activity::Idle,
-            last_message: "Latest message".into(),
-            images: vec![],
-            interaction_data: Default::default(),
-            target: None,
-            approval: None,
+        {
+            let mut __session = Session {
+                agent: "codex",
+                id: id.into(),
+                title: title.into(),
+                cwd: "/work/project".into(),
+                workspace: None,
+                git_branch: Some("main".into()),
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 0,
+                client,
+                activity: Activity::Idle,
+                target: None,
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot(
+                "Latest message".into(),
+                vec![],
+                None,
+                None,
+                Default::default(),
+            );
+            __session
         }
     }
     fn callbacks(content: &Value) -> Vec<(String, String)> {
@@ -611,7 +556,7 @@ mod tests {
             ..Default::default()
         };
         let mut browser = Browser::resume(chat.key()).unwrap();
-        browser.content(&state, &HashMap::new());
+        browser.content(&state);
         assert!(browser.pending_image().is_none());
         browser.previous_requested = true;
         let Some(monitor::Command::History {
@@ -630,17 +575,17 @@ mod tests {
                 &crate::agents::codex::images::fixture(),
             ),
         });
-        browser.content(&state, &HashMap::new());
+        browser.content(&state);
         let (id, image, _) = browser.pending_image().expect("history image");
         assert_eq!(image.mime, "image/png");
         browser.image_sent(id);
-        browser.content(&state, &HashMap::new());
+        browser.content(&state);
         assert!(browser.pending_image().is_none());
         state
             .preferences
             .applications
             .set_enabled(&chat.client.application_id(), false);
-        browser.content(&state, &HashMap::new());
+        browser.content(&state);
         assert!(browser.pending_image().is_none());
     }
     #[test]
@@ -656,7 +601,7 @@ mod tests {
             asking,
         ];
         let mut browser = Browser::new().unwrap();
-        let content = browser.content(&state, &HashMap::new());
+        let content = browser.content(&state);
         assert!(
             !callbacks(&content)
                 .iter()
@@ -686,7 +631,7 @@ mod tests {
             .set_enabled(&Client::Terminal.application_id(), false);
         assert!(
             !browser
-                .content(&state, &HashMap::new())
+                .content(&state)
                 .to_string()
                 .contains("Terminal chat")
         );
@@ -702,81 +647,66 @@ mod tests {
             ],
             ..Default::default()
         };
-        let content = browser.content(&state, &HashMap::new());
+        let content = browser.content(&state);
         let data = callbacks(&content)
             .into_iter()
             .find(|(text, _)| text.contains("Alpha"))
             .unwrap()
             .1;
         state.sessions[0].title = "Zulu".into();
-        browser.content(&state, &HashMap::new());
+        browser.content(&state);
         assert!(browser.navigate(8, &data).is_err());
         assert!(browser.navigate(7, &data).unwrap());
         assert_eq!(browser.selected(7), Some("codex:1"));
         assert_eq!(browser.selected(8), None);
-        let detail = browser.content(&state, &HashMap::new());
+        let detail = browser.content(&state);
         assert!(detail["text"].as_str().unwrap().contains("Zulu"));
         assert!(detail["text"].as_str().unwrap().contains("Latest message"));
         assert!(!detail["text"].as_str().unwrap().contains("/work/project"));
         browser
             .navigate(7, &format!("{}:info", browser.nonce))
             .unwrap();
-        let info = browser.content(&state, &HashMap::new());
+        let info = browser.content(&state);
         assert!(info["text"].as_str().unwrap().contains("/work/project"));
         assert!(info["text"].as_str().unwrap().contains("main"));
         state.sessions.clear();
         assert!(
-            browser.content(&state, &HashMap::new())["text"]
+            browser.content(&state)["text"]
                 .as_str()
                 .unwrap()
                 .contains("closed")
         );
     }
     #[test]
-    fn request_buttons_are_bound_to_delivered_request_and_disappear_on_resolution() {
-        let mut s = session("1", "Chat", Client::VSCode);
-        s.approval = Some(Approval {
+    fn session_card_never_contains_request_body_command_or_answer_controls() {
+        let mut session = session("1", "Chat", Client::VSCode);
+        session.set_approval(Some(Approval {
             id: "request".into(),
             body: "Allow test?".into(),
             expires: u64::MAX,
             can_allow: true,
-        });
-        s.interaction_data = crate::domain::interaction::Interaction::allow();
-        let p = Pending::new(s.clone()).unwrap();
-        let key = s.approval_key().unwrap();
-        let mut pending = HashMap::from([(key.clone(), p)]);
-        let mut state = monitor::State {
-            sessions: vec![s],
+        }));
+        let mut interaction = crate::domain::interaction::Interaction::allow();
+        interaction.command = Some("private-command --approve".into());
+        session.set_interaction(interaction);
+        let state = monitor::State {
+            sessions: vec![session.clone()],
             ..Default::default()
         };
-        let mut browser = Browser::new().unwrap();
+        let mut browser = Browser::resume(session.key()).unwrap();
         browser.message = Some(7);
-        let list = browser.content(&state, &pending);
-        let data = callbacks(&list)
-            .into_iter()
-            .find(|(_, data)| data.contains(":s:"))
-            .unwrap()
-            .1;
-        browser.navigate(7, &data).unwrap();
-        let detail = browser.content(&state, &pending);
-        assert!(detail["text"].as_str().unwrap().contains("Allow test?"));
+        let detail = browser.content(&state);
+        assert!(!detail["text"].as_str().unwrap().contains("Allow test?"));
+        assert!(!detail["text"].as_str().unwrap().contains("private-command"));
+        assert!(detail["text"].as_str().unwrap().contains("Latest message"));
+        assert_eq!(callbacks(&detail).len(), 3);
         assert!(
             callbacks(&detail)
                 .iter()
-                .any(|(_, data)| data.starts_with(&pending[&key].nonce))
+                .all(|(_, data)| data.starts_with(&browser.nonce))
         );
-        assert!(!browser.permits_answer(7, &pending[&key]));
-        browser.commit(detail);
-        assert!(browser.permits_answer(7, &pending[&key]));
-        assert!(!browser.permits_answer(8, &pending[&key]));
-        pending.get_mut(&key).unwrap().nonce = "new-question-step".into();
-        assert!(!browser.permits_answer(7, &pending[&key]));
-        pending.clear();
-        state.sessions[0].approval = None;
-        let resolved = browser.content(&state, &pending);
-        assert!(!resolved["text"].as_str().unwrap().contains("Allow test?"));
-        assert_eq!(callbacks(&resolved).len(), 3);
     }
+
     #[test]
     fn previous_message_uses_monitor_history_and_latest_restores_live_message() {
         let mut state = monitor::State {
@@ -795,7 +725,7 @@ mod tests {
         );
         let mut browser = Browser::new().unwrap();
         browser.message = Some(7);
-        let list = browser.content(&state, &HashMap::new());
+        let list = browser.content(&state);
         let data = callbacks(&list)
             .into_iter()
             .find(|(_, data)| data.contains(":s:"))
@@ -829,7 +759,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let detail = browser.content(&state, &HashMap::new());
+        let detail = browser.content(&state);
         assert!(state.history[&monitor::HistoryKey::window("codex:1".into())].loading);
         assert!(
             detail["text"]
@@ -854,7 +784,7 @@ mod tests {
         browser
             .navigate(7, &format!("{}:latest", browser.nonce))
             .unwrap();
-        let latest = browser.content(&state, &HashMap::new());
+        let latest = browser.content(&state);
         assert!(latest["text"].as_str().unwrap().contains("Latest message"));
         assert!(
             !latest["text"]
@@ -866,26 +796,27 @@ mod tests {
     #[test]
     fn rendered_message_entities_are_shifted_past_literal_header_and_clipped_safely() {
         let mut chat = session("1", "Chat **literal** 🤖", Client::VSCode);
-        chat.last_message =
-            "## Итог\n\n**Готово 🤖**: [ссылка](https://example.com) и `file_name.rs`".into();
+        chat.set_last_message(
+            "## Summary\n\n**Done 🤖**: [link](https://example.com) and `file_name.rs`".into(),
+        );
         let mut state = monitor::State {
             sessions: vec![chat],
             ..Default::default()
         };
         let mut browser = Browser::new().unwrap();
         browser.message = Some(7);
-        let list = browser.content(&state, &HashMap::new());
+        let list = browser.content(&state);
         let data = callbacks(&list)
             .into_iter()
             .find(|(_, data)| data.contains(":s:"))
             .unwrap()
             .1;
         browser.navigate(7, &data).unwrap();
-        let payload = browser.content(&state, &HashMap::new());
+        let payload = browser.content(&state);
         let text = payload["text"].as_str().unwrap();
         let utf16: Vec<_> = text.encode_utf16().collect();
         assert!(text.contains("Chat **literal** 🤖"));
-        assert!(text.contains("Готово 🤖: ссылка и file_name.rs"));
+        assert!(text.contains("Done 🤖: link and file_name.rs"));
         let spans: Vec<_> = payload["entities"]
             .as_array()
             .unwrap()
@@ -902,20 +833,20 @@ mod tests {
         assert!(
             spans
                 .iter()
-                .any(|(kind, span)| *kind == "bold" && span.contains("Готово 🤖"))
+                .any(|(kind, span)| *kind == "bold" && span.contains("Done 🤖"))
         );
         assert!(
             spans
                 .iter()
-                .any(|(kind, span)| *kind == "text_link" && span == "ссылка")
+                .any(|(kind, span)| *kind == "text_link" && span == "link")
         );
         assert!(
             spans
                 .iter()
                 .any(|(kind, span)| *kind == "code" && span == "file_name.rs")
         );
-        state.sessions[0].last_message = format!("**{}**", "🤖".repeat(3000));
-        let clipped = browser.content(&state, &HashMap::new());
+        state.sessions[0].set_last_message(format!("**{}**", "🤖".repeat(3000)));
+        let clipped = browser.content(&state);
         let size = clipped["text"].as_str().unwrap().encode_utf16().count();
         assert!(size <= 3900);
         for entity in clipped["entities"].as_array().unwrap() {
@@ -935,7 +866,7 @@ mod tests {
         };
         let mut browser = Browser::new().unwrap();
         browser.message = Some(7);
-        let list = browser.content(&state, &HashMap::new());
+        let list = browser.content(&state);
         let data = callbacks(&list)
             .into_iter()
             .find(|(_, data)| data.contains(":s:"))
@@ -950,7 +881,7 @@ mod tests {
                 status: monitor::MessageStatus::Sent,
             },
         );
-        let detail = browser.content(&state, &HashMap::new());
+        let detail = browser.content(&state);
         let text = detail["text"].as_str().unwrap();
         assert!(text.starts_with("💻 Chat  🟢\n\nLatest message"));
         for unwanted in [
@@ -968,7 +899,7 @@ mod tests {
                 .any(|(label, _)| label.contains("Refresh"))
         );
         assert!(browser.open_info());
-        let info = browser.content(&state, &HashMap::new());
+        let info = browser.content(&state);
         assert!(
             !callbacks(&info)
                 .iter()
@@ -981,7 +912,7 @@ mod tests {
             .navigate(7, &format!("{}:message", browser.nonce))
             .unwrap();
         assert!(
-            browser.content(&state, &HashMap::new())["text"]
+            browser.content(&state)["text"]
                 .as_str()
                 .unwrap()
                 .contains("Latest message")
@@ -995,25 +926,25 @@ mod tests {
         };
         let mut browser = Browser::new().unwrap();
         browser.message = Some(7);
-        let list = browser.content(&state, &HashMap::new());
+        let list = browser.content(&state);
         let data = callbacks(&list)
             .into_iter()
             .find(|(_, data)| data.contains(":s:"))
             .unwrap()
             .1;
         browser.navigate(7, &data).unwrap();
-        let detail = browser.content(&state, &HashMap::new());
+        let detail = browser.content(&state);
         browser.commit(detail);
         state.sessions[0].activity = Activity::Working;
-        let status = browser.content(&state, &HashMap::new());
+        let status = browser.content(&state);
         assert!(!browser.needs_new_message());
         browser.commit(status);
         browser.open_info();
-        let info = browser.content(&state, &HashMap::new());
+        let info = browser.content(&state);
         assert!(!browser.needs_new_message());
         browser.commit(info);
-        state.sessions[0].last_message = "A new agent reply".into();
-        let fresh = browser.content(&state, &HashMap::new());
+        state.sessions[0].set_last_message("A new agent reply".into());
+        let fresh = browser.content(&state);
         assert!(browser.needs_new_message());
         assert!(
             fresh["text"]
@@ -1030,57 +961,33 @@ mod tests {
         assert_eq!(browser.selected(8), Some("codex:1"));
     }
     #[test]
-    fn requests_update_the_existing_session_message_without_new_agent_text() {
+    fn request_lifecycle_changes_only_the_session_status_marker() {
         let mut state = monitor::State {
             sessions: vec![session("1", "Chat", Client::VSCode)],
             ..Default::default()
         };
-        let mut browser = Browser::new().unwrap();
+        let mut browser = Browser::resume(state.sessions[0].key()).unwrap();
         browser.message = Some(7);
-        let list = browser.content(&state, &HashMap::new());
-        browser.commit(list.clone());
-        let data = callbacks(&list)
-            .into_iter()
-            .find(|(_, data)| data.contains(":s:"))
-            .unwrap()
-            .1;
-        browser.navigate(7, &data).unwrap();
-        let detail = browser.content(&state, &HashMap::new());
-        browser.commit(detail);
-        state.sessions[0].approval = Some(Approval {
-            id: "new-request".into(),
+        let original = browser.content(&state);
+        browser.commit(original.clone());
+        state.sessions[0].set_approval(Some(Approval {
+            id: "request".into(),
             body: "Allow?".into(),
             expires: u64::MAX,
             can_allow: true,
-        });
-        state.sessions[0].interaction_data = crate::domain::interaction::Interaction::allow();
-        let key = state.sessions[0].approval_key().unwrap();
-        let mut pending = HashMap::from([(
-            key.clone(),
-            Pending::new(state.sessions[0].clone()).unwrap(),
-        )]);
-        let request = browser.content(&state, &pending);
+        }));
+        state.sessions[0].set_interaction(crate::domain::interaction::Interaction::allow());
+        let pending = browser.content(&state);
         assert!(!browser.needs_new_message());
-        browser.commit(request);
-        assert!(browser.permits_answer(7, &pending[&key]));
-        browser.open_info();
-        let info = browser.content(&state, &pending);
-        browser.commit(info);
-        browser
-            .navigate(7, &format!("{}:message", browser.nonce))
-            .unwrap();
-        browser.content(&state, &pending);
-        assert!(
-            !browser.needs_new_message(),
-            "returning from Info is not a new request"
-        );
-        pending.get_mut(&key).unwrap().nonce = "next-question-step".into();
-        browser.content(&state, &pending);
-        assert!(
-            !browser.needs_new_message(),
-            "draft steps of one request edit the current message"
-        );
+        assert!(!pending["text"].as_str().unwrap().contains("Allow?"));
+        assert_eq!(pending["reply_markup"], original["reply_markup"]);
+        browser.commit(pending);
+        state.sessions[0].set_approval(None);
+        let resolved = browser.content(&state);
+        assert!(!browser.needs_new_message());
+        assert_eq!(resolved, original);
     }
+
     #[test]
     fn large_lists_paginate_and_keep_telegram_limits() {
         let state = monitor::State {
@@ -1095,7 +1002,7 @@ mod tests {
             browser
                 .navigate(7, &format!("{}:p:{page}", browser.nonce))
                 .unwrap();
-            let content = browser.content(&state, &HashMap::new());
+            let content = browser.content(&state);
             assert!(content["text"].as_str().unwrap().encode_utf16().count() <= 3900);
             let buttons = callbacks(&content);
             assert!(buttons.len() <= 35);

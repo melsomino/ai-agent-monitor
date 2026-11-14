@@ -9,6 +9,12 @@ use anyhow::{Context, Result};
 pub trait SessionProvider: Send {
     fn id(&self) -> &'static str;
     fn sessions(&self) -> Result<Vec<Session>>;
+    /// Wake the provider actor when its local live observation changes.
+    fn live_updates(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
+    /// Update status/requests from local observations only; no discovery or history I/O.
+    fn refresh_live(&self, _sessions: &mut [Session]) {}
     #[cfg(test)]
     fn pending_count(&self) -> usize;
     fn previous_message(
@@ -25,7 +31,7 @@ pub trait SessionProvider: Send {
     fn allow(&self, session: &Session) -> bool;
     fn interaction(&self, session: &Session) -> Interaction {
         if session
-            .approval
+            .approval()
             .as_ref()
             .is_some_and(|request| request.can_allow)
         {
@@ -48,7 +54,7 @@ pub trait SessionProvider: Send {
     fn respond(&self, session: &Session, response: &Response) -> bool {
         response == &Response::Action("allow".into())
             && session
-                .approval
+                .approval()
                 .as_ref()
                 .is_some_and(|request| request.can_allow)
             && self.allow(session)
@@ -86,7 +92,7 @@ impl Registry<'_> {
         }
         for session in &mut sessions {
             if let Some(provider) = self.provider(session.agent) {
-                session.interaction_data = provider.interaction(session);
+                session.set_interaction(provider.interaction(session));
                 session.target = Some(provider.open_target(session));
                 #[cfg(target_os = "macos")]
                 if session.client == Client::Terminal {
@@ -114,7 +120,7 @@ impl Registry<'_> {
     #[cfg(test)]
     fn allow(&self, session: &Session) -> bool {
         session
-            .approval
+            .approval()
             .as_ref()
             .is_some_and(|approval| approval.can_allow)
             && self
@@ -156,30 +162,39 @@ mod tests {
             self.id
         }
         fn sessions(&self) -> Result<Vec<Session>> {
-            Ok(vec![Session {
-                authoritative: true,
-                interaction_data: Default::default(),
-                target: None,
-                agent: self.id,
-                id: "same-chat".into(),
-                title: "Chat".into(),
-                cwd: "/project".into(),
-                workspace: None,
-                git_branch: None,
-                model: None,
-                model_display_name: None,
-                reasoning_effort: None,
-                updated_at: 0,
-                client: Client::Terminal,
-                activity: Activity::Confirmation,
-                last_message: "Answer".into(),
-                images: vec![],
-                approval: Some(Approval {
-                    id: "same-request".into(),
-                    body: "Approve?".into(),
-                    expires: u64::MAX,
-                    can_allow: true,
-                }),
+            Ok(vec![{
+                let mut session = Session {
+                    connection: crate::domain::session::ConnectionState::live(false),
+                    activities: Default::default(),
+
+                    target: None,
+                    agent: self.id,
+                    id: "same-chat".into(),
+                    title: "Chat".into(),
+                    cwd: "/project".into(),
+                    workspace: None,
+                    git_branch: None,
+                    model: None,
+                    model_display_name: None,
+
+                    reasoning_effort: None,
+                    updated_at: 0,
+                    client: Client::Terminal,
+                    activity: Activity::Confirmation,
+                };
+                session.seed_snapshot(
+                    "Answer".into(),
+                    vec![],
+                    None,
+                    Some(Approval {
+                        id: "same-request".into(),
+                        body: "Approve?".into(),
+                        expires: u64::MAX,
+                        can_allow: true,
+                    }),
+                    Default::default(),
+                );
+                session
             }])
         }
         #[cfg(test)]
@@ -226,10 +241,10 @@ mod tests {
         assert!(registry.open_target(&session).is_none());
         assert!(!registry.allow(&session));
         session.agent = "first";
-        session.approval.as_mut().unwrap().can_allow = false;
+        session.approval_mut().unwrap().can_allow = false;
         assert!(!registry.allow(&session));
         assert!(first.allowed.lock().unwrap().is_empty());
-        session.approval = None;
+        session.set_approval(None);
         assert!(!registry.allow(&session));
         assert!(first.allowed.lock().unwrap().is_empty());
     }

@@ -25,7 +25,7 @@ impl Card {
                 0,
             );
         }
-        if let Some(approval) = &session.approval {
+        if let Some(approval) = &session.approval() {
             if interaction.questions.is_empty()
                 || (interaction.questions.len() == 1
                     && interaction.questions[0].title.trim() != approval.body.trim())
@@ -155,7 +155,7 @@ impl Card {
                 title.set_margin_bottom(10);
                 group.pack_start(&title, false, false, 0);
                 if index == 0 {
-                    if let Some(approval) = &session.approval {
+                    if let Some(approval) = &session.approval() {
                         if !approval.body.trim().is_empty()
                             && !interaction
                                 .questions

@@ -116,7 +116,7 @@ impl Notifications {
             .iter()
             .filter(|s| {
                 state.preferences.applications.enabled(s.client)
-                    && s.approval
+                    && s.approval()
                         .as_ref()
                         .is_some_and(|a| a.expires > monitor::now())
             })
@@ -180,7 +180,7 @@ impl Notifications {
                 captions.extend(["questions".into(), "Answer questions…".into()]);
             }
             let body = session
-                .approval
+                .approval()
                 .as_ref()
                 .map(|a| a.body.as_str())
                 .unwrap_or_default();
@@ -240,8 +240,8 @@ fn token(session: &Session) -> String {
     format!(
         "{}:{:?}:{:?}",
         session.key(),
-        session.approval,
-        session.interaction_data
+        session.approval(),
+        session.interaction()
     )
 }
 fn close(bus: &gio::DBusConnection, id: u32) {

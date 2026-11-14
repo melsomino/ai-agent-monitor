@@ -3,7 +3,7 @@
 <a id="indicator-structure"></a>
 ## Purpose and structure
 
-The ambient indicator provides a compact summary without opening the session list: two-robot identity artwork, green working number, filled blue unseen-finished counter, filled orange request counter, in that order. Zero values are omitted. It is not a task progress percentage. Counter meanings are separate from Codex quota in the footer.
+The ambient indicator provides a compact summary without opening the session list: two-robot identity artwork, filled orange request counter, filled blue unseen-finished counter, green working number, in that order (M/H). GNOME ordering remains platform-specific until verified against this sequence. Zero values are omitted. It is not a task progress percentage. Counter meanings are separate from Codex quota in the footer.
 
 **IN-01 (S):** Working/finished totals MUST reflect application visibility, and MUST NOT change just because the popup title query changes. H has no application filtering and calculates fixture counts only. **Pending filtering is unresolved:** M uses `State::pending_count()` on all sessions, G filters applications first. See [D-01](../discrepancies.md#d-01).
 
@@ -39,7 +39,7 @@ With animation preference off, an active working base keeps both eyes fully gree
 ## Acceptance
 
 - Zero counts: artwork only; no zero placeholders.
-- Add one working, one finished and one pending session: order remains green, blue, orange; numbers are regular weight.
+- Add one working, one finished and one pending session: M/H order remains orange, blue, green; numbers are regular weight. Hidden zero counters leave no empty slot.
 - Apply a title query: counts unchanged. Disable an app: working/finished removed; pending obeys each platform's documented current policy.
 - Open/close the native popup: M relies on system tracking selection; G checked style follows Visible. Verify persistent native selection on a real desktop (U, not certified by code).
 - Disable animation while working: eyes steady when eligible, status labels unchanged. Notification answers never originate from clicking this summary.

@@ -1,4 +1,9 @@
 //! Resident menu bar item and native sessions menu.
+use super::visual::{
+    self, BRAND_HEIGHT, GlassBox, UsageTrack, UsageTrackState, appearance_color, command_text,
+    draw_menu_tint, glass_box, hover_fill_color, primary_text_color, request_color,
+    secondary_text_color, working_status_color,
+};
 use crate::macos::session_layout::{
     BUTTON_HORIZONTAL_INSET, BUTTON_MIN_HEIGHT, BUTTON_VERTICAL_INSET,
 };
@@ -31,13 +36,16 @@ use std::{
     time::Instant,
 };
 
+const MENU_WIDTH: f64 = 460.0;
+const LIST_WIDTH: f64 = 438.0;
+
 const SESSION_HEADER_HEIGHT: f64 = session_layout::ROW_HEIGHT;
 const SESSION_TEXT_LEFT: f64 = session_layout::TEXT_LEFT;
 const DETAIL_WIDTH: f64 = session_layout::DETAIL_WIDTH;
-const LIST_BOTTOM_PADDING: f64 = 8.0;
+const LIST_BOTTOM_PADDING: f64 = 14.0;
 const SESSION_HOVER_PADDING: f64 = 0.0;
-const SESSION_HEADER_HOVER_LEFT: f64 = SESSION_TEXT_LEFT - 8.0;
-const SESSION_HEADER_HOVER_WIDTH: f64 = 384.0 - 2.0 * SESSION_HEADER_HOVER_LEFT;
+const SESSION_HEADER_HOVER_LEFT: f64 = SESSION_TEXT_LEFT - 9.0;
+const SESSION_HEADER_HOVER_WIDTH: f64 = LIST_WIDTH - 2.0 * SESSION_HEADER_HOVER_LEFT;
 const MESSAGE_TOP_GAP: f64 = 4.0;
 const BUTTON_HOVER_PADDING: f64 = 0.0;
 const ICON_BUTTON_SIZE: f64 = 28.0;
@@ -48,6 +56,7 @@ struct MessageHistory {
     messages: Vec<crate::agents::history::Message>,
     cursor: Option<String>,
     anchor: String,
+    anchor_images: Vec<crate::domain::media::Image>,
     loading: bool,
     exhausted: bool,
     error: Option<String>,
@@ -69,6 +78,7 @@ enum ControlKind {
     Form,
     Open,
     Native,
+    Composer,
     ContextToggle(String),
 }
 #[derive(Clone)]
@@ -79,7 +89,7 @@ struct RequestControl {
     kind: ControlKind,
 }
 fn request_controls(session: &Session) -> Vec<RequestControl> {
-    if session.approval.is_none() {
+    if session.approval().is_none() {
         return vec![];
     }
     let interaction = session.interaction();
@@ -159,8 +169,12 @@ pub struct State {
     status_eyes: OnceCell<[Retained<NSImageView>; 2]>,
     status_eye_animation: RefCell<motion::WorkingEyes>,
     status_timer: RefCell<Option<Retained<NSTimer>>>,
-    settings_window: OnceCell<Retained<NSWindow>>,
-    settings_tabs: OnceCell<Retained<PreferencesTabs>>,
+    settings_shell: OnceCell<super::inline_settings::Shell>,
+    settings_tabs: OnceCell<Retained<NSTabViewController>>,
+    settings_active: Cell<bool>,
+    settings_selected: Cell<usize>,
+    web_settings: OnceCell<Retained<super::web_settings::WebSettings>>,
+    settings_session_scroll: Cell<NSPoint>,
     applications: RefCell<settings::Applications>,
     applications_list: OnceCell<Retained<SessionListView>>,
     applications_controller: OnceCell<Retained<NSViewController>>,
@@ -205,12 +219,12 @@ pub struct State {
     menu_open: Cell<bool>,
     list: OnceCell<Retained<SessionListView>>,
     root: OnceCell<Retained<PanelView>>,
+    backdrop: OnceCell<Retained<visual::MeshView>>,
     toolbar: OnceCell<Retained<NSView>>,
     footer: OnceCell<Retained<NSView>>,
     footer_height: Cell<f64>,
-    footer_extension: OnceCell<FooterExtension>,
-    header_extension: OnceCell<Retained<MenuTintView>>,
-    footer_fill: OnceCell<Retained<NSColor>>,
+    footer_extension: OnceCell<Retained<visual::MeshView>>,
+    header_extension: OnceCell<Retained<visual::MeshView>>,
     scroll: OnceCell<Retained<SessionScrollView>>,
     content_height: Cell<f64>,
     expanded: RefCell<HashSet<String>>,
@@ -223,6 +237,7 @@ pub struct State {
     layout: RefCell<Vec<LayoutRow>>,
     group_icons: RefCell<Vec<GroupIcon>>,
     caption: OnceCell<Retained<NSTextField>>,
+    overview: OnceCell<Retained<NSTextField>>,
     all: RefCell<Vec<Session>>,
     visible: RefCell<Vec<Session>>,
     filter_query: RefCell<String>,
@@ -233,6 +248,8 @@ pub struct State {
     buttons: RefCell<Vec<ButtonHover>>,
     request_controls: RefCell<HashMap<String, RequestControl>>,
     question_panels: RefCell<HashMap<String, Retained<inline_questions::Panel>>>,
+    composers: RefCell<HashMap<String, Retained<super::session_composer::Composer>>>,
+    work_glows: RefCell<Vec<Retained<super::work_caption::WorkGlow>>>,
     expanded_contexts: RefCell<HashSet<String>>,
     responding: RefCell<HashSet<String>>,
     message_history: RefCell<HashMap<String, MessageHistory>>,
@@ -345,29 +362,6 @@ impl State {
 }
 
 define_class!(
-    // SAFETY: Decorative NSView; drawing and appearance updates are main-thread only.
-    #[unsafe(super(NSView))]
-    #[thread_kind = MainThreadOnly]
-    #[derive(Debug)]
-    struct MenuTintView;
-    unsafe impl NSObjectProtocol for MenuTintView {}
-    impl MenuTintView {
-        #[unsafe(method_id(hitTest:))]
-        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> { None }
-
-        #[unsafe(method(drawRect:))]
-        fn draw_background(&self, _dirty: NSRect) { draw_menu_tint(self.bounds()); }
-    }
-);
-
-fn draw_menu_tint(bounds: NSRect) {
-    NSColor::windowBackgroundColor()
-        .colorWithAlphaComponent(0.65)
-        .setFill();
-    NSBezierPath::bezierPathWithRect(bounds).fill();
-}
-
-define_class!(
     // SAFETY: NSObject has no subclassing requirements. UI and all state are
     // confined to the main thread; retained controls outlive their weak targets.
     #[unsafe(super(NSObject))]
@@ -376,21 +370,6 @@ define_class!(
     pub struct MenuController;
 
     unsafe impl NSObjectProtocol for MenuController {}
-    // SAFETY: The retained controller handles the window's main-thread delegate callback.
-    unsafe impl NSWindowDelegate for MenuController {
-        #[unsafe(method(windowDidBecomeKey:))]
-        fn settings_became_key(&self, _notification: &NSNotification) {
-            self.refresh_settings();
-        }
-        #[unsafe(method(windowDidResignKey:))]
-        fn settings_resigned_key(&self, _notification: &NSNotification) {
-            self.end_shortcut_recording(true);
-        }
-        #[unsafe(method(windowWillClose:))]
-        fn settings_will_close(&self, _notification: &NSNotification) {
-            self.end_shortcut_recording(true);
-        }
-    }
     // SAFETY: The retained main-thread controller implements NSMenuDelegate.
     unsafe impl NSMenuDelegate for MenuController {
         #[unsafe(method(menuWillOpen:))]
@@ -431,7 +410,7 @@ define_class!(
         }
 
         #[unsafe(method(pollState:))]
-        fn poll_state(&self,_timer:&NSTimer){self.drain_ui();self.receive_sessions();}
+        fn poll_state(&self,_timer:&NSTimer){self.drain_ui();self.receive_sessions();if let Some(web)=self.ivars().web_settings.get(){let height=web.frame().size.height;web.poll(self.ivars().menu_open.get()&&self.ivars().settings_active.get()&&self.ivars().settings_selected.get()==4);if height!=web.frame().size.height{self.layout_settings();}}}
         #[unsafe(method(pollPointer:))]
         fn poll_pointer(&self, _timer: &NSTimer) {
             self.constrain_menu_to_work_area();
@@ -455,6 +434,20 @@ define_class!(
                 }
                 panel.advance_carets(now);
             }
+            let composers: Vec<_> = self.ivars().composers.borrow().values().cloned().collect();
+            let mut composer_resized = false;
+            for composer in composers {
+                composer_resized |= composer.resize_to_fit();
+                if composer.editing() {
+                    let id = composer.id();
+                    if self.ivars().keyboard_focus.borrow().as_ref() != Some(&id) {
+                        *self.ivars().keyboard_focus.borrow_mut() = Some(id);
+                        focus_changed = true;
+                    }
+                }
+                composer.paint(self.ivars().keyboard_focus.borrow().as_deref());
+            }
+            if composer_resized { self.render_rows(&self.ivars().filtered_sessions()); }
             if focus_changed { self.apply_hover(self.ivars().hovered.get()); }
         }
 
@@ -488,7 +481,10 @@ define_class!(
                 let mut histories = state.message_history.borrow_mut();
                 let history = histories.entry(key.clone()).or_default();
                 if history.loading || history.exhausted { return; }
-                if history.cursor.is_none() { history.anchor = session.last_message.clone(); }
+                if history.cursor.is_none() {
+                    history.anchor = session.last_message().to_owned();
+                    history.anchor_images = session.images().to_vec();
+                }
                 history.loading = true;
                 history.error = None;
                 history.ticket = ticket;
@@ -517,7 +513,7 @@ define_class!(
                     self.render_rows(&self.ivars().filtered_sessions());
                     self.update_hover();
                 }
-                ControlKind::Native => {},
+                ControlKind::Native | ControlKind::Composer => {},
                 ControlKind::Form => { self.dismiss_menu(); self.show_form(control.session,None); }
                 ControlKind::Open => {
                     self.ivars().acknowledge_finished(&control.session.key());
@@ -543,8 +539,18 @@ define_class!(
 
         #[unsafe(method(settings:))]
         fn settings(&self, _sender: Option<&AnyObject>) {
-            self.dismiss_menu();
             self.show_settings();
+        }
+
+        #[unsafe(method(backToSessions:))]
+        fn back_to_sessions(&self, _sender: Option<&AnyObject>) { self.hide_settings(); }
+
+        #[unsafe(method(selectSettingsTab:))]
+        fn select_settings_tab(&self, sender: &NSButton) {
+            self.end_shortcut_recording(false);
+            if let Some(window)=self.ivars().root.get().and_then(|v|v.window()) { unsafe {window.endEditingFor(None);} }
+            self.ivars().settings_selected.set(sender.tag().clamp(0,4) as usize);
+            self.layout_settings();
         }
 
         #[unsafe(method(setupIntegrations:))]
@@ -601,6 +607,14 @@ define_class!(
             if let Some(url) = NSURL::URLWithString(ns_string!("https://t.me/BotFather?text=%2Fnewbot")) {
                 workspace.openURL(&url);
             }
+        }
+        #[unsafe(method(copyCommand:))]
+        fn copy_command(&self, sender: &NSButton) {
+            let Some(text)=sender.identifier() else { return; };
+            let pasteboard=NSPasteboard::generalPasteboard();
+            pasteboard.clearContents();
+            // SAFETY: Standard AppKit string type; the command is already visible.
+            pasteboard.setString_forType(&text,unsafe { NSPasteboardTypeString });
         }
         #[unsafe(method(copyBotValue:))]
         fn copy_bot_value(&self, sender: &NSButton) {
@@ -718,33 +732,6 @@ fn settings_note(
     label
 }
 
-fn resize_preferences_window(window: &NSWindow, size: NSSize) {
-    crate::macos::settings_pane::resize(window, size);
-}
-
-define_class!(
-    // SAFETY: Native tab controller; selection and window sizing stay on the main thread.
-    #[unsafe(super(NSTabViewController))]
-    #[thread_kind = MainThreadOnly]
-    #[name = "AAMPreferencesTabs"]
-    #[derive(Debug)]
-    struct PreferencesTabs;
-    unsafe impl NSObjectProtocol for PreferencesTabs {}
-    impl PreferencesTabs {
-        #[unsafe(method(tabView:didSelectTabViewItem:))]
-        fn did_select(&self, tab: &NSTabView, item: Option<&NSTabViewItem>) {
-            // SAFETY: Preserve the superclass's tab-selection and view-controller lifecycle.
-            unsafe { let _: () = msg_send![super(self), tabView: tab, didSelectTabViewItem: item]; }
-            if let Some(controller) = item.and_then(|item| item.viewController(self.mtm()))
-                && let Some(window) = self.view().window() {
-                let size = controller.preferredContentSize();
-                self.setPreferredContentSize(size);
-                resize_preferences_window(&window, size);
-            }
-        }
-    }
-);
-
 define_class!(
     // SAFETY: Decoration-only NSView, drawn exclusively on the main thread.
     #[unsafe(super(NSView))]
@@ -813,6 +800,7 @@ fn owner(view: &NSView) -> Option<Retained<MenuController>> {
 fn pointer_changed(view: &NSView) {
     if let Some(controller) = owner(view) {
         controller.update_group_headings();
+        controller.sync_backdrop();
         controller.update_hover();
     }
 }
@@ -902,22 +890,6 @@ define_class!(
         fn wheel(&self, event: &NSEvent) { route_wheel(self,event); }
     }
 );
-define_class!(
-    // SAFETY: Transparent overlay delegates hit testing to its actual controls.
-    #[unsafe(super(NSView))]
-    #[thread_kind = MainThreadOnly]
-    #[derive(Debug)]
-    struct OverlayView;
-    unsafe impl NSObjectProtocol for OverlayView {}
-    impl OverlayView {
-        #[unsafe(method_id(hitTest:))]
-        fn hit_test(&self, point: NSPoint) -> Option<Retained<NSView>> {
-            // SAFETY: Standard NSView hit test with a valid point.
-            let hit: Option<Retained<NSView>> = unsafe { msg_send![super(self), hitTest: point] };
-            hit.filter(|view| !std::ptr::eq(std::ptr::from_ref(&**view).cast::<()>(), std::ptr::from_ref(self).cast::<()>()))
-        }
-    }
-);
 
 #[derive(Default, Debug)]
 struct HoverState {
@@ -952,12 +924,15 @@ impl SessionRowView {
             mtm,
             rect(
                 SESSION_HEADER_HOVER_LEFT,
-                frame.size.height - SESSION_HEADER_HEIGHT - SESSION_HOVER_PADDING,
+                frame.size.height - SESSION_HEADER_HEIGHT + 3.0,
                 SESSION_HEADER_HOVER_WIDTH,
-                SESSION_HEADER_HEIGHT + SESSION_HOVER_PADDING * 2.0,
+                SESSION_HEADER_HEIGHT - 6.0,
             ),
-            16.0,
+            15.0,
         );
+        if let Some(surface) = background.downcast_ref::<GlassBox>() {
+            surface.ivars().kind.set(6);
+        }
         row.addSubview(&background);
         row.ivars()
             .background
@@ -972,6 +947,10 @@ impl SessionRowView {
             return;
         }
         if let Some(background) = self.ivars().background.get() {
+            if let Some(surface) = background.downcast_ref::<GlassBox>() {
+                surface.ivars().focused.set(focused);
+                surface.ivars().hovered.set(active);
+            }
             let color = if focused {
                 NSColor::controlAccentColor()
             } else {
@@ -985,18 +964,18 @@ impl SessionRowView {
         }
         if let Some(arrow) = self.ivars().destination_arrow.get() {
             let color = if focused {
-                NSColor::selectedMenuItemTextColor()
+                primary_text_color()
             } else {
-                NSColor::secondaryLabelColor()
+                secondary_text_color()
             };
             arrow.setContentTintColor(Some(&color));
         }
         self.paint_title(focused);
         if let Some(arrow) = self.ivars().arrow.get() {
-            arrow.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+            arrow.setContentTintColor(Some(&secondary_text_color()));
         }
     }
-    fn paint_title(&self, focused: bool) {
+    fn paint_title(&self, _focused: bool) {
         let Some(title) = self.ivars().title.get() else {
             return;
         };
@@ -1004,11 +983,7 @@ impl SessionRowView {
         let attributed =
             NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &text);
         let full = NSRange::new(0, text.length());
-        let color = if focused {
-            NSColor::selectedMenuItemTextColor()
-        } else {
-            NSColor::labelColor()
-        };
+        let color = primary_text_color();
         // SAFETY: Attribute values have AppKit's documented NSColor/NSFont types;
         // all ranges refer to UTF-16 positions in this exact displayed title.
         unsafe {
@@ -1034,7 +1009,7 @@ impl SessionRowView {
     }
 }
 fn hover_background(mtm: MainThreadMarker, frame: NSRect, radius: f64) -> Retained<NSBox> {
-    let background = NSBox::initWithFrame(NSBox::alloc(mtm), frame);
+    let background = glass_box(mtm, frame, 0);
     background.setBoxType(NSBoxType::Custom);
     background.setTitlePosition(NSTitlePosition::NoTitle);
     background.setBorderWidth(0.0);
@@ -1072,17 +1047,13 @@ fn allow_status_overflow(view: &NSView) {
     }
 }
 
-struct FooterExtension {
-    view: Retained<StatusContentView>,
-    fill: Retained<NSBox>,
-}
-
 struct ButtonHover {
     button: Retained<NSButton>,
     background: Retained<NSBox>,
     base_alpha: f64,
     radio: Option<inline_questions::Radio>,
     caption: Option<Retained<NSTextField>>,
+    symbol: Option<Retained<visual::DecisionIcon>>,
     focusable_when_disabled: bool,
     gutter: Option<GutterHover>,
 }
@@ -1147,28 +1118,103 @@ fn answer_button_layout(sizes: &[NSSize], available: f64) -> (Vec<NSRect>, f64) 
 
 #[cfg(test)]
 fn messages_before_request(session: &Session, history: &MessageHistory) -> String {
-    earlier_messages(session, history).join("\n\n")
+    earlier_messages(session, history)
+        .iter()
+        .map(|(text, _)| *text)
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
-fn earlier_messages<'a>(session: &'a Session, history: &'a MessageHistory) -> Vec<&'a str> {
-    let mut messages: Vec<&str> = history
+fn earlier_messages<'a>(
+    session: &'a Session,
+    history: &'a MessageHistory,
+) -> Vec<(&'a str, &'a [crate::domain::media::Image])> {
+    let mut messages: Vec<_> = history
         .messages
         .iter()
-        .map(|message| message.text.trim_end())
+        .map(|message| (message.text.trim_end(), message.images.as_slice()))
         .collect();
-    let latest = session.last_message.trim_end();
+    let latest = session.last_message().trim_end();
     let anchor = history.anchor.trim_end();
     if !history.messages.is_empty() && !anchor.is_empty() && anchor != latest {
-        messages.push(anchor);
+        messages.push((anchor, &history.anchor_images));
     }
-    if session.approval.is_some() && !latest.is_empty() {
-        messages.push(latest);
+    if session.approval().is_some() && !latest.is_empty() {
+        messages.push((latest, session.images()));
     }
     messages
 }
 
-// AppKit may re-enter controller callbacks while a window is being shown or
-// reconciled. Keep the existing forms alive without holding a registry borrow.
+/// Immediate decisions share the first row; scope-specific decisions keep
+/// a disclosure beside their button and optional details below it.
+fn request_action_layout(
+    sizes: &[NSSize],
+    contexts: &[Option<f64>],
+    width: f64,
+) -> (Vec<NSRect>, f64) {
+    let immediate = contexts
+        .iter()
+        .take_while(|context| context.is_none())
+        .count();
+    let (mut frames, mut y) = if immediate == 2
+        && sizes[..2]
+            .iter()
+            .all(|size| size.width <= (width - 10.0) / 2.0)
+    {
+        let half = (width - 10.0) / 2.0;
+        let height = sizes[..2]
+            .iter()
+            .map(|size| size.height)
+            .fold(0.0, f64::max);
+        (
+            vec![
+                rect(0.0, 0.0, half, height),
+                rect(half + 10.0, 0.0, half, height),
+            ],
+            height,
+        )
+    } else {
+        answer_button_layout(&sizes[..immediate], width)
+    };
+    for (index, size) in sizes.iter().enumerate().skip(immediate) {
+        if y > 0.0 {
+            y += 12.0;
+        }
+        frames.push(rect(0.0, y, size.width, size.height));
+        y += size.height;
+        if let Some(height) = contexts[index].filter(|height| *height > 0.0) {
+            y += height + 4.0;
+        }
+    }
+    (frames, y)
+}
+
+/// Left-to-right status-item order: pending requests, unseen completions, working.
+fn status_counter_positions(widths: [Option<f64>; 3]) -> ([f64; 3], f64) {
+    let mut positions = [26.0; 3];
+    let mut end = 26.0;
+    let mut first = true;
+    for (index, width) in widths.into_iter().enumerate() {
+        if let Some(width) = width {
+            end += if first { 2.0 } else { 5.0 };
+            positions[index] = end;
+            end += width;
+            first = false;
+        }
+    }
+    (positions, end - 26.0)
+}
+
+fn request_glyph(control: &RequestControl) -> Option<visual::DecisionGlyph> {
+    match control.label.as_str() {
+        "Allow once" | "Allow" | "Allow similar commands" => Some(visual::DecisionGlyph::Check),
+        "Deny" => Some(visual::DecisionGlyph::Cross),
+        _ => None,
+    }
+}
+
+// AppKit may re-enter callbacks while a window is shown or reconciled.
+// Keep the existing forms alive without holding a registry borrow.
 fn open_owned_form<T: Clone>(
     forms: &RefCell<Vec<T>>,
     create: impl FnOnce(&[T]) -> Option<T>,
@@ -1197,6 +1243,26 @@ fn menu_navigation_key(key: u16, modifiers: NSEventModifierFlags) -> bool {
                 | NSEventModifierFlags::Control
                 | NSEventModifierFlags::Option,
         )
+}
+
+// Mutually exclusive presentation states; unseen completion is a subset of
+// Idle, never an additional count for a working/waiting session.
+fn overview_counts(sessions: &[Session], mut finished: impl FnMut(&Session) -> bool) -> [usize; 5] {
+    let mut counts = [0; 5];
+    for session in sessions {
+        let index = if session.approval().is_some() || session.activity == Activity::Confirmation {
+            0
+        } else {
+            match session.activity {
+                Activity::Working => 1,
+                Activity::Idle if finished(session) => 2,
+                Activity::Idle => 3,
+                _ => 4,
+            }
+        };
+        counts[index] += 1;
+    }
+    counts
 }
 
 fn adjacent_session(current: Option<usize>, count: usize, forward: bool) -> Option<usize> {
@@ -1265,83 +1331,13 @@ fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
 
 fn detail_text_color(approval: bool) -> Retained<NSColor> {
     let (dark_rgb, light_rgb) = if approval {
-        ([241.0, 241.0, 241.0], [32.0, 32.0, 32.0])
+        ([245.0, 242.0, 255.0], [41.0, 36.0, 59.0])
     } else {
-        ([207.0, 207.0, 207.0], [65.0, 65.0, 65.0])
+        ([186.0, 178.0, 208.0], [101.0, 91.0, 118.0])
     };
     appearance_color(light_rgb, dark_rgb, 1.0)
 }
 
-pub(super) fn working_status_color() -> Retained<NSColor> {
-    // Darker green on light material; keep the brighter green in dark mode.
-    appearance_color([0.0, 118.0, 55.0], [48.0, 209.0, 88.0], 1.0)
-}
-
-pub(super) fn hover_fill_color() -> Retained<NSColor> {
-    // Explicit appearance variants remain visible over the denser menu tint,
-    // including when controls were first created in the opposite appearance.
-    appearance_color([0.0; 3], [255.0; 3], 0.14)
-}
-
-fn message_style(label: &NSTextField, color: &NSColor) {
-    crate::macos::markdown::apply(label, color);
-}
-
-fn appearance_color(light_rgb: [f64; 3], dark_rgb: [f64; 3], alpha: f64) -> Retained<NSColor> {
-    let color = |rgb: [f64; 3]| {
-        NSColor::colorWithSRGBRed_green_blue_alpha(
-            rgb[0] / 255.0,
-            rgb[1] / 255.0,
-            rgb[2] / 255.0,
-            alpha,
-        )
-    };
-    let dark = color(dark_rgb);
-    let light = color(light_rgb);
-    let provider = block2::RcBlock::new(move |appearance: std::ptr::NonNull<NSAppearance>| {
-        // SAFETY: AppKit supplies a live appearance; framework name constants
-        // are immutable, valid NSStrings for the lifetime of the process.
-        let is_dark = unsafe {
-            appearance
-                .as_ref()
-                .bestMatchFromAppearancesWithNames(&NSArray::from_slice(&[
-                    NSAppearanceNameDarkAqua,
-                    NSAppearanceNameAqua,
-                ]))
-                .is_some_and(|name| &*name == NSAppearanceNameDarkAqua)
-        };
-        std::ptr::NonNull::from(if is_dark { &*dark } else { &*light })
-    });
-    // SAFETY: Both returned colors are retained by the provider's captures.
-    // NSColor copies and retains the provider for subsequent appearance changes.
-    unsafe { NSColor::colorWithName_dynamicProvider(None, &provider) }
-}
-
-fn footer_fill_color() -> Retained<NSColor> {
-    let dark =
-        NSColor::colorWithSRGBRed_green_blue_alpha(44.0 / 255.0, 44.0 / 255.0, 44.0 / 255.0, 1.0);
-    let light = NSColor::colorWithSRGBRed_green_blue_alpha(
-        231.0 / 255.0,
-        231.0 / 255.0,
-        231.0 / 255.0,
-        1.0,
-    );
-    let provider = block2::RcBlock::new(move |appearance: std::ptr::NonNull<NSAppearance>| {
-        // SAFETY: AppKit supplies a live appearance and these immutable names.
-        let dark_mode = unsafe {
-            appearance
-                .as_ref()
-                .bestMatchFromAppearancesWithNames(&NSArray::from_slice(&[
-                    NSAppearanceNameDarkAqua,
-                    NSAppearanceNameAqua,
-                ]))
-                .is_some_and(|name| &*name == NSAppearanceNameDarkAqua)
-        };
-        std::ptr::NonNull::from(if dark_mode { &*dark } else { &*light })
-    });
-    // SAFETY: Both color objects are retained by the copied provider.
-    unsafe { NSColor::colorWithName_dynamicProvider(None, &provider) }
-}
 fn footer_gap(bounds: NSRect, footer: NSRect, flipped: bool) -> NSRect {
     let (y, height) = if flipped {
         let edge = footer.origin.y + footer.size.height;
@@ -1447,6 +1443,7 @@ impl MenuController {
                         self.ivars().filter_dirty.set(true);
                         self.filter();
                         if self.ivars().menu_open.get() {
+                            self.hide_settings();
                             self.focus_answer();
                         } else {
                             self.show();
@@ -1556,12 +1553,7 @@ impl MenuController {
     }
 
     fn record_shortcut_key(&self, event: &NSEvent) -> bool {
-        if !self
-            .ivars()
-            .settings_window
-            .get()
-            .is_some_and(|window| window.isKeyWindow())
-        {
+        if !self.ivars().settings_active.get() || !self.ivars().menu_open.get() {
             self.end_shortcut_recording(true);
             return false;
         }
@@ -1701,24 +1693,7 @@ impl MenuController {
 
     fn show_settings(&self) {
         let state = self.ivars();
-        let window = state.settings_window.get_or_init(|| {
-            // SAFETY: Standard window initialization on the main thread. State
-            // retains the window, so closing it must not release that ownership.
-            let window = unsafe {
-                let window = NSWindow::initWithContentRect_styleMask_backing_defer(
-                    NSWindow::alloc(self.mtm()),
-                    rect(0.0, 0.0, 460.0, 244.0),
-                    NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
-                    NSBackingStoreType::Buffered,
-                    false,
-                );
-                window.setReleasedWhenClosed(false);
-                window
-            };
-            window.setTitle(ns_string!("AI Agent Monitor Settings"));
-            window.setLevel(NSFloatingWindowLevel);
-            window.setHidesOnDeactivate(false);
-            window.setDelegate(Some(ProtocolObject::from_ref(self)));
+        let shell = state.settings_shell.get_or_init(|| {
             let view =
                 NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 244.0));
             let note = self.label(
@@ -1824,7 +1799,7 @@ impl MenuController {
             state.applications_list.set(list).expect("application settings initialized once");
 
             let integrations_view = NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 460.0, 280.0));
-            let heading = self.label(&integrations_view, "Detected agents and hook setup", rect(24.0, 246.0, 412.0, 22.0), 13.0, 0.0, false);
+            let heading = self.label(&integrations_view, "Detected agents", rect(24.0, 246.0, 412.0, 22.0), 13.0, 0.0, false);
             state.integrations_heading.set(heading).expect("integrations heading initialized once");
             // SAFETY: Flipped, ivar-free document view on the UI thread.
             let integrations: Retained<SessionListView> = unsafe { msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 412.0, 172.0)] };
@@ -1955,17 +1930,20 @@ impl MenuController {
             telegram_root.addSubview(&connected);
             state.telegram_connected_view.set(connected).expect("connected Telegram view initialized once");
 
-            // AppKit owns the preferences toolbar, selection, and tab transitions.
-            // SAFETY: NSTabViewController's initializer is valid for this ivar-free subclass.
-            let tabs: Retained<PreferencesTabs> = unsafe { msg_send![PreferencesTabs::alloc(self.mtm()), init] };
+            let web=super::web_settings::WebSettings::new(self.mtm());
+            state.web_settings.set(web.clone()).expect("web settings initialized once");
+            let web_content: Retained<NSView>=web.into_super();
+            // Retain native pane controllers/items; the inline shell owns their presentation.
+            let tabs = NSTabViewController::new(self.mtm());
             state.settings_tabs.set(tabs.clone()).expect("settings tabs initialized once");
-            tabs.setTabStyle(NSTabViewControllerTabStyle::Toolbar);
+            tabs.setTabStyle(NSTabViewControllerTabStyle::Unspecified);
             tabs.setTitle(Some(ns_string!("AI Agent Monitor Settings")));
             for (title, symbol, content) in [
                 ("General", "gearshape", &view),
                 ("Applications", "square.stack.3d.up", &applications_view),
-                ("Integrations", "puzzlepiece.extension", &integrations_view),
+                ("Agents", "bot", &integrations_view),
                 ("Telegram", "paperplane", &telegram_root),
+                ("Web", "network", &web_content),
             ] {
                 let controller = NSViewController::new(self.mtm());
                 controller.setTitle(Some(&NSString::from_str(title)));
@@ -1973,59 +1951,132 @@ impl MenuController {
                 controller.setPreferredContentSize(content.frame().size);
                 controller.setView(content);
                 if title == "Applications" { state.applications_controller.set(controller.clone()).expect("applications controller initialized once"); }
-                if title == "Integrations" { state.integrations_controller.set(controller.clone()).expect("integrations controller initialized once"); }
+                if title == "Agents" { state.integrations_controller.set(controller.clone()).expect("integrations controller initialized once"); }
                 if title == "Telegram" { state.telegram_controller.set(controller.clone()).expect("Telegram controller initialized once"); }
                 let item = NSTabViewItem::tabViewItemWithViewController(&controller);
                 if title == "Telegram" { state.telegram_tab_item.set(item.clone()).expect("Telegram item initialized once"); }
                 item.setLabel(&NSString::from_str(title));
-                let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                    &NSString::from_str(symbol), Some(&NSString::from_str(title)),
-                );
+                let image = if symbol == "bot" {
+                    Some(super::session_robot::settings_icon())
+                } else {
+                    NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                        &NSString::from_str(symbol), Some(&NSString::from_str(title)),
+                    )
+                };
                 item.setImage(image.as_deref());
                 tabs.addTabViewItem(&item);
             }
             tabs.setSelectedTabViewItemIndex(0);
-            window.setToolbarStyle(NSWindowToolbarStyle::Preference);
-            window.setContentViewController(Some(&tabs));
-            window.setContentSize(NSSize::new(460.0, 244.0));
-            if let Some(toolbar) = window.toolbar() {
-                toolbar.setDisplayMode(NSToolbarDisplayMode::IconAndLabel);
-                toolbar.setAllowsUserCustomization(false);
-            }
-            window.center();
-            window
+            super::inline_settings::Shell::new(self.mtm(), self)
         });
         self.refresh_settings();
         self.refresh_application_settings();
         self.refresh_integration_settings();
         self.refresh_telegram_settings();
-        let app = NSApplication::sharedApplication(self.mtm());
-        if app.respondsToSelector(sel!(activate)) {
-            app.activate();
-        } else {
-            // Compatibility with macOS 13, before activate was introduced.
-            #[allow(deprecated)]
-            app.activateIgnoringOtherApps(true);
+        if !state.settings_active.replace(true) {
+            if let Some(scroll) = state.scroll.get() {
+                state
+                    .settings_session_scroll
+                    .set(scroll.contentView().bounds().origin);
+                scroll.setHidden(true);
+            }
+            if let Some(footer) = state.footer.get() {
+                footer.setHidden(true);
+            }
+            if let Some(root) = state.root.get() {
+                root.addSubview(&shell.scroll);
+            }
+            for composer in state.composers.borrow().values() {
+                composer.stop_editing();
+            }
+            for panel in state.question_panels.borrow().values() {
+                panel.stop_editing();
+            }
+            self.ivars().keyboard_focus.borrow_mut().take();
+            self.clear_hover();
         }
-        window.makeKeyAndOrderFront(None);
+        shell.scroll.setHidden(false);
+        self.layout_settings();
+        if let Some(window) = shell.scroll.window() {
+            // Opening settings must not create keyboard selection on Sessions.
+            // The first Tab/arrow establishes focus through handle_settings_key.
+            unsafe {
+                window.endEditingFor(None);
+            }
+            window.makeFirstResponder(None);
+        }
+        if !state.menu_open.get() {
+            self.show();
+        }
+    }
+
+    fn layout_settings(&self) {
+        let state = self.ivars();
+        if !state.settings_active.get() {
+            return;
+        }
+        let (Some(tabs), Some(shell)) = (state.settings_tabs.get(), state.settings_shell.get())
+        else {
+            return;
+        };
+        let index = state.settings_selected.get();
+        if tabs.selectedTabViewItemIndex() != index as isize {
+            tabs.setSelectedTabViewItemIndex(index as isize);
+        }
+        if let Some(item) = tabs
+            .tabViewItems()
+            .objectAtIndex(index)
+            .viewController(self.mtm())
+        {
+            let size = if index == 4 {
+                let size = item.view().frame().size;
+                item.setPreferredContentSize(size);
+                size
+            } else {
+                item.preferredContentSize()
+            };
+            shell.select(index, &item.view(), size.height);
+        }
+        self.resize_content(state.content_height.get());
+    }
+
+    fn hide_settings(&self) {
+        let state = self.ivars();
+        if !state.settings_active.replace(false) {
+            return;
+        }
+        self.end_shortcut_recording(false);
+        if let Some(window) = state.root.get().and_then(|v| v.window()) {
+            unsafe {
+                window.endEditingFor(None);
+            }
+            window.makeFirstResponder(None);
+        }
+        if let Some(shell) = state.settings_shell.get() {
+            shell.scroll.setHidden(true);
+        }
+        if let Some(scroll) = state.scroll.get() {
+            scroll.setHidden(false);
+        }
+        if let Some(footer) = state.footer.get() {
+            footer.setHidden(false);
+        }
+        self.render_footer();
+        self.filter();
+        self.resize_content(state.content_height.get());
+        if let Some(scroll) = state.scroll.get() {
+            scroll
+                .contentView()
+                .scrollToPoint(state.settings_session_scroll.get());
+        }
+        self.sync_backdrop();
     }
 
     fn size_settings_panel(&self, controller: &NSViewController, height: f64) {
         let size = NSSize::new(460.0, height);
         controller.view().setAutoresizesSubviews(false);
         controller.setPreferredContentSize(size);
-        if let Some(tabs) = self.ivars().settings_tabs.get()
-            && tabs
-                .tabView()
-                .selectedTabViewItem()
-                .and_then(|item| item.viewController(self.mtm()))
-                .is_some_and(|selected| std::ptr::eq(&*selected, controller))
-        {
-            tabs.setPreferredContentSize(size);
-            if let Some(window) = self.ivars().settings_window.get() {
-                resize_preferences_window(window, size);
-            }
-        }
+        self.layout_settings();
     }
 
     fn refresh_telegram_settings(&self) {
@@ -2616,11 +2667,6 @@ impl MenuController {
         } else {
             0.0
         };
-        let working_width = if working_count > 0 {
-            2.0 + number_width
-        } else {
-            0.0
-        };
         let finished_count = state.finished_count();
         let finished_number_width = if finished_count > 99 {
             26.0
@@ -2637,12 +2683,6 @@ impl MenuController {
                 finished_count.to_string()
             }));
         }
-        let finished_gap = if working_count > 0 { 5.0 } else { 2.0 };
-        let finished_width = if finished_count > 0 {
-            finished_gap + finished_number_width
-        } else {
-            0.0
-        };
         let badge_width = if count > 99 {
             26.0
         } else if count > 9 {
@@ -2650,18 +2690,11 @@ impl MenuController {
         } else {
             14.0
         };
-        let request_gap = if working_count > 0 || finished_count > 0 {
-            5.0
-        } else {
-            2.0
-        };
-        let extra_width = working_width
-            + finished_width
-            + if count > 0 {
-                request_gap + badge_width
-            } else {
-                0.0
-            };
+        let (counter_x, extra_width) = status_counter_positions([
+            (count > 0).then_some(badge_width),
+            (finished_count > 0).then_some(finished_number_width),
+            (working_count > 0).then_some(number_width),
+        ]);
         let canvas_width = 26.0 + extra_width;
         let animate = working
             && self.monitor().snapshot().preferences.animation
@@ -2696,11 +2729,11 @@ impl MenuController {
             allow_status_overflow(content);
         }
         if let Some(label) = state.status_working_count.get() {
-            label.setFrame(rect(28.0, 0.0, number_width, 18.0));
+            label.setFrame(rect(counter_x[2], 0.0, number_width, 18.0));
             center_label(label, height / 2.0);
         }
         let finished_frame = rect(
-            26.0 + working_width + finished_gap,
+            counter_x[1],
             height / 2.0 - 7.0,
             finished_number_width,
             14.0,
@@ -2713,7 +2746,7 @@ impl MenuController {
             label.setFrame(finished_frame);
             center_label(label, height / 2.0);
         }
-        let badge_x = 26.0 + working_width + finished_width + request_gap;
+        let badge_x = counter_x[0];
         let badge_y = height / 2.0 - 7.0;
         if let Some(badge) = state.status_badge.get() {
             badge.setHidden(count == 0);
@@ -2757,14 +2790,14 @@ impl MenuController {
             center_label(label, height / 2.0);
         }
         let mut tooltip = "Agent Sessions".to_owned();
-        if working_count > 0 {
-            tooltip.push_str(&format!(" · Working: {working_count}"));
-        }
         if count > 0 {
             tooltip.push_str(&format!(" · Pending requests: {count}"));
         }
         if finished_count > 0 {
             tooltip.push_str(&format!(" · Unseen finished: {finished_count}"));
+        }
+        if working_count > 0 {
+            tooltip.push_str(&format!(" · Working: {working_count}"));
         }
         button.setToolTip(Some(&NSString::from_str(&tooltip)));
     }
@@ -2796,30 +2829,153 @@ impl MenuController {
         label
     }
 
+    fn message_with_images(
+        &self,
+        text: &str,
+        images: &[crate::domain::media::Image],
+        width: f64,
+        request: bool,
+    ) -> Retained<NSView> {
+        let mut previews = Vec::new();
+        let mut pixels = 0_u64;
+        for image in images.iter().take(10) {
+            // Reject oversized/unknown raster dimensions before asking AppKit
+            // to decode; transcript data is untrusted and must stay bounded.
+            let Some((w, h)) = image.dimensions() else {
+                continue;
+            };
+            let size = u64::from(w) * u64::from(h);
+            if w == 0 || h == 0 || w > 8192 || h > 8192 || pixels + size > 16_000_000 {
+                continue;
+            }
+            let Some(native) =
+                NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(&image.data))
+            else {
+                continue;
+            };
+            let scale = (width / f64::from(w)).min(240.0 / f64::from(h)).min(1.0);
+            let preview = NSImageView::initWithFrame(
+                NSImageView::alloc(self.mtm()),
+                rect(0.0, 0.0, f64::from(w) * scale, f64::from(h) * scale),
+            );
+            preview.setImage(Some(&native));
+            preview.setImageScaling(NSImageScaling::ScaleProportionallyDown);
+            // Retain only the display-sized raster in the view tree, not a
+            // decoded full-resolution image for every expanded history entry.
+            let Some(bitmap) = preview.bitmapImageRepForCachingDisplayInRect(preview.bounds())
+            else {
+                continue;
+            };
+            preview.cacheDisplayInRect_toBitmapImageRep(preview.bounds(), &bitmap);
+            let thumbnail = NSImage::initWithSize(NSImage::alloc(), preview.frame().size);
+            thumbnail.addRepresentation(&bitmap);
+            preview.setImage(Some(&thumbnail));
+            preview.setToolTip(Some(&NSString::from_str("Agent image")));
+            pixels += size;
+            previews.push(preview);
+        }
+        let text = if text.trim() == "[Image]" && !previews.is_empty() {
+            ""
+        } else {
+            text
+        };
+        let label = crate::macos::markdown::message(
+            text,
+            width,
+            &detail_text_color(request),
+            request,
+            self.mtm(),
+        );
+        if previews.is_empty() {
+            return label;
+        }
+        let mut y = if text.is_empty() {
+            0.0
+        } else {
+            label.frame().size.height + 8.0
+        };
+        // SAFETY: Same flipped, main-thread document view as session content.
+        let content: Retained<SessionListView> = unsafe {
+            msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, width, 1.0)]
+        };
+        if !text.is_empty() {
+            content.addSubview(&label);
+        }
+        let last = previews.len() - 1;
+        for (index, preview) in previews.into_iter().enumerate() {
+            preview.setFrameOrigin(NSPoint::new(0.0, y));
+            y += preview.frame().size.height + if index == last { 0.0 } else { 8.0 };
+            content.addSubview(&preview);
+        }
+        content.setFrameSize(NSSize::new(width, y));
+        content.into_super()
+    }
+
     fn build_menu(&self) {
         let mtm = self.mtm();
         // NSMenu supplies the system background and owns presentation/dismissal.
         // SAFETY: NSView's initializer is valid for this ivar-free subclass.
         let allocated = PanelView::alloc(mtm).set_ivars(PanelState::default());
         let view: Retained<PanelView> =
-            unsafe { msg_send![super(allocated),initWithFrame:rect(0.0,0.0,392.0,476.0)] };
+            unsafe { msg_send![super(allocated),initWithFrame:rect(0.0,0.0,MENU_WIDTH,476.0)] };
         view.ivars()
             .owner
             .set(objc2::rc::Weak::new(self))
             .expect("root owner initialized once");
         view.setWantsLayer(true);
+        view.setClipsToBounds(true);
+        let backdrop = visual::MeshView::new(mtm, view.bounds());
+        view.addSubview(&backdrop);
+        self.ivars()
+            .backdrop
+            .set(backdrop)
+            .expect("backdrop initialized once");
         // SAFETY: OverlayView has no ivars or custom initialization.
-        let toolbar: Retained<OverlayView> = unsafe {
-            msg_send![OverlayView::alloc(mtm), initWithFrame: rect(0.0, 0.0, 392.0, 32.0)]
-        };
+        let toolbar =
+            NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, LIST_WIDTH, BRAND_HEIGHT));
+        let hero = SessionRobot::new(mtm, rect(8.0, 31.0, 40.0, 35.0), Activity::Idle);
+        toolbar.addSubview(&hero);
+        let title = self.label(
+            &toolbar,
+            "AI Agent Monitor",
+            rect(61.0, 48.0, 178.0, 25.0),
+            18.0,
+            0.35,
+            false,
+        );
+        title.setTextColor(Some(&primary_text_color()));
+        let version = self.label(
+            &toolbar,
+            &format!("v{}", core::VERSION),
+            rect(244.0, 52.0, 80.0, 15.0),
+            9.0,
+            0.0,
+            true,
+        );
+        version.setToolTip(Some(&NSString::from_str(&format!(
+            "AI Agent Monitor {}",
+            core::VERSION
+        ))));
+        let overview = self.label(
+            &toolbar,
+            "",
+            rect(61.0, 28.0, LIST_WIDTH - 73.0, 18.0),
+            11.0,
+            0.0,
+            true,
+        );
+        self.ivars()
+            .overview
+            .set(overview)
+            .expect("overview initialized once");
         let caption = self.label(&view, "", rect(20.0, 445.0, 286.0, 18.0), 10.0, 0.0, true);
         caption.setHidden(true);
         for (symbol, action, x, tooltip) in [
-            ("gearshape", sel!(settings:), 322.0, "Settings"),
-            ("power", sel!(quit:), 354.0, "Quit AI Agent Monitor"),
+            ("gearshape", sel!(settings:), 366.0, "Settings"),
+            ("power", sel!(quit:), 399.0, "Quit AI Agent Monitor"),
         ] {
             let button =
-                self.action_button(&toolbar, "", action, "", rect(x, 4.0, 24.0, 24.0), false);
+                self.action_button(&toolbar, "", action, "", rect(x, 44.0, 28.0, 28.0), false);
             if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
                 &NSString::from_str(symbol),
                 Some(&NSString::from_str(tooltip)),
@@ -2835,11 +2991,11 @@ impl MenuController {
             std::mem::take(&mut *self.ivars().buttons.borrow_mut());
         // SAFETY: NSView's designated initializer is valid for this subclass.
         let list: Retained<SessionListView> = unsafe {
-            msg_send![SessionListView::alloc(mtm), initWithFrame: rect(0.0, 0.0, 384.0, 400.0)]
+            msg_send![SessionListView::alloc(mtm), initWithFrame: rect(0.0, 0.0, LIST_WIDTH, 400.0)]
         };
         // SAFETY: NSScrollView's initializer is valid for this ivar-free subclass.
         let scroll: Retained<SessionScrollView> = unsafe {
-            msg_send![SessionScrollView::alloc(mtm), initWithFrame: rect(4.0, 4.0, 384.0, 460.0)]
+            msg_send![SessionScrollView::alloc(mtm), initWithFrame: rect(11.0, 4.0, LIST_WIDTH, 460.0)]
         };
         scroll.setDrawsBackground(false);
         scroll.setHasVerticalScroller(true);
@@ -2851,18 +3007,18 @@ impl MenuController {
         scroll.setHorizontalScrollElasticity(NSScrollElasticity::None);
         scroll.setDocumentView(Some(&list));
         view.addSubview(&scroll);
-        let footer = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 392.0, 36.0));
+        let footer = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, MENU_WIDTH, 36.0));
         view.addSubview(&footer);
         self.ivars()
             .footer
             .set(footer)
             .expect("footer initialized once");
-        view.addSubview(&toolbar);
+        list.addSubview(&toolbar);
         view.addSubview(&caption);
         view.setPostsFrameChangedNotifications(true);
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("AI Agent Monitor"));
         menu.setAutoenablesItems(false);
-        menu.setMinimumWidth(392.0);
+        menu.setMinimumWidth(MENU_WIDTH);
         menu.setDelegate(Some(ProtocolObject::from_ref(self)));
         // SAFETY: nil action and an empty key equivalent create an inert container item.
         let item = unsafe {
@@ -2908,7 +3064,7 @@ impl MenuController {
         self.ivars().root.set(view).expect("root initialized once");
         self.ivars()
             .toolbar
-            .set(toolbar.into_super())
+            .set(toolbar)
             .expect("toolbar initialized once");
         self.ivars()
             .scroll
@@ -2981,6 +3137,7 @@ impl MenuController {
                 base_alpha,
                 radio: None,
                 caption: None,
+                symbol: None,
                 focusable_when_disabled: false,
                 gutter: None,
             });
@@ -2991,28 +3148,42 @@ impl MenuController {
 
     fn client_group_heading(&self, client: Client) -> Retained<StatusContentView> {
         let view: Retained<StatusContentView> = unsafe {
-            msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 384.0, 24.0)]
+            msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, LIST_WIDTH, 26.0)]
         };
         let icon = self.client_icon(client);
-        icon.setFrame(rect(session_layout::ICON_LEFT, 0.0, 24.0, 24.0));
+        icon.setFrame(rect(session_layout::ICON_LEFT + 2.0, 3.0, 20.0, 20.0));
+        let children = icon.subviews();
+        for index in 0..children.count() {
+            children
+                .objectAtIndex(index)
+                .setFrame(rect(0.0, 0.0, 20.0, 20.0));
+        }
         view.addSubview(&icon);
         let name = self.label(
             &view,
             client.label(),
-            rect(session_layout::ICON_LEFT + 32.0, 4.0, 280.0, 16.0),
-            11.0,
-            0.3,
+            rect(SESSION_TEXT_LEFT, 7.0, 280.0, 16.0),
+            12.0,
+            0.35,
             true,
         );
         name.sizeToFit();
-        center_label(&name, 12.0);
-        let left = name.frame().origin.x + name.frame().size.width + 10.0;
-        let line = NSBox::initWithFrame(
+        name.setTextColor(Some(&visual::group_title_color()));
+        center_label(&name, 13.0);
+        let line_x = SESSION_TEXT_LEFT + name.frame().size.width + 12.0;
+        let divider = NSBox::initWithFrame(
             NSBox::alloc(self.mtm()),
-            rect(left, 12.0, (376.0 - left).max(0.0), 1.0),
+            rect(line_x, 13.0, (LIST_WIDTH - line_x - 12.0).max(0.0), 0.5),
         );
-        line.setBoxType(NSBoxType::Separator);
-        view.addSubview(&line);
+        divider.setBoxType(NSBoxType::Custom);
+        divider.setTitlePosition(NSTitlePosition::NoTitle);
+        divider.setBorderWidth(0.0);
+        divider.setFillColor(&appearance_color(
+            [115.0, 128.0, 145.0],
+            [151.0, 168.0, 188.0],
+            0.22,
+        ));
+        view.addSubview(&divider);
         view
     }
 
@@ -3065,7 +3236,7 @@ impl MenuController {
     fn status_icon(&self, view: &NSView, activity: Activity, finished: bool, y: f64) {
         if activity == Activity::Working {
             let disc: Retained<WorkingStatusView> = unsafe {
-                msg_send![WorkingStatusView::alloc(self.mtm()), initWithFrame: rect(323.0, y - 1.0, 18.0, 18.0)]
+                msg_send![WorkingStatusView::alloc(self.mtm()), initWithFrame: rect(LIST_WIDTH - 61.0, y - 1.0, 18.0, 18.0)]
             };
             disc.setToolTip(Some(ns_string!("Working")));
             view.addSubview(&disc);
@@ -3074,9 +3245,9 @@ impl MenuController {
         if activity == Activity::Confirmation || (finished && activity == Activity::Idle) {
             let is_finished = activity == Activity::Idle;
             let color = if is_finished {
-                appearance_color([0.0, 102.0, 190.0], [115.0, 199.0, 255.0], 1.0)
+                appearance_color([62.0, 109.0, 185.0], [140.0, 216.0, 255.0], 1.0)
             } else {
-                NSColor::systemOrangeColor()
+                request_color()
             };
             let ink = if is_finished {
                 appearance_color([255.0; 3], [21.0, 49.0, 73.0], 1.0)
@@ -3085,7 +3256,7 @@ impl MenuController {
             };
             // Match the preview's 18-point symbol viewport and 15-point disc.
             let disc: Retained<StatusContentView> = unsafe {
-                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(323.0, y - 1.0, 18.0, 18.0)]
+                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(LIST_WIDTH - 61.0, y - 1.0, 18.0, 18.0)]
             };
             let circle = NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(1.5, 1.5, 15.0, 15.0));
             circle.setBoxType(NSBoxType::Custom);
@@ -3135,7 +3306,7 @@ impl MenuController {
             Some(&NSString::from_str(activity.label())),
         ) {
             image.setTemplate(true);
-            let frame = rect(325.0, y + 1.0, 14.0, 14.0);
+            let frame = rect(LIST_WIDTH - 59.0, y + 1.0, 14.0, 14.0);
             let icon = NSImageView::imageViewWithImage(&image, self.mtm());
             icon.setFrame(frame);
             icon.setContentTintColor(Some(&color));
@@ -3155,9 +3326,19 @@ impl MenuController {
         for item in state.layout.borrow().iter() {
             item.robot.advance(seconds, animate);
         }
+        for caption in state.work_glows.borrow().iter() {
+            caption.advance(seconds, animate && state.menu_open.get());
+        }
     }
 
     fn close_panel(&self) {
+        self.hide_settings();
+        for caption in self.ivars().work_glows.borrow().iter() {
+            caption.release_sprite();
+        }
+        for composer in self.ivars().composers.borrow().values() {
+            composer.stop_editing();
+        }
         let panels: Vec<_> = self
             .ivars()
             .question_panels
@@ -3169,7 +3350,7 @@ impl MenuController {
             panel.stop_editing();
         }
         if let Some(extension) = self.ivars().footer_extension.get() {
-            extension.view.removeFromSuperview();
+            extension.removeFromSuperview();
         }
         if let Some(extension) = self.ivars().header_extension.get() {
             extension.removeFromSuperview();
@@ -3206,6 +3387,7 @@ impl MenuController {
         if state.menu_open.get()
             && state.root.get().and_then(|root| root.window()).is_some()
             && state.focus_answer_on_open.replace(false)
+            && !state.settings_active.get()
         {
             self.focus_answer();
         }
@@ -3221,14 +3403,19 @@ impl MenuController {
                 .iter()
                 .find(|id| {
                     controls.get(*id).is_some_and(|control| {
-                        !matches!(control.kind, ControlKind::ContextToggle(_))
-                            && Some(control.session.key()) == requested
+                        !matches!(
+                            control.kind,
+                            ControlKind::ContextToggle(_) | ControlKind::Composer
+                        ) && Some(control.session.key()) == requested
                     })
                 })
                 .or_else(|| {
                     targets.iter().find(|id| {
                         controls.get(*id).is_some_and(|control| {
-                            !matches!(control.kind, ControlKind::ContextToggle(_))
+                            !matches!(
+                                control.kind,
+                                ControlKind::ContextToggle(_) | ControlKind::Composer
+                            )
                         })
                     })
                 })
@@ -3247,7 +3434,27 @@ impl MenuController {
 
     pub fn handle_session_key(&self, event: &NSEvent) -> bool {
         let state = self.ivars();
+        if state.settings_active.get() {
+            return self.handle_settings_key(event);
+        }
         if state.menu_open.get() {
+            let composers: Vec<_> = state.composers.borrow().values().cloned().collect();
+            if menu_navigation_key(event.keyCode(), event.modifierFlags()) {
+                for composer in &composers {
+                    if composer.editing() {
+                        *state.keyboard_focus.borrow_mut() = Some(composer.id());
+                        composer.stop_editing();
+                    }
+                }
+            } else {
+                let focus = state.keyboard_focus.borrow().clone();
+                if composers
+                    .iter()
+                    .any(|composer| composer.handle_key(event, focus.as_deref()))
+                {
+                    return true;
+                }
+            }
             let panels: Vec<_> = state.question_panels.borrow().values().cloned().collect();
             if menu_navigation_key(event.keyCode(), event.modifierFlags()) {
                 // Commit text before navigation, preserving the active input's
@@ -3340,6 +3547,15 @@ impl MenuController {
             // horizontal navigation to neighboring status items.
             return !matches!(key, 123 | 124);
         };
+        if state
+            .composers
+            .borrow()
+            .values()
+            .any(|composer| composer.id() == id)
+        {
+            // A field target never falls through to session disclosure/open.
+            return true;
+        }
         let control = state.request_controls.borrow().get(&id).cloned();
         let session_id = control
             .as_ref()
@@ -3412,12 +3628,127 @@ impl MenuController {
         true
     }
 
+    fn handle_settings_key(&self, event: &NSEvent) -> bool {
+        let state = self.ivars();
+        if state.shortcut_monitor.borrow().is_some() {
+            return self.record_shortcut_key(event);
+        }
+        if event.keyCode() == 53 {
+            self.hide_settings();
+            return true;
+        }
+        let Some(shell) = state.settings_shell.get() else {
+            return true;
+        };
+        let Some(window) = shell.scroll.window() else {
+            return true;
+        };
+        let controls = shell.controls();
+        let responder = window.firstResponder();
+        let at = controls.iter().position(|control| {
+            control
+                .downcast_ref::<NSTextField>()
+                .is_some_and(|field| field.currentEditor().is_some())
+                || responder.as_ref().is_some_and(|r| {
+                    std::ptr::eq::<AnyObject>(
+                        (&**r as *const NSResponder).cast(),
+                        (&**control as *const NSControl).cast(),
+                    )
+                })
+        });
+        let editor = at
+            .and_then(|i| controls[i].downcast_ref::<NSTextField>())
+            .and_then(|f| f.currentEditor());
+        let flags = event.modifierFlags();
+        if let Some(editor) = editor.as_ref() {
+            if flags.contains(NSEventModifierFlags::Command) {
+                // SAFETY: Standard edit commands on the active native field editor.
+                unsafe {
+                    match event.keyCode() {
+                        0 => editor.selectAll(None),
+                        7 => editor.cut(None),
+                        8 => editor.copy(None),
+                        9 => editor.paste(None),
+                        _ => return false,
+                    }
+                }
+                return true;
+            }
+            if !matches!(event.keyCode(), 48 | 125 | 126) {
+                editor.keyDown(event);
+                return true;
+            }
+        }
+        if matches!(event.keyCode(), 48 | 125 | 126) && !controls.is_empty() {
+            let backwards = event.keyCode() == 126
+                || (event.keyCode() == 48 && flags.contains(NSEventModifierFlags::Shift));
+            let next = match at {
+                Some(i) => (i + if backwards { controls.len() - 1 } else { 1 }) % controls.len(),
+                None => {
+                    if backwards {
+                        controls.len() - 1
+                    } else {
+                        0
+                    }
+                }
+            };
+            // SAFETY: Commit the current field's editor before changing its owner.
+            unsafe {
+                window.endEditingFor(None);
+            }
+            if let Some(field) = controls[next].downcast_ref::<NSTextField>() {
+                inline_questions::begin_editing(field, None);
+            } else {
+                window.makeFirstResponder(Some(&controls[next]));
+            }
+            controls[next].scrollRectToVisible(controls[next].bounds());
+            shell.paint();
+            return true;
+        }
+        if matches!(event.keyCode(), 123 | 124)
+            && at.is_some_and(|i| {
+                shell.tabs.iter().any(|tab| {
+                    std::ptr::eq::<AnyObject>(
+                        (&**tab as *const NSButton).cast(),
+                        (&*controls[i] as *const NSControl).cast(),
+                    )
+                })
+            })
+        {
+            let index =
+                (state.settings_selected.get() + if event.keyCode() == 124 { 1 } else { 4 }) % 5;
+            state.settings_selected.set(index);
+            self.layout_settings();
+            window.makeFirstResponder(Some(&shell.tabs[index]));
+            return true;
+        }
+        if matches!(event.keyCode(), 36 | 76 | 49)
+            && !flags.intersects(
+                NSEventModifierFlags::Command
+                    | NSEventModifierFlags::Control
+                    | NSEventModifierFlags::Option,
+            )
+        {
+            if let Some(i) = at {
+                unsafe {
+                    controls[i].performClick(None);
+                }
+            }
+            return true;
+        }
+        !flags.intersects(
+            NSEventModifierFlags::Command
+                | NSEventModifierFlags::Control
+                | NSEventModifierFlags::Option,
+        )
+    }
+
     fn keyboard_targets(&self, layout: &[LayoutRow]) -> Vec<String> {
         let state = self.ivars();
         let expanded = state.expanded.borrow();
         let controls = state.request_controls.borrow();
         let buttons = state.buttons.borrow();
-        let answers: Vec<_> = buttons
+        let mut answers: Vec<_> = buttons
             .iter()
             .filter(|item| item.button.isEnabled() || item.focusable_when_disabled)
             .filter_map(|item| {
@@ -3430,6 +3761,18 @@ impl MenuController {
                 Some((key, owner))
             })
             .collect();
+        for composer in state
+            .composers
+            .borrow()
+            .values()
+            .filter(|composer| composer.attached() && composer.field().isEnabled())
+        {
+            let before = answers
+                .iter()
+                .position(|(id, _)| id == &format!("compose-send:{}", composer.session()))
+                .unwrap_or(answers.len());
+            answers.insert(before, (composer.id(), composer.session().to_owned()));
+        }
         keyboard_order(
             layout.iter().filter_map(|row| {
                 row.id
@@ -3485,6 +3828,15 @@ impl MenuController {
                     .map(|list| list.convertRect_fromView(button.bounds(), Some(&button)))
             })
             .or_else(|| {
+                let composers = state.composers.borrow();
+                let composer = composers.values().find(|composer| {
+                    focus.as_deref() == Some(composer.id().as_str()) && composer.attached()
+                })?;
+                state.list.get().map(|list| {
+                    list.convertRect_fromView(composer.view().bounds(), Some(composer.view()))
+                })
+            })
+            .or_else(|| {
                 state
                     .layout
                     .borrow()
@@ -3504,9 +3856,19 @@ impl MenuController {
         if let Some(header) = header
             && let Some(list) = state.list.get()
         {
-            list.scrollRectToVisible(header);
+            // Reserve the overlay's height below the focused control.
+            let visible_target = rect(
+                header.origin.x,
+                header.origin.y,
+                header.size.width,
+                header.size.height + state.footer_height.get(),
+            );
+            list.scrollRectToVisible(visible_target);
         }
         if let Some(id) = focus {
+            for composer in state.composers.borrow().values() {
+                composer.focus(&id);
+            }
             let panels: Vec<_> = state.question_panels.borrow().values().cloned().collect();
             for panel in panels {
                 if panel.focus_field(&id) {
@@ -3552,6 +3914,13 @@ impl MenuController {
 
     fn sample_pointer(&self) {
         let state = self.ivars();
+        if state.settings_active.get() {
+            if let Some(shell) = state.settings_shell.get() {
+                shell.paint();
+            }
+            self.sync_backdrop();
+            return;
+        }
         let Some(window) = state.root.get().and_then(|view| view.window()) else {
             return;
         };
@@ -3566,6 +3935,9 @@ impl MenuController {
     }
 
     fn apply_hover(&self, target: Option<pointer::Target>) {
+        for composer in self.ivars().composers.borrow().values() {
+            composer.paint(self.ivars().keyboard_focus.borrow().as_deref());
+        }
         let state = self.ivars();
         state.hovered.set(target);
         // A native field editor is the keyboard target even before the next timer tick.
@@ -3611,12 +3983,35 @@ impl MenuController {
                 continue;
             }
             let hovered = target == Some(pointer::Target::Button(index));
+            if index < state.toolbar_buttons.borrow().len() {
+                let color = if focused {
+                    primary_text_color()
+                } else if hovered {
+                    secondary_text_color()
+                } else {
+                    visual::tertiary_text_color()
+                };
+                item.button.setContentTintColor(Some(&color));
+            }
+            if let Some(surface) = item.background.downcast_ref::<GlassBox>() {
+                surface.ivars().focused.set(focused);
+                surface.ivars().hovered.set(hovered);
+                surface.ivars().enabled.set(item.button.isEnabled());
+            }
             let background = if focused {
                 NSColor::controlAccentColor()
             } else if item.caption.is_some() && item.base_alpha > 0.0 {
                 appearance_color(
-                    if hovered { [225.0; 3] } else { [255.0; 3] },
-                    if hovered { [100.0; 3] } else { [72.0; 3] },
+                    if hovered {
+                        [222.0, 208.0, 237.0]
+                    } else {
+                        [225.0, 213.0, 237.0]
+                    },
+                    if hovered {
+                        [87.0, 73.0, 104.0]
+                    } else {
+                        [69.0, 59.0, 84.0]
+                    },
                     1.0,
                 )
             } else {
@@ -3624,14 +4019,23 @@ impl MenuController {
             };
             item.background.setFillColor(&background);
             if let Some(caption) = &item.caption {
-                let color = if focused {
-                    NSColor::selectedMenuItemTextColor()
-                } else if item.button.isEnabled() {
-                    NSColor::labelColor()
+                let color = if item.button.isEnabled() {
+                    if item
+                        .background
+                        .downcast_ref::<GlassBox>()
+                        .is_some_and(|surface| surface.ivars().kind.get() == 4)
+                    {
+                        NSColor::whiteColor()
+                    } else {
+                        primary_text_color()
+                    }
                 } else {
                     NSColor::disabledControlTextColor()
                 };
                 caption.setTextColor(Some(&color));
+                if let Some(symbol) = &item.symbol {
+                    symbol.setNeedsDisplay(true);
+                }
                 paint_hover(
                     &item.background,
                     if focused || hovered || item.base_alpha > 0.0 {
@@ -3648,7 +4052,7 @@ impl MenuController {
                 &title,
             );
             let color = if focused {
-                NSColor::selectedMenuItemTextColor()
+                primary_text_color()
             } else {
                 NSColor::labelColor()
             };
@@ -3724,7 +4128,9 @@ impl MenuController {
         };
         let window = area(list.convertRect_fromView(root.bounds(), Some(root)));
         let clip = scroll.contentView();
-        let viewport = area(list.convertRect_fromView(clip.bounds(), Some(&clip)));
+        let mut viewport = area(list.convertRect_fromView(clip.bounds(), Some(&clip)));
+        // The opaque quota overlay must not activate controls hidden behind it.
+        viewport.height = (viewport.height - state.footer_height.get()).max(0.0);
         let p = list.convertPoint_fromView(point, None);
         let button_area = |item: &ButtonHover| {
             if item.button.isEnabled() && !item.button.isHiddenOrHasHiddenAncestor() {
@@ -3816,7 +4222,11 @@ impl MenuController {
         if state.routing_scroll.replace(true) {
             return;
         }
-        if let Some(scroll) = state.scroll.get() {
+        if state.settings_active.get() {
+            if let Some(shell) = state.settings_shell.get() {
+                shell.scroll.scrollWheel(event);
+            }
+        } else if let Some(scroll) = state.scroll.get() {
             scroll.scrollWheel(event);
         }
         state.routing_scroll.set(false);
@@ -3914,7 +4324,7 @@ impl MenuController {
                 thread.setNeedsDisplay(true);
             }
             if let Some(detail) = &item.detail {
-                detail.setFrame(rect(0.0, 0.0, 384.0, detail_height));
+                detail.setFrame(rect(0.0, 0.0, LIST_WIDTH, detail_height));
                 detail.setAlphaValue(progress);
                 detail.setHidden(progress <= 0.0);
                 detail.scrollToPoint(NSPoint::new(0.0, 0.0));
@@ -3932,16 +4342,18 @@ impl MenuController {
         drop(layout);
         drop(expanded);
         drop(reveal);
-        list.setFrameSize(NSSize::new(384.0, y.max(52.0)));
+        list.setFrameSize(NSSize::new(LIST_WIDTH, y.max(52.0)));
         let viewport = self.resize_content(y);
         if state.animation_epoch.get() != epoch {
             return;
         }
-        list.setFrameSize(NSSize::new(384.0, y.max(viewport)));
+        let document_height = y + state.footer_height.get();
+        list.setFrameSize(NSSize::new(LIST_WIDTH, document_height.max(viewport)));
         list.scrollPoint(NSPoint::new(
             origin.x,
-            origin.y.min((y - viewport).max(0.0)),
+            origin.y.min((document_height - viewport).max(0.0)),
         ));
+        self.sync_backdrop();
         self.update_group_headings();
         self.update_hover();
     }
@@ -3966,10 +4378,19 @@ impl MenuController {
         width: f64,
         action: Option<(usize, &RequestControl)>,
     ) -> Option<(Retained<SessionListView>, f64)> {
+        let scoped = action.is_some();
         let sections = if let Some((index, action)) = action {
             if action.detail.trim().is_empty()
                 || !matches!(action.kind, ControlKind::Reply(Response::Action(_)))
             {
+                return None;
+            }
+            let key = format!(
+                "context:{}:{}",
+                session.approval_key().unwrap_or_else(|| session.key()),
+                index + 1
+            );
+            if !self.ivars().expanded_contexts.borrow().contains(&key) {
                 return None;
             }
             vec![(index + 1, action.label.clone(), action.detail.clone())]
@@ -3993,24 +4414,41 @@ impl MenuController {
             if y > 0.0 {
                 y += 8.0;
             }
-            let caption = NSTextField::labelWithString(&NSString::from_str(&title), self.mtm());
-            caption.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-            caption.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            caption.setFrame(rect(0.0, y, width - 30.0, 16.0));
-            view.addSubview(&caption);
-            y += 20.0;
+            if !scoped {
+                let caption = NSTextField::labelWithString(&NSString::from_str(&title), self.mtm());
+                caption.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+                caption.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                caption.setFrame(rect(18.0, y, width - 48.0, 16.0));
+                caption.setTextColor(Some(&secondary_text_color()));
+                if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    if index == 0 {
+                        ns_string!("terminal")
+                    } else {
+                        ns_string!("sparkles")
+                    },
+                    None,
+                ) {
+                    let icon = NSImageView::imageViewWithImage(&image, self.mtm());
+                    icon.setFrame(rect(0.0, y + 1.0, 13.0, 13.0));
+                    icon.setContentTintColor(Some(&secondary_text_color()));
+                    view.addSubview(&icon);
+                }
+                view.addSubview(&caption);
+                y += 20.0;
+            }
             let code = NSTextField::wrappingLabelWithString(
                 &NSString::from_str(text.trim_end()),
                 self.mtm(),
             );
-            code.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(12.0, 0.0)));
-            code.setTextColor(Some(&NSColor::labelColor()));
+            code.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(11.0, 0.0)));
+            code.setTextColor(Some(&primary_text_color()));
             code.setSelectable(true);
+            command_text(&code, text.trim_end());
             code.setMaximumNumberOfLines(0);
             if let Some(cell) = code.cell() {
                 cell.setLineBreakMode(NSLineBreakMode::ByCharWrapping);
             }
-            let code_width = width - 20.0;
+            let code_width = width - if index == 0 { 44.0 } else { 22.0 };
             let full_height = code
                 .cell()
                 .map(|cell| {
@@ -4023,7 +4461,7 @@ impl MenuController {
             // Measure two actual line fragments in the same native field so
             // the limit includes both explicit newlines and soft wrapping.
             let original = code.stringValue();
-            code.setStringValue(ns_string!("M\nM"));
+            command_text(&code, "M\nM");
             let two_lines = code
                 .cell()
                 .map(|cell| {
@@ -4032,12 +4470,12 @@ impl MenuController {
                         .ceil()
                 })
                 .unwrap_or(32.0);
-            code.setStringValue(&original);
+            command_text(&code, &original.to_string());
             let key = format!(
                 "context:{}:{index}",
                 session.approval_key().unwrap_or_else(|| session.key())
             );
-            let expanded = self.ivars().expanded_contexts.borrow().contains(&key);
+            let expanded = scoped || self.ivars().expanded_contexts.borrow().contains(&key);
             let overflowing = full_height > two_lines;
             let height = if expanded {
                 full_height
@@ -4045,24 +4483,41 @@ impl MenuController {
                 full_height.min(two_lines)
             };
             code.setMaximumNumberOfLines(if expanded { 0 } else { 2 });
-            let panel_height = height + 16.0;
+            let panel_height = height + 18.0;
             let background: Retained<StatusContentView> = unsafe {
                 msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, y, width, panel_height)]
             };
-            let box_view = NSBox::initWithFrame(
-                NSBox::alloc(self.mtm()),
-                rect(0.0, 0.0, width, panel_height),
-            );
+            let box_view = glass_box(self.mtm(), rect(0.0, 0.0, width, panel_height), 1);
             box_view.setBoxType(NSBoxType::Custom);
             box_view.setTitlePosition(NSTitlePosition::NoTitle);
-            box_view.setCornerRadius(8.0);
+            box_view.setCornerRadius(11.0);
             box_view.setBorderWidth(0.0);
             box_view.setFillColor(&appearance_color([218.0; 3], [42.0; 3], 1.0));
             background.addSubview(&box_view);
             view.addSubview(&background);
-            code.setFrame(rect(10.0, y + 8.0, code_width, height));
+            code.setFrame(rect(11.0, y + 9.0, code_width, height));
             view.addSubview(&code);
-            if overflowing {
+            if index == 0 {
+                let copy = self.action_button(
+                    &view,
+                    "",
+                    sel!(copyCommand:),
+                    &text,
+                    rect(width - 30.0, y + 3.0, 28.0, 28.0),
+                    false,
+                );
+                copy.setRefusesFirstResponder(true);
+                copy.setToolTip(Some(ns_string!("Copy command")));
+                if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    ns_string!("doc.on.doc"),
+                    Some(ns_string!("Copy command")),
+                ) {
+                    image.setSize(NSSize::new(13.0, 13.0));
+                    copy.setImage(Some(&image));
+                    copy.setContentTintColor(Some(&secondary_text_color()));
+                }
+            }
+            if overflowing && !scoped {
                 let button = self.action_button(
                     &view,
                     "",
@@ -4132,12 +4587,7 @@ impl MenuController {
             full_directory,
         )];
         if let Some(branch) = &session.git_branch {
-            rows.push((
-                "arrow.triangle.branch",
-                "Git branch",
-                branch.clone(),
-                branch.clone(),
-            ));
+            rows.push(("git-branch", "Git branch", branch.clone(), branch.clone()));
         }
         if let Some(label) = session.model_label() {
             rows.push((
@@ -4150,40 +4600,27 @@ impl MenuController {
         let mut y = 0.0;
         for (symbol, description, value, tooltip) in rows {
             if y > 0.0 {
-                y += 1.0;
+                y += 2.0;
             }
-            let height = 16.0;
+            let height = 15.4;
             let label = self.label(
                 &view,
                 &value,
-                rect(20.0, y, DETAIL_WIDTH - 20.0, height),
+                rect(18.0, y, DETAIL_WIDTH - 18.0, height),
                 11.0,
                 0.0,
-                true,
+                false,
             );
             label.setSelectable(true);
+            label.setTextColor(Some(&visual::tertiary_text_color()));
             label.setToolTip(Some(&NSString::from_str(&tooltip)));
-            // Align the symbol with the visible letter height, not the text field's
-            // frame, whose baseline and descender leave extra space below the text.
-            let text_bounds = label
-                .cell()
-                .map(|cell| cell.drawingRectForBounds(label.bounds()))
-                .unwrap_or(label.bounds());
-            let text_center = label
-                .font()
-                .map(|font| y + text_bounds.origin.y + font.ascender() - font.capHeight() / 2.0)
-                .unwrap_or(y + height / 2.0);
-            if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                &NSString::from_str(symbol),
-                Some(&NSString::from_str(description)),
-            ) {
-                image.setTemplate(true);
-                let icon = NSImageView::imageViewWithImage(&image, self.mtm());
-                icon.setFrame(rect(0.0, text_center - 6.0, 12.0, 12.0));
-                icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
-                icon.setToolTip(Some(&NSString::from_str(description)));
-                view.addSubview(&icon);
-            }
+            let icon = visual::MetadataIcon::new(
+                self.mtm(),
+                rect(0.0, y + (height - 12.0) / 2.0, 12.0, 12.0),
+                symbol,
+            );
+            icon.setToolTip(Some(&NSString::from_str(description)));
+            view.addSubview(&icon);
             y += height;
         }
         view.setFrameSize(NSSize::new(DETAIL_WIDTH, y));
@@ -4191,6 +4628,19 @@ impl MenuController {
     }
 
     fn render_rows(&self, sessions: &[Session]) {
+        self.ivars().work_glows.borrow_mut().clear();
+        let snapshot = self.monitor().snapshot();
+        let composers: Vec<_> = self.ivars().composers.borrow().values().cloned().collect();
+        for composer in &composers {
+            composer.suspend();
+            if let Some(session) = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.key() == composer.session())
+            {
+                composer.sync(&snapshot, session);
+            }
+        }
         let Some(list) = self.ivars().list.get() else {
             return;
         };
@@ -4210,6 +4660,9 @@ impl MenuController {
         let children = list.subviews();
         for index in 0..children.count() {
             children.objectAtIndex(index).removeFromSuperview();
+        }
+        if let Some(toolbar) = self.ivars().toolbar.get() {
+            list.addSubview(toolbar);
         }
         let expanded = self.ivars().expanded.borrow();
         let reveal = self.ivars().reveal.borrow();
@@ -4273,7 +4726,7 @@ impl MenuController {
                         let panel = inline_questions::Panel::create(
                             session.clone(),
                             self.monitor().clone(),
-                            QUESTION_CARD_WIDTH - 22.0,
+                            QUESTION_CARD_WIDTH - 26.0,
                             &detail_text_color(true),
                         );
                         self.ivars()
@@ -4287,7 +4740,7 @@ impl MenuController {
                 None
             };
             if let Some(panel) = &inline {
-                let enabled = session.authoritative
+                let enabled = session.authoritative()
                     && session
                         .approval_key()
                         .is_some_and(|key| !self.ivars().responding.borrow().contains(&key));
@@ -4303,13 +4756,16 @@ impl MenuController {
                 };
                 panel.reconcile(enabled, status);
             }
-            let controls = if inline.is_some() {
+            let mut controls = if inline.is_some() {
                 vec![]
             } else {
                 request_controls(session)
             };
-            let is_question = session.approval.is_some();
-            let question_padding = if is_question { 11.0 } else { 0.0 };
+            // Put scope-specific alternatives below the immediate decisions.
+            // The bound response value stays attached to its control.
+            controls.sort_by_key(|control| !control.detail.trim().is_empty());
+            let is_question = session.approval().is_some();
+            let question_padding = if is_question { 13.0 } else { 0.0 };
             let metadata_gap = if is_question { 8.0 } else { 0.0 };
             let content_width = (if is_question {
                 QUESTION_CARD_WIDTH
@@ -4342,9 +4798,24 @@ impl MenuController {
                     );
                     natural.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.23)));
                     natural.sizeToFit();
-                    let width =
-                        (natural.frame().size.width.ceil() + 4.0 + 2.0 * BUTTON_HORIZONTAL_INSET)
-                            .clamp(52.0, control_width);
+                    let icon_width = if request_glyph(control).is_some() {
+                        21.0
+                    } else {
+                        0.0
+                    };
+                    let width = (natural.frame().size.width.ceil()
+                        + 4.0
+                        + 2.0 * BUTTON_HORIZONTAL_INSET
+                        + icon_width)
+                        .clamp(
+                            52.0,
+                            control_width
+                                - if control.detail.trim().is_empty() {
+                                    0.0
+                                } else {
+                                    36.0
+                                },
+                        );
                     let measure = NSTextField::wrappingLabelWithString(
                         &NSString::from_str(&control.label),
                         self.mtm(),
@@ -4356,7 +4827,7 @@ impl MenuController {
                             cell.cellSizeForBounds(rect(
                                 0.0,
                                 0.0,
-                                width - 2.0 * BUTTON_HORIZONTAL_INSET,
+                                width - 2.0 * BUTTON_HORIZONTAL_INSET - icon_width,
                                 100000.0,
                             ))
                             .height
@@ -4375,28 +4846,58 @@ impl MenuController {
                     self.request_context(session, content_width, Some((index, control)))
                 })
                 .collect();
-            let (control_frames, controls_height) = if action_contexts.iter().any(Option::is_some) {
-                let mut y = 0.0;
-                let frames = control_sizes
-                    .iter()
-                    .zip(&action_contexts)
-                    .map(|(size, context)| {
-                        if y > 0.0 {
-                            y += 8.0;
-                        }
-                        if let Some((_, height)) = context {
-                            y += height + 4.0;
-                        }
-                        let frame = rect(0.0, y, size.width, size.height);
-                        y += size.height;
-                        frame
-                    })
-                    .collect();
-                (frames, y)
-            } else {
-                answer_button_layout(&control_sizes, control_width)
-            };
+            let context_heights: Vec<_> = action_contexts
+                .iter()
+                .zip(&controls)
+                .map(|(context, control)| {
+                    if control.detail.trim().is_empty() {
+                        None
+                    } else {
+                        Some(context.as_ref().map_or(0.0, |(_, height)| *height))
+                    }
+                })
+                .collect();
+            let (control_frames, controls_height) =
+                request_action_layout(&control_sizes, &context_heights, control_width);
             let is_expanded = expanded.contains(&session.key());
+            let composer = if super::session_composer::available(session)
+                && (is_expanded
+                    || reveal
+                        .get(&session.key())
+                        .is_some_and(|progress| *progress > 0.0))
+            {
+                let composer = self
+                    .ivars()
+                    .composers
+                    .borrow_mut()
+                    .entry(session.key())
+                    .or_insert_with(|| {
+                        super::session_composer::Composer::new(
+                            self.mtm(),
+                            self.monitor().clone(),
+                            session,
+                            DETAIL_WIDTH,
+                        )
+                    })
+                    .clone();
+                composer.sync(&snapshot, session);
+                Some(composer)
+            } else {
+                None
+            };
+            let progress = session
+                .work_caption()
+                .filter(|_| {
+                    is_expanded
+                        || reveal
+                            .get(&session.key())
+                            .is_some_and(|progress| *progress > 0.0)
+                })
+                .map(|text| {
+                    let (view, glow) = super::work_caption::new(self.mtm(), text, DETAIL_WIDTH);
+                    self.ivars().work_glows.borrow_mut().push(glow);
+                    view
+                });
             let history = self
                 .ivars()
                 .message_history
@@ -4413,23 +4914,9 @@ impl MenuController {
                         .get(&session.key())
                         .is_some_and(|progress| *progress > 0.0))
             {
-                for text in &earlier {
-                    let label =
-                        NSTextField::wrappingLabelWithString(&NSString::from_str(text), self.mtm());
-                    label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-                    label.setTextColor(Some(&detail_text_color(false)));
-                    label.setSelectable(true);
-                    label.setMaximumNumberOfLines(0);
-                    message_style(&label, &detail_text_color(false));
-                    let height = label
-                        .cell()
-                        .map(|cell| {
-                            cell.cellSizeForBounds(rect(0.0, 0.0, DETAIL_WIDTH, 1000000.0))
-                                .height
-                                .ceil()
-                        })
-                        .unwrap_or(22.0)
-                        .max(22.0);
+                for (text, images) in &earlier {
+                    let label = self.message_with_images(text, images, DETAIL_WIDTH, false);
+                    let height = label.frame().size.height;
                     label.setFrame(rect(
                         SESSION_TEXT_LEFT,
                         MESSAGE_TOP_GAP + earlier_height,
@@ -4447,10 +4934,10 @@ impl MenuController {
                     .is_some_and(|progress| *progress > 0.0)
             {
                 let text = session
-                    .approval
+                    .approval()
                     .as_ref()
                     .map(|request| request.body.as_str())
-                    .unwrap_or(&session.last_message)
+                    .unwrap_or(session.last_message())
                     .trim_end();
                 let text = if text.is_empty() {
                     "No messages yet"
@@ -4462,51 +4949,48 @@ impl MenuController {
                     .first()
                     .map(|message| message.text.as_str())
                     .or_else(|| {
-                        (is_question && !session.last_message.trim().is_empty())
-                            .then_some(session.last_message.as_str())
+                        (is_question && !session.last_message().trim().is_empty())
+                            .then_some(session.last_message())
                     })
                     .unwrap_or(text);
-                let first_label = NSTextField::wrappingLabelWithString(
-                    &NSString::from_str(first_text.trim_end()),
-                    self.mtm(),
-                );
-                first_label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-                first_label.setMaximumNumberOfLines(0);
-                message_style(&first_label, &detail_text_color(false));
                 let first_width = if earlier_height > 0.0 || !history.messages.is_empty() {
                     DETAIL_WIDTH
                 } else {
                     content_width
                 };
-                first_message_height = first_label
-                    .cell()
-                    .map(|cell| {
-                        cell.cellSizeForBounds(rect(0.0, 0.0, first_width, 1000000.0))
-                            .height
-                            .ceil()
-                    })
-                    .unwrap_or(22.0)
-                    .max(22.0);
-                let label =
-                    NSTextField::wrappingLabelWithString(&NSString::from_str(text), self.mtm());
-                label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-                label.setTextColor(Some(&detail_text_color(session.approval.is_some())));
-                label.setSelectable(true);
-                label.setMaximumNumberOfLines(0);
-                message_style(&label, &detail_text_color(session.approval.is_some()));
-                let height = if let Some(panel) = &inline {
-                    panel.view().frame().size.height
+                let first_images = history
+                    .messages
+                    .first()
+                    .map(|message| message.images.as_slice())
+                    .unwrap_or_else(|| {
+                        if session.approval().is_none()
+                            || (is_question && !session.last_message().trim().is_empty())
+                        {
+                            session.images()
+                        } else {
+                            &[]
+                        }
+                    });
+                first_message_height = self
+                    .message_with_images(first_text.trim_end(), first_images, first_width, false)
+                    .frame()
+                    .size
+                    .height;
+                let images = if session.approval().is_none() {
+                    session.images()
                 } else {
-                    label
-                        .cell()
-                        .map(|cell| {
-                            cell.cellSizeForBounds(rect(0.0, 0.0, content_width, 1000000.0))
-                                .height
-                                .ceil()
-                        })
-                        .unwrap_or(60.0)
-                        .max(22.0)
+                    &[]
                 };
+                let label = self.message_with_images(
+                    text,
+                    images,
+                    content_width,
+                    session.approval().is_some(),
+                );
+                let height = inline
+                    .as_ref()
+                    .map(|panel| panel.view().frame().size.height)
+                    .unwrap_or(label.frame().size.height);
                 label.setFrame(rect(0.0, 0.0, content_width, height));
                 let (metadata, metadata_height) = self.session_metadata(session);
                 Some((label, height, metadata, metadata_height))
@@ -4519,16 +5003,39 @@ impl MenuController {
                     height
                         + metadata_height
                         + MESSAGE_TOP_GAP
-                        + 16.0
+                        + 20.0
                         + controls_height
                         + context_height
                         + 2.0 * question_padding
                         + metadata_gap
                         + earlier_height
+                        + composer
+                            .as_ref()
+                            .map(|composer| composer.view().frame().size.height + 8.0)
+                            .unwrap_or(0.0)
+                        + progress
+                            .as_ref()
+                            .map(|view| view.frame().size.height + 8.0)
+                            .unwrap_or(0.0)
                 })
                 .unwrap_or(0.0);
             let height = SESSION_HEADER_HEIGHT + detail_height;
-            let row = SessionRowView::create(self.mtm(), rect(0.0, y, 384.0, height));
+            let row = SessionRowView::create(self.mtm(), rect(0.0, y, LIST_WIDTH, height));
+            if !new_group {
+                let separator = NSBox::initWithFrame(
+                    NSBox::alloc(self.mtm()),
+                    rect(0.0, height - 0.5, LIST_WIDTH, 0.5),
+                );
+                separator.setBoxType(NSBoxType::Custom);
+                separator.setTitlePosition(NSTitlePosition::NoTitle);
+                separator.setBorderWidth(0.0);
+                separator.setFillColor(&appearance_color(
+                    [115.0, 86.0, 156.0],
+                    [178.0, 153.0, 236.0],
+                    0.13,
+                ));
+                row.addSubview(&separator);
+            }
             // Reserve the status and disclosure controls independently of the
             // title's shared hover, keyboard highlight and click target.
             let finished = self
@@ -4537,9 +5044,9 @@ impl MenuController {
                 .unseen_finished
                 .contains_key(&session.key());
             let title_right = if session.activity == Activity::Idle && !finished {
-                348.0
+                LIST_WIDTH - 36.0
             } else {
-                316.0
+                LIST_WIDTH - 68.0
             };
             let text_width = title_right - SESSION_TEXT_LEFT - 12.0 - 42.0;
             let robot_button = self.action_button(
@@ -4560,13 +5067,18 @@ impl MenuController {
             } else {
                 ns_string!("Show details")
             }));
+            let (robot_width, robot_height) = if session.activity == Activity::Working {
+                (20.0, 16.0)
+            } else {
+                (14.0, 11.0)
+            };
             let robot = SessionRobot::new(
                 self.mtm(),
                 rect(
-                    (robot_button.bounds().size.width - 14.0) / 2.0,
-                    (robot_button.bounds().size.height - 11.0) / 2.0,
-                    14.0,
-                    11.0,
+                    (robot_button.bounds().size.width - robot_width) / 2.0,
+                    (robot_button.bounds().size.height - robot_height) / 2.0,
+                    robot_width,
+                    robot_height,
                 ),
                 session.activity,
             );
@@ -4580,10 +5092,11 @@ impl MenuController {
                     text_width,
                     22.0,
                 ),
-                13.0,
+                14.0,
                 0.3,
                 false,
             );
+            title.setTextColor(Some(&primary_text_color()));
             center_label(&title, height - SESSION_HEADER_HEIGHT / 2.0);
             let natural_width = title
                 .cell()
@@ -4592,7 +5105,7 @@ impl MenuController {
             let highlight_width = SESSION_TEXT_LEFT + natural_width.min(text_width) + 42.0 + 12.0
                 - SESSION_HEADER_HOVER_LEFT;
             if let Some(background) = row.ivars().background.get() {
-                background.setFrameSize(NSSize::new(highlight_width, SESSION_HEADER_HEIGHT));
+                background.setFrameSize(NSSize::new(highlight_width, SESSION_HEADER_HEIGHT - 6.0));
             }
             row.ivars()
                 .matches
@@ -4613,7 +5126,7 @@ impl MenuController {
                     sel!(markFinishedSeen:),
                     &session.key(),
                     rect(
-                        321.0,
+                        LIST_WIDTH - 63.0,
                         height - SESSION_HEADER_HEIGHT / 2.0 - 12.0,
                         22.0,
                         24.0,
@@ -4682,7 +5195,7 @@ impl MenuController {
                 sel!(expandSession:),
                 &session.key(),
                 rect(
-                    351.0,
+                    LIST_WIDTH - 33.0,
                     height - SESSION_HEADER_HEIGHT / 2.0 - 12.0,
                     26.0,
                     24.0,
@@ -4724,22 +5237,22 @@ impl MenuController {
                     .setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
             }
             let mut detail_clip = None;
-            if let Some((label, text_height, metadata, _)) = detail {
+            if let Some((label, text_height, metadata, _metadata_height)) = detail {
                 // The clip only reveals content; the main list is the sole scroller.
                 // SAFETY: NSClipView initializes this ivar-free subclass.
                 let clip: Retained<RevealClipView> = unsafe {
-                    msg_send![RevealClipView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 384.0, detail_height)]
+                    msg_send![RevealClipView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, LIST_WIDTH, detail_height)]
                 };
                 clip.setDrawsBackground(false);
                 // SAFETY: NSView's initializer is valid for this ivar-free subclass.
                 let document: Retained<SessionListView> = unsafe {
-                    msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, 384.0, detail_height)]
+                    msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, LIST_WIDTH, detail_height)]
                 };
                 let question_top = MESSAGE_TOP_GAP + earlier_height;
                 let message_top = question_top + question_padding;
                 let text_end = message_top + text_height;
                 let message_end = text_end + context_height;
-                let controls_gap = if inline.is_some() { 0.0 } else { 8.0 };
+                let controls_gap = if inline.is_some() { 0.0 } else { 12.0 };
                 let footer_y =
                     message_end + controls_gap + controls_height + question_padding + metadata_gap;
                 if is_question {
@@ -4754,14 +5267,15 @@ impl MenuController {
                     let decoration: Retained<StatusContentView> = unsafe {
                         msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: frame]
                     };
-                    let card = NSBox::initWithFrame(
-                        NSBox::alloc(self.mtm()),
+                    let card = glass_box(
+                        self.mtm(),
                         rect(0.0, 0.0, frame.size.width, frame.size.height),
+                        2,
                     );
                     card.setBoxType(NSBoxType::Custom);
                     card.setTitlePosition(NSTitlePosition::NoTitle);
                     card.setContentViewMargins(NSSize::new(0.0, 0.0));
-                    card.setCornerRadius(12.0);
+                    card.setCornerRadius(16.0);
                     card.setBorderWidth(1.0);
                     card.setBorderColor(&NSColor::separatorColor());
                     card.setFillColor(&appearance_color([231.0; 3], [55.0; 3], 1.0));
@@ -4772,8 +5286,50 @@ impl MenuController {
                     context.setFrameOrigin(NSPoint::new(content_x, text_end + 8.0));
                     document.addSubview(&context);
                 }
-                metadata.setFrameOrigin(NSPoint::new(SESSION_TEXT_LEFT, footer_y));
+                let composer_height = composer
+                    .as_ref()
+                    .map(|composer| composer.view().frame().size.height + 8.0)
+                    .unwrap_or(0.0);
+                let progress_height = progress
+                    .as_ref()
+                    .map(|view| view.frame().size.height + 8.0)
+                    .unwrap_or(0.0);
+                metadata.setFrameOrigin(NSPoint::new(
+                    SESSION_TEXT_LEFT,
+                    footer_y + composer_height + progress_height,
+                ));
                 document.addSubview(&metadata);
+                if let Some(progress) = &progress {
+                    progress.setFrameOrigin(NSPoint::new(SESSION_TEXT_LEFT, text_end + 8.0));
+                    document.addSubview(progress);
+                }
+                if let Some(composer) = &composer {
+                    composer
+                        .view()
+                        .setFrameOrigin(NSPoint::new(SESSION_TEXT_LEFT, text_end + 8.0));
+                    document.addSubview(composer.view());
+                    let button = composer.button();
+                    let id = button.identifier().unwrap().to_string();
+                    self.ivars().request_controls.borrow_mut().insert(
+                        id,
+                        RequestControl {
+                            session: session.clone(),
+                            label: "Send".into(),
+                            detail: String::new(),
+                            kind: ControlKind::Composer,
+                        },
+                    );
+                    self.ivars().buttons.borrow_mut().push(ButtonHover {
+                        button,
+                        background: composer.background(),
+                        base_alpha: 0.0,
+                        radio: None,
+                        caption: Some(composer.caption()),
+                        symbol: None,
+                        focusable_when_disabled: false,
+                        gutter: None,
+                    });
+                }
                 label.setFrameOrigin(NSPoint::new(content_x, message_top));
                 if let Some(panel) = &inline {
                     panel
@@ -4797,6 +5353,7 @@ impl MenuController {
                             base_alpha: item.base_alpha,
                             radio: item.radio,
                             caption: item.caption,
+                            symbol: None,
                             focusable_when_disabled: item.submit,
                             gutter: None,
                         });
@@ -4825,6 +5382,7 @@ impl MenuController {
                     start,
                     request_center,
                     message_centers,
+                    session.activity == Activity::Working,
                 );
                 row.addSubview_positioned_relativeTo(&thread, NSWindowOrderingMode::Below, None);
                 row.ivars()
@@ -4875,6 +5433,7 @@ impl MenuController {
                     base_alpha: 0.0,
                     radio: None,
                     caption: None,
+                    symbol: None,
                     focusable_when_disabled: false,
                     gutter: Some(GutterHover {
                         message: rect(
@@ -4907,14 +5466,71 @@ impl MenuController {
                 previous.setToolTip(Some(&NSString::from_str(&tooltip)));
                 if let Some(key) = session.approval_key() {
                     for (index, control) in controls.into_iter().enumerate() {
-                        if let Some((context, context_height)) = &action_contexts[index] {
+                        if let Some((context, _)) = &action_contexts[index] {
                             context.setFrameOrigin(NSPoint::new(
                                 content_x,
-                                message_end + 8.0 + control_inset + control_frames[index].origin.y
-                                    - context_height
-                                    - 4.0,
+                                message_end
+                                    + 8.0
+                                    + control_inset
+                                    + control_frames[index].origin.y
+                                    + control_frames[index].size.height
+                                    + 4.0,
                             ));
                             document.addSubview(context);
+                        }
+                        if !control.detail.trim().is_empty() {
+                            let toggle_key = format!("context:{key}:{}", index + 1);
+                            let expanded = self
+                                .ivars()
+                                .expanded_contexts
+                                .borrow()
+                                .contains(&toggle_key);
+                            let toggle = self.action_button(
+                                &document,
+                                "",
+                                sel!(respondToRequest:),
+                                &toggle_key,
+                                rect(
+                                    content_x
+                                        + control_inset
+                                        + control_frames[index].size.width
+                                        + 4.0,
+                                    message_end
+                                        + 8.0
+                                        + control_inset
+                                        + control_frames[index].origin.y
+                                        + (control_frames[index].size.height - 28.0) / 2.0,
+                                    28.0,
+                                    28.0,
+                                ),
+                                false,
+                            );
+                            toggle.setRefusesFirstResponder(true);
+                            toggle.setImage(
+                                NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                                    if expanded {
+                                        ns_string!("chevron.up")
+                                    } else {
+                                        ns_string!("chevron.down")
+                                    },
+                                    Some(ns_string!("Show or hide command scope")),
+                                )
+                                .as_deref(),
+                            );
+                            toggle.setToolTip(Some(if expanded {
+                                ns_string!("Hide command scope")
+                            } else {
+                                ns_string!("Show command scope")
+                            }));
+                            self.ivars().request_controls.borrow_mut().insert(
+                                toggle_key.clone(),
+                                RequestControl {
+                                    session: session.clone(),
+                                    label: String::new(),
+                                    detail: String::new(),
+                                    kind: ControlKind::ContextToggle(toggle_key),
+                                },
+                            );
                         }
                         let id = format!("response:{key}:{index}");
                         let button = self.action_button(
@@ -4931,15 +5547,16 @@ impl MenuController {
                             false,
                         );
                         button.setEnabled(
-                            session.authoritative
-                                && !self.ivars().responding.borrow().contains(&key)
-                                && !matches!(
-                                    self.monitor().snapshot().submissions.get(&key),
-                                    Some(
-                                        crate::actors::monitor::Submission::Sending
-                                            | crate::actors::monitor::Submission::Reconciling
-                                    )
-                                ),
+                            matches!(&control.kind, ControlKind::Open)
+                                || (session.authoritative()
+                                    && !self.ivars().responding.borrow().contains(&key)
+                                    && !matches!(
+                                        self.monitor().snapshot().submissions.get(&key),
+                                        Some(
+                                            crate::actors::monitor::Submission::Sending
+                                                | crate::actors::monitor::Submission::Reconciling
+                                        )
+                                    )),
                         );
                         button.setBezelStyle(NSBezelStyle::Push);
                         button.setFont(Some(&NSFont::systemFontOfSize(12.0)));
@@ -4955,25 +5572,48 @@ impl MenuController {
                         caption.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.23)));
                         caption.setAlignment(NSTextAlignment::Center);
                         let frame = button.frame();
+                        let glyph = request_glyph(&control);
+                        let icon_width = if glyph.is_some() { 21.0 } else { 0.0 };
+                        let available =
+                            frame.size.width - 2.0 * BUTTON_HORIZONTAL_INSET - icon_width;
+                        let caption_width = caption
+                            .cell()
+                            .map(|cell| cell.cellSize().width.ceil())
+                            .unwrap_or(available)
+                            .min(available)
+                            .max(1.0);
                         let caption_height = caption
                             .cell()
                             .map(|cell| {
-                                cell.cellSizeForBounds(rect(
-                                    0.0,
-                                    0.0,
-                                    frame.size.width - 2.0 * BUTTON_HORIZONTAL_INSET,
-                                    100000.0,
-                                ))
-                                .height
-                                .ceil()
+                                cell.cellSizeForBounds(rect(0.0, 0.0, caption_width, 100000.0))
+                                    .height
+                                    .ceil()
                             })
                             .unwrap_or(16.0);
+                        let group_x =
+                            frame.origin.x + (frame.size.width - caption_width - icon_width) / 2.0;
                         caption.setFrame(rect(
-                            frame.origin.x + BUTTON_HORIZONTAL_INSET,
+                            group_x + icon_width,
                             frame.origin.y + (frame.size.height - caption_height) / 2.0,
-                            frame.size.width - 2.0 * BUTTON_HORIZONTAL_INSET,
+                            caption_width,
                             caption_height,
                         ));
+                        let symbol = glyph.map(|glyph| {
+                            visual::DecisionIcon::new(
+                                self.mtm(),
+                                rect(
+                                    group_x,
+                                    frame.origin.y + (frame.size.height - 14.0) / 2.0,
+                                    14.0,
+                                    14.0,
+                                ),
+                                caption.clone(),
+                                glyph,
+                            )
+                        });
+                        if let Some(symbol) = &symbol {
+                            document.addSubview(symbol);
+                        }
                         button.setTransparent(true);
                         document.addSubview_positioned_relativeTo(
                             &caption,
@@ -4982,8 +5622,31 @@ impl MenuController {
                         );
                         if let Some(hover) = self.ivars().buttons.borrow_mut().last_mut() {
                             hover.caption = Some(caption);
-                            if matches!(control.label.as_str(), "Deny" | "Cancel turn") {
-                                hover.base_alpha = 0.0;
+                            hover.symbol = symbol;
+                            if let Some(surface) = hover.background.downcast_ref::<GlassBox>() {
+                                surface.ivars().kind.set(5);
+                            }
+                            hover.base_alpha = 1.0;
+                            hover
+                                .background
+                                .setCornerRadius(if control.detail.is_empty() {
+                                    12.0
+                                } else {
+                                    16.0
+                                });
+                            if index == 0
+                                && matches!(control.label.as_str(), "Allow once" | "Allow")
+                                && let Some(surface) = hover.background.downcast_ref::<GlassBox>()
+                            {
+                                surface.ivars().kind.set(4);
+                                let bounds = surface.frame();
+                                surface.setFrame(rect(
+                                    bounds.origin.x - 4.0,
+                                    bounds.origin.y - 4.0,
+                                    bounds.size.width + 8.0,
+                                    bounds.size.height + 8.0,
+                                ));
+                                surface.setCornerRadius(12.0);
                             }
                         }
                         button.setToolTip(Some(&NSString::from_str(
@@ -5039,6 +5702,9 @@ impl MenuController {
             for panel in &panels {
                 panel.resume_editing();
             }
+            for composer in &composers {
+                composer.resume();
+            }
         }
         let active: HashSet<_> = self
             .ivars()
@@ -5051,6 +5717,11 @@ impl MenuController {
             .question_panels
             .borrow_mut()
             .retain(|key, _| active.contains(key));
+        let live: HashSet<_> = self.ivars().all.borrow().iter().map(Session::key).collect();
+        self.ivars()
+            .composers
+            .borrow_mut()
+            .retain(|key, _| live.contains(key));
         self.advance_robot_eyes();
     }
 
@@ -5083,10 +5754,12 @@ impl MenuController {
                 (bounds.origin.y + bounds.size.height - top).max(0.0),
             )
         };
-        let extension = state.header_extension.get_or_init(|| {
-            // SAFETY: Decorative view passes mouse input through to NSMenu.
-            unsafe { msg_send![MenuTintView::alloc(self.mtm()), initWithFrame: gap] }
-        });
+        let Some(backdrop) = state.backdrop.get() else {
+            return;
+        };
+        let extension = state
+            .header_extension
+            .get_or_init(|| backdrop.sibling(self.mtm(), gap));
         // The native tracking window's content view can retain Aqua while its
         // menu item uses Dark Aqua. Match the item, not that unrelated parent.
         let appearance = root.effectiveAppearance();
@@ -5103,6 +5776,7 @@ impl MenuController {
         if extension.frame() != gap {
             extension.setFrame(gap);
         }
+        self.sync_mesh_slice(extension);
     }
 
     fn sync_footer_extension(&self) {
@@ -5110,51 +5784,117 @@ impl MenuController {
         if !state.menu_open.get() {
             return;
         }
-        let Some(footer) = state.footer.get() else {
+        // Settings has no quota footer, but native NSMenu padding still needs
+        // the same continuous mesh below the custom item.
+        let anchor: &NSView = if state.settings_active.get() {
+            let Some(root) = state.root.get() else {
+                return;
+            };
+            root
+        } else {
+            let Some(footer) = state.footer.get() else {
+                return;
+            };
+            footer
+        };
+        let Some(content) = anchor.window().and_then(|window| window.contentView()) else {
             return;
         };
-        let Some(content) = footer.window().and_then(|window| window.contentView()) else {
-            return;
-        };
-        let frame = content.convertRect_fromView(footer.bounds(), Some(footer));
+        let frame = content.convertRect_fromView(anchor.bounds(), Some(anchor));
         let gap = footer_gap(content.bounds(), frame, content.isFlipped());
-        let extension = state.footer_extension.get_or_init(|| {
-            // SAFETY: Decorative ivar-free NSView; hitTest returns nil so the
-            // native menu still owns mouse input in its bottom padding.
-            let view: Retained<StatusContentView> =
-                unsafe { msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: gap] };
-            let fill = NSBox::initWithFrame(
-                NSBox::alloc(self.mtm()),
-                rect(0.0, 0.0, gap.size.width, gap.size.height),
-            );
-            fill.setBoxType(NSBoxType::Custom);
-            fill.setTitlePosition(NSTitlePosition::NoTitle);
-            fill.setBorderWidth(0.0);
-            fill.setCornerRadius(0.0);
-            fill.setContentViewMargins(NSSize::new(0.0, 0.0));
-            fill.setFillColor(state.footer_fill.get_or_init(footer_fill_color));
-            view.addSubview(&fill);
-            FooterExtension { view, fill }
-        });
-        extension.view.setHidden(gap.size.height <= 0.0);
-        // SAFETY: View hierarchy access is confined to the main thread.
-        if !unsafe { extension.view.superview() }
-            .is_some_and(|parent| std::ptr::eq(&*parent, &*content))
-        {
-            content.addSubview(&extension.view);
+        let Some(backdrop) = state.backdrop.get() else {
+            return;
+        };
+        let extension = state
+            .footer_extension
+            .get_or_init(|| backdrop.sibling(self.mtm(), gap));
+        let appearance = anchor.effectiveAppearance();
+        if extension.effectiveAppearance() != appearance {
+            extension.setAppearance(Some(&appearance));
+            extension.setNeedsDisplay(true);
         }
-        if extension.view.frame() != gap {
-            extension.view.setFrame(gap);
-            extension
-                .fill
-                .setFrame(rect(0.0, 0.0, gap.size.width, gap.size.height));
+        extension.setHidden(gap.size.height <= 0.0);
+        // SAFETY: All hierarchy access is confined to the main thread.
+        if !unsafe { extension.superview() }.is_some_and(|parent| std::ptr::eq(&*parent, &*content))
+        {
+            content.addSubview(extension);
+        }
+        if extension.frame() != gap {
+            extension.setFrame(gap);
+        }
+        self.sync_mesh_slice(extension);
+    }
+
+    fn sync_mesh_slice(&self, view: &visual::MeshView) {
+        let state = self.ivars();
+        let (Some(root), Some(scroll)) = (state.root.get(), state.scroll.get()) else {
+            return;
+        };
+        // SAFETY: The slice is already attached to the same native menu window.
+        if unsafe { view.superview() }.is_none() {
+            return;
+        }
+        let source = root.convertRect_fromView(view.bounds(), Some(view));
+        let settings = state
+            .settings_active
+            .get()
+            .then(|| state.settings_shell.get())
+            .flatten();
+        let scroll: &NSScrollView = settings.map_or(&**scroll, |s| &*s.scroll);
+        let offset = scroll.contentView().bounds().origin.y + root.bounds().size.height
+            - source.origin.y
+            - source.size.height;
+        let document = settings.map_or(
+            state.content_height.get() + state.footer_height.get(),
+            |s| s.natural_height(),
+        );
+        let document = document.max(scroll.contentView().bounds().size.height);
+        view.set_brand_wave(!state.settings_active.get());
+        view.sync(source.origin.x, offset, document, MENU_WIDTH);
+    }
+
+    fn sync_backdrop(&self) {
+        let state = self.ivars();
+        let (Some(root), Some(scroll), Some(backdrop)) =
+            (state.root.get(), state.scroll.get(), state.backdrop.get())
+        else {
+            return;
+        };
+        if backdrop.frame() != root.bounds() {
+            backdrop.setFrame(root.bounds());
+        }
+        let settings = state
+            .settings_active
+            .get()
+            .then(|| state.settings_shell.get())
+            .flatten();
+        let active_scroll: &NSScrollView = settings.map_or(&**scroll, |s| &*s.scroll);
+        let document = settings.map_or(
+            state.content_height.get() + state.footer_height.get(),
+            |s| s.natural_height(),
+        );
+        let document = document.max(active_scroll.contentView().bounds().size.height);
+        backdrop.set_brand_wave(!state.settings_active.get());
+        backdrop.sync(
+            0.0,
+            active_scroll.contentView().bounds().origin.y,
+            document,
+            MENU_WIDTH,
+        );
+        if let Some(slice) = state.header_extension.get() {
+            self.sync_mesh_slice(slice);
+        }
+        if let Some(slice) = state.footer_extension.get() {
+            self.sync_mesh_slice(slice);
         }
     }
 
     fn render_footer(&self) {
         let state = self.ivars();
+        if state.settings_active.get() {
+            return;
+        }
         let usage = state.usage.borrow();
-        let usage = usage.as_ref();
         let query = state.filter_query.borrow().clone();
         let filter_rows = usize::from(!query.is_empty());
         let Some(footer) = state.footer.get() else {
@@ -5164,120 +5904,106 @@ impl MenuController {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        const VERSION_HEIGHT: f64 = 32.0;
-        const LEFT: f64 = 14.0;
-        let rows = usage.map(|usage| usage.windows.len()).unwrap_or(1);
-        let height = (rows + filter_rows) as f64 * 24.0 + 12.0 + VERSION_HEIGHT;
-        let resets: Vec<_> = usage
-            .into_iter()
-            .flat_map(|usage| usage.windows.iter())
-            .map(|window| {
-                window
-                    .resets_at
-                    .map(|reset| {
-                        let formatter = NSDateFormatter::new();
-                        formatter.setDateFormat(Some(if window.minutes >= 1440 {
-                            ns_string!("MMM d")
-                        } else {
-                            ns_string!("HH:mm")
-                        }));
-                        formatter
-                            .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(reset as f64))
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| "—".into())
-            })
-            .collect();
-        let remaining: Vec<_> = usage
-            .into_iter()
-            .flat_map(|usage| usage.windows.iter())
-            .map(|window| {
-                window
-                    .remaining(now)
-                    .map(|value| format!("{value}%"))
-                    .unwrap_or_else(|| "—".into())
-            })
-            .collect();
-        let text_width = |text: &str| {
-            let label = NSTextField::labelWithString(&NSString::from_str(text), self.mtm());
-            label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-            label.sizeToFit();
-            label.frame().size.width.ceil()
-        };
-        let date_width = resets
-            .iter()
-            .map(|text| text_width(text))
-            .fold(text_width("—"), f64::max);
-        let percent_width = remaining
-            .iter()
-            .map(|text| text_width(text))
-            .fold(text_width("—"), f64::max);
-        let date_x = 378.0 - date_width;
-        let percent_x = date_x - 12.0 - percent_width;
+        let windows = usage
+            .as_ref()
+            .map(|usage| usage.windows.as_slice())
+            .unwrap_or_default();
+        let height = windows.len().max(1) as f64 * 40.0 + 20.0 + filter_rows as f64 * 20.0;
         let changed = state.footer_height.replace(height) != height;
         let children = footer.subviews();
         for index in 0..children.count() {
             children.objectAtIndex(index).removeFromSuperview();
         }
-        footer.setFrame(rect(0.0, 0.0, 392.0, height));
-        // A denser system-color wash reduces the glass/background influence
-        // in the footer while leaving AppKit in charge of the menu material.
-        let background = NSBox::initWithFrame(NSBox::alloc(self.mtm()), footer.bounds());
-        background.setBoxType(NSBoxType::Custom);
-        background.setTitlePosition(NSTitlePosition::NoTitle);
-        background.setBorderWidth(0.0);
-        background.setCornerRadius(0.0);
-        background.setContentViewMargins(NSSize::new(0.0, 0.0));
-        background.setFillColor(state.footer_fill.get_or_init(footer_fill_color));
-        footer.addSubview(&background);
-        let separator = NSBox::initWithFrame(
-            NSBox::alloc(self.mtm()),
-            rect(0.0, height - 1.0, 392.0, 1.0),
-        );
-        separator.setBoxType(NSBoxType::Separator);
-        footer.addSubview(&separator);
-        if filter_rows > 0 {
-            let label = self.label(
+        footer.setFrame(rect(0.0, 0.0, MENU_WIDTH, height));
+        if !query.is_empty() {
+            self.label(
                 footer,
-                "",
-                rect(LEFT, height - 32.0, 330.0, 20.0),
-                12.0,
+                &format!("Filter: {query}"),
+                rect(26.0, height - 22.0, MENU_WIDTH - 52.0, 18.0),
+                11.0,
+                0.0,
+                true,
+            );
+        }
+        for index in 0..windows.len().max(1) {
+            let window = windows.get(index);
+            let remaining = window.and_then(|window| window.remaining(now));
+            let percentage = remaining
+                .map(|value| format!("{value}%"))
+                .unwrap_or_else(|| "—".to_owned());
+            let reset = window
+                .and_then(|window| window.resets_at)
+                .map(|reset| {
+                    let formatter = NSDateFormatter::new();
+                    formatter.setDateFormat(Some(
+                        if window.is_some_and(|window| window.minutes >= 1440) {
+                            ns_string!("MMM d")
+                        } else {
+                            ns_string!("HH:mm")
+                        },
+                    ));
+                    formatter
+                        .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(reset as f64))
+                        .to_string()
+                })
+                .unwrap_or_else(|| "—".to_owned());
+            let name_text = window
+                .map(|window| format!("Codex {}", window.label()))
+                .unwrap_or_else(|| "Codex usage".to_owned());
+            let y = height - 16.0 - filter_rows as f64 * 20.0 - 36.0 - index as f64 * 40.0;
+            let panel = glass_box(self.mtm(), rect(16.0, y, MENU_WIDTH - 32.0, 36.0), 3);
+            panel.setBoxType(NSBoxType::Custom);
+            panel.setTitlePosition(NSTitlePosition::NoTitle);
+            panel.setCornerRadius(17.0);
+            footer.addSubview(&panel);
+            let icon = visual::QuotaSymbol::new(self.mtm(), rect(29.0, y + 9.0, 18.0, 18.0));
+            footer.addSubview(&icon);
+            let name = self.label(
+                footer,
+                &name_text,
+                rect(56.0, y + 8.0, 150.0, 20.0),
+                11.0,
                 0.0,
                 false,
             );
-            label.setStringValue(&NSString::from_str(&format!("Filter: {query}")));
-            label.setToolTip(Some(&NSString::from_str(&query)));
-        }
-        if let Some(usage) = usage {
-            for (index, window) in usage.windows.iter().enumerate() {
-                let y = height - 8.0 - 24.0 * (index + 1 + filter_rows) as f64;
-                let name = self.label(
-                    footer,
-                    &format!("Codex {}", window.label()),
-                    rect(LEFT, y, (percent_x - LEFT - 12.0).max(0.0), 20.0),
-                    11.0,
-                    0.0,
-                    true,
-                );
-                let percent = self.label(
-                    footer,
-                    &remaining[index],
-                    rect(percent_x, y, percent_width, 20.0),
-                    11.0,
-                    0.0,
-                    true,
-                );
-                percent.setAlignment(NSTextAlignment::Right);
-                let date = self.label(
-                    footer,
-                    &resets[index],
-                    rect(date_x, y, date_width, 20.0),
-                    11.0,
-                    0.0,
-                    true,
-                );
-                date.setAlignment(NSTextAlignment::Right);
-                let tooltip = NSString::from_str(&format!(
+            name.setTextColor(Some(&primary_text_color()));
+            name.sizeToFit();
+            let name_width = name.frame().size.width.ceil();
+            name.setFrame(rect(56.0, y + 8.0, name_width, 20.0));
+            let date = self.label(
+                footer,
+                &reset,
+                rect(0.0, y + 8.0, 80.0, 20.0),
+                11.0,
+                0.0,
+                true,
+            );
+            date.sizeToFit();
+            let date_width = date.frame().size.width.ceil().max(15.0);
+            let date_x = MENU_WIDTH - 29.0 - date_width;
+            date.setFrame(rect(date_x, y + 8.0, date_width, 20.0));
+            let percent = self.label(
+                footer,
+                &percentage,
+                rect(0.0, y + 8.0, 40.0, 20.0),
+                11.0,
+                0.0,
+                true,
+            );
+            percent.sizeToFit();
+            let percent_width = percent.frame().size.width.ceil().max(15.0);
+            let percent_x = date_x - 24.0 - percent_width;
+            percent.setFrame(rect(percent_x, y + 8.0, percent_width, 20.0));
+            let track_x = 56.0 + name_width + 12.0;
+            let track_width = (percent_x - 12.0 - track_x).max(0.0);
+            let track: Retained<UsageTrack> = unsafe {
+                msg_send![super(UsageTrack::alloc(self.mtm()).set_ivars(UsageTrackState { remaining: remaining.map(f64::from) })),initWithFrame:rect(track_x,y+14.0,track_width,8.0)]
+            };
+            footer.addSubview(&track);
+            let tooltip = NSString::from_str(&if let (Some(window), Some(usage)) =
+                (window, usage.as_ref())
+            {
+                format!(
                     "Codex · {} quota remaining\nReset: {}\nLast reported: {}{}",
                     window.label(),
                     window
@@ -5291,55 +6017,25 @@ impl MenuController {
                                 ))
                                 .to_string()
                         })
-                        .unwrap_or_else(|| "Unknown".into()),
+                        .unwrap_or_else(|| "Unknown".to_owned()),
                     usage.observed_at,
-                    if window.remaining(now).is_none() {
+                    if remaining.is_none() {
                         "\nWaiting for Codex to report the new balance."
                     } else {
                         ""
-                    },
-                ));
-                for label in [name, percent, date] {
-                    center_label(&label, y + 10.0);
-                    label.setToolTip(Some(&tooltip));
-                }
+                    }
+                )
+            } else {
+                "Usage will appear after Codex reports its account limits.".to_owned()
+            });
+            for label in [&name, &percent, &date] {
+                center_label(label, y + 18.0);
+                label.setTextColor(Some(&visual::quota_value_color()));
+                label.setToolTip(Some(&tooltip));
             }
-        } else {
-            let label = self.label(
-                footer,
-                "Codex usage",
-                rect(LEFT, VERSION_HEIGHT + 4.0, 220.0, 20.0),
-                12.0,
-                0.0,
-                true,
-            );
-            label.setToolTip(Some(ns_string!(
-                "Usage will appear after Codex reports its account limits."
-            )));
-            let value = self.label(
-                footer,
-                "—",
-                rect(date_x, VERSION_HEIGHT + 4.0, date_width, 20.0),
-                12.0,
-                0.0,
-                true,
-            );
-            value.setAlignment(NSTextAlignment::Right);
+            name.setTextColor(Some(&primary_text_color()));
+            track.setToolTip(Some(&tooltip));
         }
-        let version = self.label(
-            footer,
-            &format!("v{}", core::VERSION),
-            rect(20.0, 8.0, 180.0, 16.0),
-            10.0,
-            0.0,
-            true,
-        );
-        version.setTextColor(Some(&NSColor::tertiaryLabelColor()));
-        version.setToolTip(Some(&NSString::from_str(&format!(
-            "AI Agent Monitor {}",
-            core::VERSION
-        ))));
-        center_label(&version, 16.0);
         if changed {
             self.layout_rows();
         }
@@ -5371,7 +6067,18 @@ impl MenuController {
 
     fn resize_content(&self, content_height: f64) -> f64 {
         let state = self.ivars();
-        state.content_height.set(content_height);
+        let settings = state.settings_active.get();
+        if !settings {
+            state.content_height.set(content_height);
+        }
+        let content_height = if settings {
+            state
+                .settings_shell
+                .get()
+                .map_or(content_height, |s| s.natural_height())
+        } else {
+            content_height
+        };
         let screen = state
             .status
             .get()
@@ -5386,32 +6093,40 @@ impl MenuController {
             })
             .unwrap_or(640.0)
             .max(100.0);
-        let footer_height = state.footer_height.get();
-        let height = (content_height + footer_height + 8.0)
+        let footer_height = if settings {
+            0.0
+        } else {
+            state.footer_height.get()
+        };
+        let height = (content_height + footer_height)
             .max(64.0 + footer_height)
             .min(maximum);
-        let viewport = height - footer_height - 8.0;
+        let viewport = height;
         NSAnimationContext::beginGrouping();
         let context = NSAnimationContext::currentContext();
         context.setDuration(0.0);
         context.setAllowsImplicitAnimation(false);
         let mut resized = false;
         if let Some(root) = state.root.get() {
-            let size = NSSize::new(392.0, height);
+            let size = NSSize::new(MENU_WIDTH, height);
             if root.frame().size != size {
                 root.setFrameSize(size);
                 resized = true;
             }
         }
         if let Some(scroll) = state.scroll.get() {
-            scroll.setFrame(rect(4.0, footer_height + 4.0, 384.0, viewport));
+            scroll.setFrame(rect(11.0, 0.0, LIST_WIDTH, viewport));
         }
         if let Some(toolbar) = state.toolbar.get() {
-            toolbar.setFrame(rect(0.0, 0.0, 392.0, 32.0));
+            toolbar.setFrame(rect(0.0, 0.0, LIST_WIDTH, BRAND_HEIGHT));
         }
         if let Some(caption) = state.caption.get() {
-            caption.setFrame(rect(20.0, height - 27.0, 286.0, 18.0));
+            caption.setFrame(rect(49.0, height - BRAND_HEIGHT - 40.0, 360.0, 18.0));
         }
+        if settings && let Some(shell) = state.settings_shell.get() {
+            shell.resize(NSSize::new(MENU_WIDTH, height));
+        }
+        self.sync_backdrop();
         NSAnimationContext::endGrouping();
         if resized
             && state.menu_open.get()
@@ -5507,6 +6222,9 @@ impl MenuController {
 
     fn filter(&self) {
         let state = self.ivars();
+        if state.settings_active.get() {
+            return;
+        }
         let visible = state.filtered_sessions();
         let count = visible.len();
         let previous = state.visible.borrow();
@@ -5522,13 +6240,67 @@ impl MenuController {
                     || a.git_branch != b.git_branch
                     || a.client != b.client
                     || a.activity != b.activity
-                    || a.last_message != b.last_message
-                    || a.approval != b.approval
+                    || a.last_message() != b.last_message()
+                    || a.progress() != b.progress()
+                    || a.approval() != b.approval()
             });
         drop(previous);
         if changed {
             self.render_rows(&visible);
             *state.visible.borrow_mut() = visible;
+        }
+        if let Some(overview) = state.overview.get() {
+            let snapshot = self.monitor().snapshot();
+            let counts = overview_counts(&state.visible.borrow(), |session| {
+                snapshot.unseen_finished.contains_key(&session.key())
+            });
+            let segments: Vec<_> = ["waiting for you", "working", "finished", "idle"]
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| counts[*index] > 0)
+                .map(|(index, label)| (index, format!("{} {label}", counts[index])))
+                .collect();
+            let summary = segments
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let value = NSMutableAttributedString::initWithString(
+                NSMutableAttributedString::alloc(),
+                &NSString::from_str(&summary),
+            );
+            let colors = [
+                request_color(),
+                working_status_color(),
+                appearance_color([62.0, 109.0, 185.0], [140.0, 216.0, 255.0], 1.0),
+                visual::neutral_robot_color(),
+            ];
+            // SAFETY: Each range is measured in UTF-16 in this exact summary.
+            unsafe {
+                value.addAttribute_value_range(
+                    NSForegroundColorAttributeName,
+                    &secondary_text_color(),
+                    NSRange::new(0, summary.encode_utf16().count()),
+                );
+                let mut offset = 0;
+                for (index, segment) in &segments {
+                    let length = segment.encode_utf16().count();
+                    let color = &colors[*index];
+                    value.addAttribute_value_range(
+                        NSForegroundColorAttributeName,
+                        color,
+                        NSRange::new(offset, length),
+                    );
+                    offset += length + 3;
+                }
+            }
+            overview.setAttributedStringValue(&value);
+            let hint = if counts[4] == 0 {
+                summary
+            } else {
+                format!("{summary}\nStatus unavailable: {}", counts[4])
+            };
+            overview.setToolTip(Some(&NSString::from_str(&hint)));
         }
         if let Some(caption) = state.caption.get() {
             let text = if count == 0 {
@@ -5602,7 +6374,7 @@ pub fn start(mtm: MainThreadMarker, show: bool) -> Result<Option<Resident>> {
     }
     let (ui, incoming) = tokio::sync::mpsc::channel(128);
     // Standard edit key equivalents dispatch to the field editor through the
-    // responder chain, including secure text fields in the settings window.
+    // responder chain, including secure text fields in the settings pane.
     let app = NSApplication::sharedApplication(mtm);
     let main_menu = app.mainMenu().unwrap_or_else(|| NSMenu::new(mtm));
     let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
@@ -5673,6 +6445,11 @@ fn menu_work_area_origin(frame: NSRect, visible: NSRect) -> NSPoint {
         frame.origin.y.clamp(bottom, top),
     )
 }
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "menu_visual_test.rs"]
+pub(crate) mod visual_test;
 
 #[cfg(test)]
 mod close_tests {
@@ -5793,7 +6570,7 @@ mod close_tests {
     #[test]
     fn pending_questions_keep_latest_message_and_history_above_the_card() {
         let mut session = session("chat", Some("question"));
-        session.last_message = "Latest message\n\n".into();
+        session.set_last_message("Latest message\n\n".into());
         let mut history = MessageHistory::default();
         assert_eq!(
             messages_before_request(&session, &history),
@@ -5809,17 +6586,17 @@ mod close_tests {
             messages_before_request(&session, &history),
             "Previous message\n\nLatest message"
         );
-        session.last_message = "New message".into();
+        session.set_last_message("New message".into());
         assert_eq!(
             messages_before_request(&session, &history),
             "Previous message\n\nLatest message\n\nNew message"
         );
-        session.approval = None;
+        session.set_approval(None);
         assert_eq!(
             messages_before_request(&session, &history),
             "Previous message\n\nLatest message"
         );
-        session.last_message.clear();
+        session.set_last_message(String::new());
         history = MessageHistory::default();
         assert!(messages_before_request(&session, &history).is_empty());
     }
@@ -5974,6 +6751,52 @@ mod close_tests {
     }
 
     #[test]
+    fn status_counters_follow_priority_without_gaps_for_hidden_counters() {
+        for mask in 0..8 {
+            let widths = std::array::from_fn(|index| (mask & (1 << index) != 0).then_some(14.0));
+            let (positions, extra) = status_counter_positions(widths);
+            let mut end = 26.0;
+            for index in 0..3 {
+                if widths[index].is_some() {
+                    assert_eq!(positions[index], end + if end == 26.0 { 2.0 } else { 5.0 });
+                    end = positions[index] + 14.0;
+                }
+            }
+            assert_eq!(extra, end - 26.0);
+        }
+        let (positions, extra) = status_counter_positions([Some(26.0), Some(20.0), Some(9.0)]);
+        assert_eq!(positions, [28.0, 59.0, 84.0]);
+        assert_eq!(extra, 67.0);
+    }
+
+    #[test]
+    fn immediate_approval_decisions_stay_together_above_scoped_options() {
+        let sizes = [
+            NSSize::new(120.0, 32.0),
+            NSSize::new(80.0, 32.0),
+            NSSize::new(220.0, 32.0),
+        ];
+        let (frames, height) = request_action_layout(&sizes, &[None, None, Some(60.0)], 362.0);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].origin.y, frames[1].origin.y);
+        assert_eq!(frames[0].size.width, frames[1].size.width);
+        assert!(frames[0].origin.x + frames[0].size.width < frames[1].origin.x);
+        assert!(frames[2].origin.y >= frames[0].size.height + 12.0);
+        assert_eq!(height, frames[2].origin.y + frames[2].size.height + 64.0);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.origin.x + frame.size.width <= 362.0)
+        );
+        let (only_scope, height) = request_action_layout(&sizes[2..], &[Some(60.0)], 362.0);
+        assert_eq!(only_scope[0].origin.y, 0.0);
+        assert_eq!(height, 96.0);
+        let (collapsed, height) = request_action_layout(&sizes, &[None, None, Some(0.0)], 362.0);
+        assert_eq!(collapsed, frames);
+        assert_eq!(height, collapsed[2].origin.y + collapsed[2].size.height);
+    }
+
+    #[test]
     fn answer_buttons_share_one_row_only_when_all_fit_and_never_stretch() {
         let sizes = [
             NSSize::new(60.0, 28.0),
@@ -6111,34 +6934,45 @@ mod close_tests {
     }
 
     fn session(id: &str, approval: Option<&str>) -> Session {
-        Session {
-            authoritative: true,
-            interaction_data: Default::default(),
-            target: None,
-            agent: "codex",
-            id: id.into(),
-            title: id.into(),
-            cwd: "/project".into(),
-            workspace: None,
-            git_branch: None,
-            model: None,
-            model_display_name: None,
-            reasoning_effort: None,
-            updated_at: 0,
-            client: Client::VSCode,
-            activity: if approval.is_some() {
-                Activity::Confirmation
-            } else {
-                Activity::Idle
-            },
-            last_message: String::new(),
-            images: vec![],
-            approval: approval.map(|path| crate::agents::sessions::Approval {
-                id: path.into(),
-                body: "Подтверждение".into(),
-                expires: u64::MAX,
-                can_allow: true,
-            }),
+        {
+            let mut __session = Session {
+                target: None,
+                agent: "codex",
+                id: id.into(),
+                title: id.into(),
+                cwd: "/project".into(),
+                workspace: None,
+                git_branch: None,
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 0,
+                client: Client::VSCode,
+                activity: if approval.is_some() {
+                    Activity::Confirmation
+                } else {
+                    Activity::Idle
+                },
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot(
+                String::new(),
+                vec![],
+                None,
+                approval.map(|path| crate::agents::sessions::Approval {
+                    id: path.into(),
+                    body: "Confirmation".into(),
+                    expires: u64::MAX,
+                    can_allow: true,
+                }),
+                Default::default(),
+            );
+            __session
         }
     }
 

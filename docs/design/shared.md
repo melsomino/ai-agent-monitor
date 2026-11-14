@@ -5,7 +5,7 @@
 
 AI Agent Monitor observes existing local coding-agent sessions. It does not start, schedule, or manage their implementation tasks. A session may be working, idle, awaiting a human response, or have unknown activity. A completion marker is additional attention state, not an execution state. The monitor offers navigation, message inspection, and only those responses supported by the agent adapter.
 
-The user surfaces are an ambient system indicator; a session popup with persistent footer; a separate settings window; OS notifications; and an optional personal Telegram bot. A normal native answer window also remains reachable on macOS as a fallback. H simulates the indicator/popup and a small settings panel; it does not implement the OS or remote channels.
+The user surfaces are an ambient system indicator; a session popup with persistent footer; settings (inline on macOS/HTML, separate on GNOME); OS notifications; and an optional personal Telegram bot. A normal native answer window also remains reachable on macOS as a fallback. H simulates the indicator/popup and in-popup settings; it does not implement the OS or remote channels.
 
 **SH-01 — No implicit authorization (S).** Opening, reading, hovering, selecting a radio, expanding command details, and navigating MUST NOT authorize a permission request. An action button or submission gesture must explicitly initiate a response. Native multi-question radio selection only edits a draft. A single-question preset is an explicit submission button.
 

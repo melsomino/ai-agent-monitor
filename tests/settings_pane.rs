@@ -51,7 +51,7 @@ fn main() {
             settings_pane::replace(&controller, &item, pane, mtm);
             controller.setPreferredContentSize(size);
             tabs.setPreferredContentSize(size);
-            settings_pane::resize(&window, size);
+            window.setContentSize(size);
             tabs.view().layoutSubtreeIfNeeded();
             assert!(std::ptr::eq(&*controller.view(), &**pane));
             assert!(std::ptr::eq(&*item.view(mtm).unwrap(), &**pane));

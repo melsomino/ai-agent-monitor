@@ -81,11 +81,11 @@ impl Disclosure {
             .retain(|key, _| sessions.iter().any(|s| s.key() == *key));
         for s in sessions {
             let key = s.key();
-            let token = format!("{:?}:{:?}", s.approval, s.interaction_data);
-            let new_request = s.approval.is_some() && self.requests.get(&key) != Some(&token);
+            let token = format!("{:?}:{:?}", s.approval(), s.interaction());
+            let new_request = s.approval().is_some() && self.requests.get(&key) != Some(&token);
             self.expanded
                 .entry(key.clone())
-                .or_insert(s.activity == Activity::Working || s.approval.is_some());
+                .or_insert(s.activity == Activity::Working || s.approval().is_some());
             if new_request {
                 self.expanded.insert(key.clone(), true);
             }
@@ -191,7 +191,7 @@ mod tests {
     }
     #[test]
     fn highlight_handles_unicode_expansion() {
-        assert!(title_markup("İstanbul Доставка", "i дост").contains("<u>Д</u>"));
+        assert!(title_markup("İstanbul Delivery", "i deli").contains("<u>D</u>"));
     }
 }
 
@@ -200,25 +200,30 @@ mod behavior_tests {
     use super::*;
     use crate::domain::{interaction::Interaction, session::Approval};
     fn session(id: &str, title: &str, activity: Activity) -> Session {
-        Session {
-            agent: "codex",
-            id: id.into(),
-            title: title.into(),
-            cwd: "/tmp".into(),
-            workspace: None,
-            git_branch: None,
-            model: None,
-            model_display_name: None,
-            reasoning_effort: None,
-            updated_at: 0,
-            client: Client::VSCode,
-            activity,
-            last_message: String::new(),
-            images: vec![],
-            interaction_data: Interaction::default(),
-            target: None,
-            authoritative: true,
-            approval: None,
+        {
+            let mut __session = Session {
+                agent: "codex",
+                id: id.into(),
+                title: title.into(),
+                cwd: "/tmp".into(),
+                workspace: None,
+                git_branch: None,
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 0,
+                client: Client::VSCode,
+                activity,
+                target: None,
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot(String::new(), vec![], None, None, Interaction::default());
+            __session
         }
     }
     #[test]
@@ -230,12 +235,12 @@ mod behavior_tests {
         d.expanded.insert(s.key(), false);
         d.observe(&[s.clone()]);
         assert_eq!(d.expanded[&s.key()], false);
-        s.approval = Some(Approval {
+        s.set_approval(Some(Approval {
             id: "r".into(),
             body: "Allow?".into(),
             expires: u64::MAX,
             can_allow: true,
-        });
+        }));
         d.observe(&[s.clone()]);
         assert_eq!(d.expanded[&s.key()], true);
         d.expanded.insert(s.key(), false);

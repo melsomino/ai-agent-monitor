@@ -111,7 +111,7 @@ pub async fn run(
                 if known.contains(&key) {
                     remove_session_notification(&key);
                 }
-                let approval = session.approval.as_ref().unwrap();
+                let approval = session.approval().unwrap();
                 delivery.queued.push(
                     (
                         plan,
@@ -207,37 +207,48 @@ mod tests {
         }
     }
     fn session() -> Session {
-        Session {
-            agent: "codex",
-            id: "chat".into(),
-            title: "Chat".into(),
-            cwd: "/work".into(),
-            workspace: None,
-            git_branch: None,
-            model: None,
-            model_display_name: None,
-            reasoning_effort: None,
-            updated_at: 0,
-            client: Client::VSCode,
-            activity: Activity::Confirmation,
-            last_message: String::new(),
-            images: vec![],
-            interaction_data: Interaction::default(),
-            target: Some("target".into()),
-            authoritative: true,
-            approval: Some(Approval {
-                id: "ticket".into(),
-                body: "Answer in editor".into(),
-                expires: u64::MAX,
-                can_allow: false,
-            }),
+        {
+            let mut __session = Session {
+                agent: "codex",
+                id: "chat".into(),
+                title: "Chat".into(),
+                cwd: "/work".into(),
+                workspace: None,
+                git_branch: None,
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 0,
+                client: Client::VSCode,
+                activity: Activity::Confirmation,
+                target: Some("target".into()),
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot(
+                String::new(),
+                vec![],
+                None,
+                Some(Approval {
+                    id: "ticket".into(),
+                    body: "Answer in editor".into(),
+                    expires: u64::MAX,
+                    can_allow: false,
+                }),
+                Interaction::default(),
+            );
+            __session
         }
     }
     #[tokio::test]
     async fn question_answer_button_opens_menu_without_submitting_or_showing_a_form() {
         use crate::domain::interaction::Question;
         let mut session = session();
-        session.interaction_data.questions = vec![
+        session.interaction_mut().questions = vec![
             Question {
                 id: "one".into(),
                 title: "First?".into(),
@@ -358,7 +369,7 @@ mod tests {
     fn edited_request_replaces_queued_delivery_and_discards_its_old_retry() {
         let now = Instant::now();
         let mut session = session();
-        session.interaction_data = Interaction::allow();
+        session.set_interaction(Interaction::allow());
         let mut bindings = Bindings::default();
         let old = bindings.bind(&session).unwrap();
         let notice = Notice {
@@ -369,7 +380,7 @@ mod tests {
         queue
             .queued
             .push((old.clone(), notice.clone()), now + Duration::from_secs(5));
-        session.interaction_data.command = Some("echo updated".into());
+        session.interaction_mut().command = Some("echo updated".into());
         let current = bindings.bind(&session).unwrap();
         queue.queued.push((current.clone(), notice.clone()), now);
         queue.retain_current(&bindings);

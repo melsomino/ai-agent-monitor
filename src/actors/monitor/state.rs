@@ -29,6 +29,7 @@ pub struct History {
 pub enum HistoryClient {
     Window,
     Telegram,
+    Web(u64),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HistoryKey {
@@ -86,16 +87,16 @@ impl State {
         self.unseen_finished.retain(|key, _| {
             self.sessions.iter().any(|session| {
                 session.key() == *key
-                    && (!session.authoritative
+                    && (!session.authoritative()
                         || matches!(session.activity, Activity::Idle | Activity::Unknown))
             })
         });
         for session in &self.sessions {
-            if session.authoritative
+            if session.authoritative()
                 && session.activity == Activity::Idle
                 && previous.iter().any(|old| {
                     old.key() == session.key()
-                        && old.authoritative
+                        && old.authoritative()
                         && old.activity == Activity::Working
                 })
             {
@@ -108,7 +109,7 @@ impl State {
     pub fn pending_count(&self) -> usize {
         self.sessions
             .iter()
-            .filter(|s| s.approval.is_some())
+            .filter(|s| s.approval().is_some())
             .count()
     }
 }

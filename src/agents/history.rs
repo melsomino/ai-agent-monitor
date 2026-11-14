@@ -338,7 +338,7 @@ mod tests {
         let tool = json!({"type":"response_item","payload":{"type":"function_call_output","output":"x".repeat(2*1024*1024+10)}}).to_string();
         fs::write(
             &path,
-            pair("Ранее 🌍") + &tool + "\n" + &pair("Latest") + "{partial",
+            pair("Earlier 🌍") + &tool + "\n" + &pair("Latest") + "{partial",
         )
         .unwrap();
         assert_eq!(
@@ -346,7 +346,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .text,
-            "Ранее 🌍"
+            "Earlier 🌍"
         );
         assert!(jsonl(&path, None, Some("Not flushed yet"), codex).is_err());
         assert!(codex(&json!({"type":"response_item","payload":{"type":"message","role":"assistant","channel":"analysis","content":[{"text":"internal"}]}})).is_none());

@@ -139,14 +139,18 @@ impl Settings {
             ),
             (
                 "integrations",
-                "Integrations",
-                "application-x-addon-symbolic",
+                "Agents",
+                "bot",
                 &integrations,
             ),
             ("telegram", "Telegram", "mail-send-symbolic", &telegram),
         ] {
             stack.add_named(pane, id);
-            let image = gtk::Image::from_icon_name(Some(icon), gtk::IconSize::LargeToolbar);
+            let image: gtk::Widget = if icon == "bot" {
+                widgets::agent_icon().upcast()
+            } else {
+                gtk::Image::from_icon_name(Some(icon), gtk::IconSize::LargeToolbar).upcast()
+            };
             let button = gtk::ToolButton::new(Some(&image), Some(title));
             button.set_is_important(true);
             let target = stack.clone();
@@ -348,6 +352,7 @@ impl Settings {
         if *self.integration_signature.borrow() != signature {
             self.integration_signature.replace(signature);
             clear(&self.integrations);
+            self.integrations.pack_start(&widgets::label("Detected agents", "question", false), false, false, 0);
             for row in &state.integrations {
                 let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
                 header.pack_start(

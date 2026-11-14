@@ -5,9 +5,13 @@
 
 This is the living, platform-independent product specification, reverse-engineered from the repository. It describes existing behavior, **not a redesign**. Its baseline is commit `aa1601582edcf768767f23b8d3dd960dfc4a9461`, inspected on 2026-11-02. The pre-existing local `build-number.txt` change is outside this specification. Application code, resources, preferences, and tests were not changed for this work. Copy maintenance on 2026-11-03 translated the architecture document and HTML prototype to English; prototype event logic and native implementations were unchanged. Corresponding copy descriptions below reflect that update.
 
+Visual maintenance on 2026-11-07 adopts the prototype’s monitor layout and glass surface treatment in AppKit; see the [revision ledger](components/glass-surfaces.md) for current tokens, scope and unimplemented differences.
+
+Settings maintenance on 2026-11-12 ports the HTML in-popup navigation to AppKit with real native pane controls. GNOME retains its separate window. See [settings shell](components/settings.md#settings-shell) for the current lifecycle, keyboard contract and regression coverage.
+
 Three frontend implementations are compared throughout:
 
-1. **H — HTML:** [standalone interactive prototype](../../design/previews/monitor-ui.html). Primary reference for visual design and demonstrated interaction intent, including its JavaScript, not just its appearance.
+1. **H — HTML:** [interactive mock host](../../design/previews/monitor-ui.html) for the [HTML prototype component](platforms/html.md). Primary reference for visual design and demonstrated interaction intent, including its JavaScript, not just its appearance.
 2. **M — macOS:** Rust/AppKit. Primary reference for established native behavior, with OS-specific constraints kept separate.
 3. **G — GNOME:** Rust/GTK 3 plus the GNOME Shell extension, including Wayland positioning and activation.
 
@@ -33,6 +37,7 @@ Normative **MUST / MUST NOT** statements are observable contracts backed by the 
 |---|---|
 | [Shared specification](shared.md) | Product boundaries, surfaces, cross-channel invariants, capability model |
 | [State models](state-models.md) | Activity, completion, requests, delivery, history, persistence |
+| [Glass surface revision](components/glass-surfaces.md) | Current H/M surface tokens, acceptance and explicit remaining differences |
 | [Visual foundations](components/foundations.md) | Geometry, typography, colors, icons, motion, theme comparison |
 | [Ambient indicator](components/indicator.md) | Menu bar/panel counts, eyes, selection, tooltip |
 | [Sessions and content](components/sessions.md) | Membership, grouping, sticky icons, header targets, expanded content, footer |
@@ -54,3 +59,7 @@ Architecture remains in [actor architecture](../actor-architecture.md); integrat
 ## Maintaining this specification
 
 Preserve explicit anchor IDs and contract IDs when reorganizing prose. A behavioral change should update its component, acceptance criteria, parity row, and any affected discrepancy. Record the inspected revision and evidence scope. Do not mark a runtime issue verified merely because it was fixed in source. Resolve a conflict only with an explicit decision and evidence; retain a short historical note if it explains platform divergence. Relative source links plus symbols are preferred to volatile line numbers. A developer implementing a new frontend should read shared/state documents first, component contracts next, then platform exceptions and unresolved decisions.
+
+### Session activity schema update — 2026-11-09
+
+The content timeline and connection-capability change is documented in [state models](state-models.md#state-content-timeline) and the separate [implemented activity model](../session-activities.md). Evidence: shared/unit tests, macOS native settings/visual harnesses and an offscreen HTML/WebKit interaction check. GTK consumers were migrated in source; Linux build/runtime verification was unavailable in this environment.

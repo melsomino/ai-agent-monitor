@@ -51,12 +51,25 @@ impl SessionProvider for Claude {
             .map(|mut r| {
                 enrich(&mut r);
                 let mut session = tracking::snapshot(&r);
-                session.approval = requests
-                    .iter()
-                    .filter(|request| request.session_id == r.id)
-                    .max_by_key(|request| request.expires)
-                    .map(approval);
-                if session.approval.is_some() {
+                if let Some((offset, tail)) =
+                    r.transcript.as_deref().and_then(tracking::tail_with_offset)
+                {
+                    let recent = transcript_activities(&tail, offset, session.updated_at);
+                    if !recent.is_empty() {
+                        session.activities.clear();
+                        for activity in recent {
+                            session.upsert_activity(activity);
+                        }
+                    }
+                }
+                session.set_approval(
+                    requests
+                        .iter()
+                        .filter(|request| request.session_id == r.id)
+                        .max_by_key(|request| request.expires)
+                        .map(approval),
+                );
+                if session.approval().is_some() {
                     session.activity = crate::agents::sessions::Activity::Confirmation;
                 }
                 session
@@ -76,7 +89,7 @@ impl SessionProvider for Claude {
         crate::agents::history::jsonl(
             &path,
             before,
-            Some(session.last_message.as_str()),
+            Some(session.last_message()),
             crate::agents::history::claude,
         )
     }
@@ -89,12 +102,12 @@ impl SessionProvider for Claude {
         core::vscode_file_target(session.project_path())
     }
     fn allow(&self, session: &Session) -> bool {
-        let Some(snapshot) = &session.approval else {
+        let Some(snapshot) = &session.approval() else {
             return false;
         };
         let Some(request) = pending::list_for("claude")
             .into_iter()
-            .find(|r| r.session_id == session.id && approval(r) == *snapshot)
+            .find(|r| r.session_id == session.id && approval(r) == **snapshot)
         else {
             return false;
         };
@@ -316,6 +329,61 @@ pub fn install(directory: &Path, executable: &Path) -> Result<bool> {
     temp.write_all(&data)?;
     temp.persist(path)?;
     Ok(true)
+}
+
+fn transcript_activities(
+    input: &str,
+    mut offset: u64,
+    fallback: i64,
+) -> std::collections::VecDeque<crate::domain::session_activity::SessionActivity> {
+    use crate::domain::session_activity::*;
+    let mut result = std::collections::VecDeque::new();
+    for line in input.split_inclusive('\n') {
+        let position = offset;
+        offset += line.len() as u64;
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["isSidechain"] == true || !matches!(v["type"].as_str(), Some("assistant" | "user")) {
+            continue;
+        }
+        let text = if let Some(text) = v["message"]["content"].as_str() {
+            text.to_owned()
+        } else {
+            v["message"]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p["type"] == "text")
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let time = timestamp(&v["timestamp"]).unwrap_or_else(|| seconds(fallback));
+        let id = v["uuid"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("offset:{position}"));
+        upsert(
+            &mut result,
+            SessionActivity::Message(SessionMessage {
+                id: format!("claude-message:{id}"),
+                started_at: time,
+                updated_at: time,
+                role: if v["type"] == "user" {
+                    MessageRole::User
+                } else {
+                    MessageRole::Agent
+                },
+                text: tracking::text(&text),
+                images: vec![],
+            }),
+        );
+    }
+    result
 }
 
 #[cfg(test)]

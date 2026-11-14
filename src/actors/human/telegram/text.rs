@@ -69,9 +69,6 @@ impl Text {
                 entity
             }));
     }
-    pub fn append_limited(&mut self, other: Self, limit: usize) {
-        self.append(other.bounded(limit));
-    }
     pub fn markdown(&mut self, source: &str, limit: usize) {
         self.append(Self::from_markdown(source).bounded(limit));
     }
@@ -212,24 +209,24 @@ mod tests {
     }
     #[test]
     fn nested_styles_and_links_use_utf16_after_removing_markup() {
-        let text = Text::from_markdown("🤖 **Привет *мир*** и [ссылка](https://example.com)");
-        assert_eq!(text.text, "🤖 Привет мир и ссылка");
+        let text = Text::from_markdown("🤖 **Hello *world*** and [link](https://example.com)");
+        assert_eq!(text.text, "🤖 Hello world and link");
         let bold = text.entities.iter().find(|e| e.kind == "bold").unwrap();
         assert_eq!(bold.offset, 3);
-        assert_eq!(span(&text, bold), "Привет мир");
+        assert_eq!(span(&text, bold), "Hello world");
         assert_eq!(
             span(
                 &text,
                 text.entities.iter().find(|e| e.kind == "italic").unwrap()
             ),
-            "мир"
+            "world"
         );
         let link = text
             .entities
             .iter()
             .find(|e| e.kind == "text_link")
             .unwrap();
-        assert_eq!(span(&text, link), "ссылка");
+        assert_eq!(span(&text, link), "link");
         assert_eq!(link.url.as_deref(), Some("https://example.com"));
     }
     #[test]
@@ -244,15 +241,15 @@ mod tests {
     }
     #[test]
     fn truncation_keeps_unicode_and_entities_inside_the_actual_text() {
-        let text = Text::from_markdown("**🤖привет🤖**").bounded(6);
-        assert_eq!(text.text, "🤖при…");
+        let text = Text::from_markdown("**🤖hello🤖**").bounded(6);
+        assert_eq!(text.text, "🤖hel…");
         assert_eq!(text.units, 6);
-        assert_eq!(span(&text, &text.entities[0]), "🤖при");
+        assert_eq!(span(&text, &text.entities[0]), "🤖hel");
         let mut wrapped = Text::default();
-        wrapped.plain("Заголовок 🤖\n");
+        wrapped.plain("Header 🤖\n");
         wrapped.append(text);
         wrapped.plain("\nFooter");
-        assert_eq!(span(&wrapped, &wrapped.entities[0]), "🤖при");
+        assert_eq!(span(&wrapped, &wrapped.entities[0]), "🤖hel");
         let payload = wrapped.payload(json!({"inline_keyboard":[]}));
         assert!(payload.get("parse_mode").is_none());
         assert_eq!(payload["entities"][0]["length"], 5);

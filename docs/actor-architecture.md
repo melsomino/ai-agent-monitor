@@ -1,3 +1,5 @@
+> Implemented content-schema update: sessions now use a bounded `SessionActivity` timeline with independent connection capabilities. See [Session activity model](session-activities.md) for the exact current structures, source identities and retention rules. The conceptual `AgentSession` / `HumanInteraction` schema below describes the earlier actor design; its `last_message` / `human_interaction` fields are not the current Rust `Session` storage schema.
+
 # AI Agent Monitor actor architecture
 
 Status: implemented at the user's request. This document records the agreed contracts and implementation structure. The user performs manual verification of macOS UI behavior.
@@ -64,7 +66,7 @@ An Interactor does not call another Interactor or an Agent Adapter. An Agent Ada
 Monitor owns:
 
 - The list of open sessions and their freshness.
-- Each session's latest message.
+- Each session's bounded typed activity tail; latest-message/request/caption values are projections.
 - Active Human Interactions and their delivery state toward the agent.
 - Application and integration settings, connection state, and usage.
 - Each request's route to its Agent Adapter and current operations.

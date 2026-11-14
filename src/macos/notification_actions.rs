@@ -128,8 +128,8 @@ impl Bindings {
         // snapshot and action category when its context or choices change.
         // An old category must never approve a newly edited command.
         if self.values.get(&key).is_some_and(|binding| {
-            binding.session.approval == session.approval
-                && binding.session.interaction_data == session.interaction_data
+            binding.session.approval() == session.approval()
+                && binding.session.interaction() == session.interaction()
         }) {
             return None;
         }
@@ -191,10 +191,10 @@ mod tests {
             )])))
         );
         assert_eq!(
-            plan.response(3, Some("Мой ответ")),
+            plan.response(3, Some("My answer")),
             Some(Response::Answers(BTreeMap::from([(
                 "q".into(),
-                vec!["Мой ответ".into()]
+                vec!["My answer".into()]
             )])))
         );
         assert!(plan.response(3, Some(" ")).is_none());
@@ -247,39 +247,50 @@ mod tests {
     #[test]
     fn bindings_refresh_changed_context_and_choices_without_repeating_unchanged_requests() {
         use crate::domain::session::{Activity, Approval, Client};
-        let mut session = Session {
-            agent: "codex",
-            id: "chat".into(),
-            title: "Chat".into(),
-            cwd: "/work".into(),
-            workspace: None,
-            git_branch: None,
-            model: None,
-            model_display_name: None,
-            reasoning_effort: None,
-            updated_at: 0,
-            client: Client::VSCode,
-            activity: Activity::Confirmation,
-            last_message: String::new(),
-            images: vec![],
-            interaction_data: question(2),
-            target: None,
-            authoritative: true,
-            approval: Some(Approval {
-                id: "request".into(),
-                body: "Pick".into(),
-                expires: u64::MAX,
-                can_allow: false,
-            }),
+        let mut session = {
+            let mut __session = Session {
+                agent: "codex",
+                id: "chat".into(),
+                title: "Chat".into(),
+                cwd: "/work".into(),
+                workspace: None,
+                git_branch: None,
+                model: None,
+                model_display_name: None,
+                reasoning_effort: None,
+                updated_at: 0,
+                client: Client::VSCode,
+                activity: Activity::Confirmation,
+                target: None,
+                connection: if true {
+                    crate::domain::session::ConnectionState::live(true)
+                } else {
+                    Default::default()
+                },
+                activities: Default::default(),
+            };
+            __session.seed_snapshot(
+                String::new(),
+                vec![],
+                None,
+                Some(Approval {
+                    id: "request".into(),
+                    body: "Pick".into(),
+                    expires: u64::MAX,
+                    can_allow: false,
+                }),
+                question(2),
+            );
+            __session
         };
         let key = session.approval_key().unwrap();
         let mut bindings = Bindings::default();
         let first = bindings.bind(&session).unwrap();
         session.updated_at += 1;
-        session.last_message = "Unrelated progress".into();
+        session.set_last_message("Unrelated progress".into());
         assert!(bindings.bind(&session).is_none());
         assert!(bindings.lookup(&key, &first.category()).is_some());
-        session.interaction_data.command = Some("echo changed".into());
+        session.interaction_mut().command = Some("echo changed".into());
         let second = bindings.bind(&session).unwrap();
         assert!(bindings.lookup(&key, &first.category()).is_none());
         assert_eq!(
@@ -287,10 +298,10 @@ mod tests {
                 .lookup(&key, &second.category())
                 .unwrap()
                 .session
-                .interaction_data,
-            session.interaction_data
+                .interaction(),
+            session.interaction()
         );
-        session.interaction_data.questions[0].choices[0].label = "Updated option".into();
+        session.interaction_mut().questions[0].choices[0].label = "Updated option".into();
         let third = bindings.bind(&session).unwrap();
         assert!(bindings.lookup(&key, &second.category()).is_none());
         assert_eq!(

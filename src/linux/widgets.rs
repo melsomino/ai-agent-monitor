@@ -146,6 +146,27 @@ pub(super) fn rounded(c: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64
     c.arc(x + r, y + r, r, PI, PI + FRAC_PI_2);
     c.close_path();
 }
+pub fn agent_icon() -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::new();
+    area.set_size_request(24, 24);
+    area.connect_draw(|w, c| {
+        let ink = w.style_context().color(gtk::StateFlags::NORMAL);
+        let _ = c.save();
+        c.translate((w.allocated_width() as f64 - 24.0) / 2.0, (w.allocated_height() as f64 - 24.0) / 2.0);
+        c.scale(0.75, 0.75);
+        c.set_source_rgba(ink.red(), ink.green(), ink.blue(), ink.alpha());
+        c.set_line_width(2.0);
+        rounded(c, 6.0, 7.0, 20.0, 17.0, 5.0);
+        let _ = c.stroke();
+        for x in [2.5, 26.0] { rounded(c, x, 12.0, 3.5, 7.0, 1.5); let _ = c.stroke(); }
+        for x in [11.0, 18.0] { rounded(c, x, 14.0, 3.0, 4.0, 1.5); let _ = c.fill(); }
+        c.move_to(16.0, 7.0); c.line_to(16.0, 3.0); let _ = c.stroke();
+        let _ = c.restore();
+        glib::Propagation::Proceed
+    });
+    area
+}
+
 pub fn robot(activity: Activity, started: std::time::Instant) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::new();
     area.set_has_window(false);

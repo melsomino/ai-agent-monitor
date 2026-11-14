@@ -1,0 +1,11 @@
+html,body{margin:0;min-height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body{background:#12101c;color:#f5f2ff}body[data-theme=light]{background:#eee9f2;color:#29243b}.preview-bar{display:flex;align-items:center;gap:10px;height:30px;width:min(460px,100%);margin:auto;background:#627d9b;color:#fff;font-size:11px}.preview-bar>span{margin-left:auto;padding-right:10px}.preview-bar button{border:0;border-radius:8px;padding:3px 8px;background:#ffffff18;color:inherit;font:inherit;cursor:pointer}.working{color:#46f4a1}.finished,.request{border-radius:50%;display:inline-grid;place-items:center;min-width:15px;height:15px;color:#181121;background:#88ceff}.request{background:#ffb84f}iframe{display:block;width:min(460px,100%);height:calc(100vh - 40px);min-height:300px;max-height:1100px;margin:0 auto;border:0;border-radius:22px;box-shadow:0 8px 35px #0004}aside{max-width:410px;margin:12px auto;font-size:12px;color:#aca1bb}[hidden]{display:none!important}
+#show-monitor{display:inline-flex;align-items:center;gap:6px;margin-left:24px}
+.preview-menubar-robot{display:block;flex:0 0 27px;width:27px;height:20px;background:#f3f4f9;mask:url('../../assets/menubar/robots-template.png') center/contain no-repeat}
+
+.preview-theme{position:fixed;top:44px;left:max(12px,calc(50% - 320px));display:flex;flex-direction:column;gap:5px;padding:5px;border:1px solid #a99ac42e;border-radius:12px;background:#292335;color:#ddd4ec}
+.preview-theme button{border:0;border-radius:8px;padding:7px 12px;background:transparent;color:inherit;font:12px -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}
+.preview-theme button[aria-pressed=true]{background:#a994df35;color:#fff}
+.preview-theme button:focus-visible{outline:2px solid #c7b5ff;outline-offset:1px}
+body[data-theme=light] .preview-theme{background:#e7e0ef;color:#554767}
+body[data-theme=light] .preview-theme button[aria-pressed=true]{background:#9c81c83b;color:#30213f}
+@media(max-width:660px){.preview-theme{position:static;width:max-content;flex-direction:row;margin:8px auto}}

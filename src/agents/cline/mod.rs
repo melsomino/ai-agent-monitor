@@ -81,12 +81,25 @@ pub fn parse(session: &mut Session, messages: &Value) {
     let Some(messages) = messages.as_array() else {
         return;
     };
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         if message["type"] == "say"
             && matches!(message["say"].as_str(), Some("text" | "completion_result"))
             && let Some(text) = message["text"].as_str().filter(|s| !s.is_empty())
         {
-            session.last_message = tracking::text(text);
+            use crate::domain::session_activity::*;
+            let time = message["ts"]
+                .as_i64()
+                .map(millis)
+                .unwrap_or_else(|| seconds(session.updated_at));
+            let id = format!("cline-message:{}:{index}", message["ts"]);
+            session.upsert_activity(SessionActivity::Message(SessionMessage {
+                id,
+                started_at: time,
+                updated_at: time,
+                role: MessageRole::Agent,
+                text: tracking::text(text),
+                images: vec![],
+            }));
         }
     }
     let Some(last) = messages.last() else {
@@ -100,12 +113,12 @@ pub fn parse(session: &mut Session, messages: &Value) {
         match last["ask"].as_str() {
             Some("tool" | "command" | "use_mcp_server" | "browser_action_launch") => {
                 session.activity = Activity::Confirmation;
-                session.approval = Some(Approval {
+                session.set_approval(Some(Approval {
                     id: format!("{}:{}", session.id, last["ts"]),
                     body: permission_body(last),
                     expires: u64::MAX,
                     can_allow: false,
-                });
+                }));
             }
             Some(
                 "followup"
@@ -159,7 +172,7 @@ impl SessionProvider for Cline {
             .into_iter()
             .find(|path| path.is_file())
             .ok_or_else(|| anyhow::anyhow!("Task history is unavailable"))?;
-        crate::agents::history::cline(&path, before, Some(session.last_message.as_str()))
+        crate::agents::history::cline(&path, before, Some(session.last_message()))
     }
 
     #[cfg(test)]
@@ -324,24 +337,24 @@ mod tests {
             &serde_json::json!([{"type":"say","say":"text","text":"Reading files"},{"type":"ask","ask":"tool","ts":123,"partial":false,"text":"{\"tool\":\"readFile\",\"path\":\"src/main.rs\"}"}]),
         );
         assert_eq!(session.activity, Activity::Confirmation);
-        assert!(!session.approval.as_ref().unwrap().can_allow);
+        assert!(!session.approval().unwrap().can_allow);
         assert!(!Cline.allow(&session));
         assert!(
             session
-                .approval
+                .approval()
                 .as_ref()
                 .unwrap()
                 .body
                 .contains("src/main.rs")
         );
         session.activity = Activity::Idle;
-        session.approval = None;
+        session.set_approval(None);
         parse(
             &mut session,
             &serde_json::json!([{"type":"ask","ask":"command","ts":124,"partial":false}]),
         );
         assert_eq!(session.activity, Activity::Idle);
-        assert!(session.approval.is_none());
+        assert!(session.approval().is_none());
     }
     #[test]
     fn installer_is_idempotent_and_refuses_to_overwrite_other_hooks() {

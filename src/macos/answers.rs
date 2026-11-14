@@ -127,8 +127,8 @@ impl AnswerForm {
         let key = self.key();
         let active = state.sessions.iter().any(|s| {
             s.key() == self.ivars().session.key()
-                && s.approval.is_some()
-                && s.approval == self.ivars().session.approval
+                && s.approval().is_some()
+                && s.approval() == self.ivars().session.approval()
         });
         if !active {
             if let Some(window) = self.ivars().window.get() {
@@ -143,7 +143,7 @@ impl AnswerForm {
                     .sessions
                     .iter()
                     .find(|s| s.key() == self.ivars().session.key())
-                    .is_some_and(|s| s.authoritative)
+                    .is_some_and(|s| s.authoritative())
                     && !matches!(
                         phase,
                         Some(

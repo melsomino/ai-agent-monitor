@@ -1,5 +1,6 @@
 use super::*;
 pub enum Command {
+    ForgetHistory { client: HistoryClient },
     FinishedSeen {
         completions: HashMap<String, u64>,
     },
@@ -75,6 +76,7 @@ pub enum Command {
 }
 pub(crate) enum AgentCommand {
     Refresh,
+    LiveRefresh,
     SendMessage {
         id: String,
         session: Box<Session>,

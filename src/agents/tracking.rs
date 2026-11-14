@@ -244,54 +244,75 @@ pub fn owner(agent: &str) -> Result<(u32, String, String)> {
     })
 }
 pub fn snapshot(r: &Record) -> Session {
-    Session {
-        authoritative: true,
-        interaction_data: Default::default(),
-        target: None,
-        agent: if r.agent == "claude" {
-            "claude"
-        } else {
-            "cline"
-        },
-        id: r.id.clone(),
-        title: r.title.clone(),
-        cwd: r.cwd.clone(),
-        workspace: None,
-        git_branch: None,
-        model: r.model.clone(),
-        model_display_name: None,
-        reasoning_effort: None,
-        updated_at: (r.updated / 1_000_000_000) as i64,
-        client: if r.client == "vscode" {
-            Client::VSCode
-        } else {
-            Client::Terminal
-        },
-        activity: match r.status.as_str() {
-            "working" => Activity::Working,
-            "confirmation" => Activity::Confirmation,
-            "idle" => Activity::Idle,
-            _ => Activity::Unknown,
-        },
-        last_message: r.last_message.clone(),
-        images: vec![],
-        approval: None,
+    {
+        let mut __session = Session {
+            target: None,
+            agent: if r.agent == "claude" {
+                "claude"
+            } else {
+                "cline"
+            },
+            id: r.id.clone(),
+            title: r.title.clone(),
+            cwd: r.cwd.clone(),
+            workspace: None,
+            git_branch: None,
+            model: r.model.clone(),
+            model_display_name: None,
+            reasoning_effort: None,
+            updated_at: (r.updated / 1_000_000_000) as i64,
+            client: if r.client == "vscode" {
+                Client::VSCode
+            } else {
+                Client::Terminal
+            },
+            activity: match r.status.as_str() {
+                "working" => Activity::Working,
+                "confirmation" => Activity::Confirmation,
+                "idle" => Activity::Idle,
+                _ => Activity::Unknown,
+            },
+            connection: if true {
+                crate::domain::session::ConnectionState::live(false)
+            } else {
+                Default::default()
+            },
+            activities: Default::default(),
+        };
+        if !r.last_message.is_empty() {
+            let time = crate::domain::session_activity::millis((r.updated / 1_000_000) as i64);
+            __session.upsert_activity(crate::domain::session_activity::SessionActivity::Message(
+                crate::domain::session_activity::SessionMessage {
+                    id: format!("hook-message:{}", r.updated),
+                    started_at: time,
+                    updated_at: time,
+                    role: crate::domain::session_activity::MessageRole::Agent,
+                    text: r.last_message.clone(),
+                    images: vec![],
+                },
+            ));
+        }
+        __session
     }
 }
 /// Read a bounded transcript tail. Never trust command output as lifecycle events.
 pub fn tail(path: &Path) -> Option<String> {
+    tail_with_offset(path).map(|(_, text)| text)
+}
+pub fn tail_with_offset(path: &Path) -> Option<(u64, String)> {
     use std::io::{Seek, SeekFrom};
     let mut file = fs::File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
-    let start = length.saturating_sub(2 * 1024 * 1024);
+    let mut start = length.saturating_sub(2 * 1024 * 1024);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut bytes = Vec::new();
     file.take(2 * 1024 * 1024).read_to_end(&mut bytes).ok()?;
     if start > 0 {
         let first = bytes.iter().position(|b| *b == b'\n')?;
         bytes.drain(..=first);
+        start += first as u64 + 1;
     }
-    String::from_utf8(bytes).ok()
+    String::from_utf8(bytes).ok().map(|text| (start, text))
 }
 
 #[cfg(test)]
