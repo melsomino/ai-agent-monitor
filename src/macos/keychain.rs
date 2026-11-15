@@ -69,12 +69,18 @@ fn string(text: &str) -> Owned {
 fn dictionary() -> Owned {
     Owned(unsafe { CFDictionaryCreateMutable(ptr::null(), 0, ptr::null(), ptr::null()) })
 }
-fn query() -> Result<(Owned, Owned, Owned, Symbols)> {
+fn query_for(name: &str) -> Result<(Owned, Owned, Owned, Symbols)> {
     let keys = Symbols::load()?;
     let query = dictionary();
     // Retain the credential namespace across the app's bundle-ID migration.
-    let service = string("local.codex.agent-monitor.notify.telegram");
-    let account = string("bot-token");
+    let service = string(if name == "bot-token" {
+        "local.codex.agent-monitor.notify.telegram"
+    } else if name == "tuna-api-key" {
+        "local.codex.agent-monitor.tuna"
+    } else {
+        "local.codex.agent-monitor.ngrok"
+    });
+    let account = string(name);
     // The dictionary borrows its values. These owned strings live through each call.
     unsafe {
         CFDictionarySetValue(query.0, keys.class, keys.password);
@@ -84,7 +90,10 @@ fn query() -> Result<(Owned, Owned, Owned, Symbols)> {
     Ok((query, service, account, keys))
 }
 pub fn load() -> Result<Option<String>> {
-    let (query, _service, _account, keys) = query()?;
+    load_named("bot-token")
+}
+pub fn load_named(name: &str) -> Result<Option<String>> {
+    let (query, _service, _account, keys) = query_for(name)?;
     let mut result = ptr::null();
     let status = unsafe {
         CFDictionarySetValue(query.0, keys.return_data, keys.boolean_true);
@@ -94,19 +103,22 @@ pub fn load() -> Result<Option<String>> {
         return Ok(None);
     }
     if status != 0 {
-        bail!("Could not read Telegram token from Keychain ({status})");
+        bail!("Could not read credential from Keychain ({status})");
     }
     let data = Owned(result);
     let length = unsafe { CFDataGetLength(data.0) };
     anyhow::ensure!(
-        length > 0 && length <= 256,
-        "Invalid Telegram credential in Keychain"
+        length > 0 && length <= 4096,
+        "Invalid credential in Keychain"
     );
     let bytes = unsafe { std::slice::from_raw_parts(CFDataGetBytePtr(data.0), length as usize) };
     Ok(Some(String::from_utf8(bytes.to_vec())?))
 }
 pub fn save(token: &str) -> Result<()> {
-    let (query, _service, _account, keys) = query()?;
+    save_named("bot-token", token)
+}
+pub fn save_named(name: &str, token: &str) -> Result<()> {
+    let (query, _service, _account, keys) = query_for(name)?;
     let data = Owned(unsafe { CFDataCreate(ptr::null(), token.as_ptr(), token.len() as isize) });
     let attributes = dictionary();
     let status = unsafe {
@@ -120,15 +132,18 @@ pub fn save(token: &str) -> Result<()> {
         }
     };
     if status != 0 {
-        bail!("Could not save Telegram token in Keychain ({status})");
+        bail!("Could not save credential in Keychain ({status})");
     }
     Ok(())
 }
 pub fn delete() -> Result<()> {
-    let (query, _service, _account, _keys) = query()?;
+    delete_named("bot-token")
+}
+pub fn delete_named(name: &str) -> Result<()> {
+    let (query, _service, _account, _keys) = query_for(name)?;
     let status = unsafe { SecItemDelete(query.0) };
     if status != 0 && status != -25300 {
-        bail!("Could not remove Telegram token from Keychain ({status})");
+        bail!("Could not remove credential from Keychain ({status})");
     }
     Ok(())
 }

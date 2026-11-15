@@ -175,6 +175,8 @@ The monitor opens your bot in Telegram. Press **Start** to complete the connecti
 
 The settings screen then shows the connected bot, with options to test it, open it, replace it, or unlink it.
 
+Send `/web_access` to the bot to receive temporary browser connection links when Web access is enabled on your computer.
+
 You can change bots without interrupting the current connection. The old bot remains active until the replacement is successfully connected.
 
 **Your computer must be awake and AI Agent Monitor must be running** for Telegram integration to work.

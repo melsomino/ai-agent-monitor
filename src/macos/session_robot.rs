@@ -24,8 +24,10 @@ pub(super) fn settings_icon() -> Retained<objc2_app_kit::NSImage> {
         NSColor::blackColor().setFill();
         for x in [11.0, 18.0] {
             NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                NSPoint::new(x, 14.0), NSSize::new(3.0, 4.0),
-            )).fill();
+                NSPoint::new(x, 14.0),
+                NSSize::new(3.0, 4.0),
+            ))
+            .fill();
         }
         let antenna = NSBezierPath::bezierPath();
         antenna.moveToPoint(NSPoint::new(16.0, 24.0));
@@ -34,7 +36,8 @@ pub(super) fn settings_icon() -> Retained<objc2_app_kit::NSImage> {
         antenna.stroke();
         objc2::runtime::Bool::YES
     });
-    let image = NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(32.0, 32.0), false, &draw);
+    let image =
+        NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(32.0, 32.0), false, &draw);
     image.setTemplate(true);
     image.setAccessibilityDescription(Some(objc2_foundation::ns_string!("Agents")));
     image
@@ -64,7 +67,7 @@ define_class!(
         fn draw_robot(&self, _dirty: NSRect) {
             NSGraphicsContext::saveGraphicsState_class();
             if self.ivars().hero {
-                draw_hero(self.bounds());
+                draw_hero(self.bounds(), super::visual::is_dark(self));
                 NSGraphicsContext::restoreGraphicsState_class();
                 return;
             }
@@ -186,7 +189,7 @@ fn rounded(x: f64, y: f64, width: f64, height: f64, radius: f64) -> Retained<NSB
 
 // Header artwork follows the prototype mask, gradient and two ambient halos.
 // The small session markers retain their status colors and eye animation.
-fn draw_hero(bounds: NSRect) {
+fn draw_hero(bounds: NSRect, dark: bool) {
     let scale = 40.0 / 22.0;
     let transform = NSAffineTransform::transform();
     transform.translateXBy_yBy(
@@ -208,43 +211,47 @@ fn draw_hero(bounds: NSRect) {
             3.6,
         )));
     }
-    for (blur, rgb, alpha) in [
-        (12.0, [101.0, 80.0, 237.0], 0.53),
-        (3.0, [165.0, 184.0, 255.0], 0.60),
-    ] {
-        NSGraphicsContext::saveGraphicsState_class();
-        let shadow = NSShadow::new();
-        shadow.setShadowOffset(NSSize::new(0.0, 0.0));
-        shadow.setShadowBlurRadius(blur);
-        shadow.setShadowColor(Some(&super::visual::appearance_color(rgb, rgb, alpha)));
-        shadow.set();
-        super::visual::appearance_color([140.0, 117.0, 255.0], [140.0, 117.0, 255.0], 1.0)
-            .setFill();
-        body.fill();
-        NSGraphicsContext::restoreGraphicsState_class();
+    if dark {
+        for (blur, rgb, alpha) in [
+            (12.0, [101.0, 80.0, 237.0], 0.53),
+            (3.0, [165.0, 184.0, 255.0], 0.60),
+        ] {
+            NSGraphicsContext::saveGraphicsState_class();
+            let shadow = NSShadow::new();
+            shadow.setShadowOffset(NSSize::new(0.0, 0.0));
+            shadow.setShadowBlurRadius(blur);
+            shadow.setShadowColor(Some(&super::visual::appearance_color(rgb, rgb, alpha)));
+            shadow.set();
+            super::visual::appearance_color([125.0, 95.0, 226.0], [140.0, 117.0, 255.0], 1.0)
+                .setFill();
+            body.fill();
+            NSGraphicsContext::restoreGraphicsState_class();
+        }
     }
     if let Some(gradient) = super::visual::stops(&[
         (
-            super::visual::appearance_color([162.0, 228.0, 255.0], [162.0, 228.0, 255.0], 1.0),
+            super::visual::appearance_color([101.0, 153.0, 232.0], [162.0, 228.0, 255.0], 1.0),
             0.0,
         ),
         (
-            super::visual::appearance_color([140.0, 117.0, 255.0], [140.0, 117.0, 255.0], 1.0),
+            super::visual::appearance_color([125.0, 95.0, 226.0], [140.0, 117.0, 255.0], 1.0),
             0.75,
         ),
         (
-            super::visual::appearance_color([140.0, 117.0, 255.0], [140.0, 117.0, 255.0], 1.0),
+            super::visual::appearance_color([125.0, 95.0, 226.0], [140.0, 117.0, 255.0], 1.0),
             1.0,
         ),
     ]) {
         gradient.drawInBezierPath_angle(&body, -60.0);
     }
-    let cyan = super::visual::appearance_color([127.0, 231.0, 255.0], [127.0, 231.0, 255.0], 1.0);
-    let shadow = NSShadow::new();
-    shadow.setShadowOffset(NSSize::new(0.0, 0.0));
-    shadow.setShadowBlurRadius(4.0);
-    shadow.setShadowColor(Some(&cyan));
-    shadow.set();
+    let cyan = super::visual::appearance_color([36.0, 126.0, 168.0], [127.0, 231.0, 255.0], 1.0);
+    if dark {
+        let shadow = NSShadow::new();
+        shadow.setShadowOffset(NSSize::new(0.0, 0.0));
+        shadow.setShadowBlurRadius(4.0);
+        shadow.setShadowColor(Some(&cyan));
+        shadow.set();
+    }
     cyan.setFill();
     eyes.fill();
 }

@@ -77,7 +77,7 @@ Long titles remain one line with truncation. Expanded prose wraps; commands use 
 
 H contains an `@supports AccentColor` declaration on the root, but `.aam-stage` defines its own `--aam-blue`. The stage-local token wins; do not claim verified system-accent parity. H field ring is #007AFF70/#409CFF85; M uses native keyboard-focus indicator and custom tracking-time decoration; G uses GTK entry styling.
 
-Filled request/finished discs use dark request ink in H/M; G draws white foreground. M status viewport18 with disc15; G18 with disc16. This is a visual difference, not an instruction to change either.
+Filled request/finished discs use white ink in light appearance and dark ink in dark appearance in H/M; G draws white foreground. M status viewport18 with disc15; G18 with disc16. This is a visual difference, not an instruction to change either.
 
 <a id="visual-motion"></a>
 ## Motion and theme changes

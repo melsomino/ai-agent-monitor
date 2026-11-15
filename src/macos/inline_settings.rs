@@ -30,6 +30,7 @@ struct ActionSurface {
 pub(super) struct Shell {
     pub scroll: Retained<NSScrollView>,
     document: Retained<SettingsDocument>,
+    content: Retained<SettingsDocument>,
     pub back: Retained<NSButton>,
     back_surface: Retained<NSBox>,
     pub tabs: Vec<Retained<NSButton>>,
@@ -53,6 +54,10 @@ impl Shell {
             msg_send![SettingsDocument::alloc(mtm),initWithFrame:rect(0.0,0.0,460.0,420.0)]
         };
         scroll.setDocumentView(Some(&document));
+        let content: Retained<SettingsDocument> = unsafe {
+            msg_send![SettingsDocument::alloc(mtm),initWithFrame:rect(0.0,0.0,460.0,420.0)]
+        };
+        document.addSubview(&content);
         scroll.setHidden(true);
         let back = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -72,20 +77,20 @@ impl Shell {
         back_surface.setCornerRadius(12.0);
         back_surface.setFillColor(&NSColor::clearColor());
         back_surface.setHidden(true);
-        document.addSubview(&back_surface);
-        document.addSubview(&back);
+        content.addSubview(&back_surface);
+        content.addSubview(&back);
         let title = NSTextField::labelWithString(ns_string!("Settings"), mtm);
         title.setFrame(rect(112.0, 21.0, 190.0, 26.0));
         title.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
         title.setTextColor(Some(&super::visual::primary_text_color()));
-        document.addSubview(&title);
+        content.addSubview(&title);
         let version =
             NSTextField::labelWithString(&NSString::from_str(crate::app::core::VERSION), mtm);
         version.setFrame(rect(322.0, 26.0, 114.0, 18.0));
         version.setAlignment(NSTextAlignment::Right);
         version.setFont(Some(&NSFont::systemFontOfSize(10.0)));
         version.setTextColor(Some(&super::visual::tertiary_text_color()));
-        document.addSubview(&version);
+        content.addSubview(&version);
         let mut tabs = Vec::new();
         let mut surfaces = Vec::new();
         let mut labels = Vec::new();
@@ -104,7 +109,7 @@ impl Shell {
             let surface = super::visual::glass_box(mtm, frame, 0);
             surface.setCornerRadius(12.0);
             surface.setFillColor(&NSColor::clearColor());
-            document.addSubview(&surface);
+            content.addSubview(&surface);
             let button = unsafe {
                 NSButton::buttonWithTitle_target_action(
                     &NSString::from_str(name),
@@ -142,22 +147,23 @@ impl Shell {
                     23.0,
                 ));
                 icon.setContentTintColor(Some(&super::visual::secondary_text_color()));
-                document.addSubview(&icon);
+                content.addSubview(&icon);
             }
             let label = NSTextField::labelWithString(&NSString::from_str(name), mtm);
             label.setFrame(rect(frame.origin.x, 108.0, frame.size.width, 18.0));
             label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             label.setAlignment(NSTextAlignment::Center);
             label.setTextColor(Some(&super::visual::secondary_text_color()));
-            document.addSubview(&label);
+            content.addSubview(&label);
             labels.push(label);
-            document.addSubview(&button);
+            content.addSubview(&button);
             tabs.push(button);
             surfaces.push(surface);
         }
         Self {
             scroll,
             document,
+            content,
             back,
             back_surface,
             tabs,
@@ -180,7 +186,7 @@ impl Shell {
             if let Some(old) = self.pane.borrow_mut().take() {
                 old.removeFromSuperview();
             }
-            self.document.addSubview(pane);
+            self.content.addSubview(pane);
             *self.pane.borrow_mut() =
                 unsafe { Retained::retain(pane as *const NSView as *mut NSView) };
         }
@@ -189,12 +195,7 @@ impl Shell {
         pane.setFrame(rect(0.0, 150.0, 460.0, height));
         pane.setHidden(false);
         self.natural_height.set(height + 166.0);
-        self.document.setFrameSize(NSSize::new(
-            460.0,
-            self.natural_height
-                .get()
-                .max(self.scroll.contentView().bounds().size.height),
-        ));
+        self.resize(self.scroll.frame().size);
         if changed || replaced {
             self.scroll
                 .contentView()
@@ -206,7 +207,7 @@ impl Shell {
         fn collect(view: &NSView, buttons: &mut Vec<Retained<NSButton>>) {
             if let Some(button) = view.downcast_ref::<NSButton>() {
                 // Keep checkbox and address radio controls native.
-                if !matches!(button.action(), Some(action) if action == sel!(toggleLogin:) || action == sel!(toggleMenuAnimation:) || action == sel!(selectWebAddress:))
+                if !matches!(button.action(), Some(action) if action == sel!(toggleLogin:) || action == sel!(toggleMenuAnimation:) || action == sel!(selectWebAddress:) || action == sel!(openWebLink:))
                 {
                     // SAFETY: The pane retains this control throughout main-thread decoration.
                     if let Some(button) =
@@ -236,7 +237,11 @@ impl Shell {
                 continue;
             };
             let surface = super::visual::glass_box(self.document.mtm(), button.frame(), 5);
-            surface.setCornerRadius(12.0);
+            surface.setCornerRadius(if matches!(button.action(), Some(action) if action==sel!(toggleRemoteSection:) || action==sel!(copyWebLink:) || action==sel!(renewWebPairing:)) {
+                14.0
+            } else {
+                12.0
+            });
             surface.setFillColor(&super::visual::appearance_color(
                 [226.0, 215.0, 238.0],
                 [68.0, 55.0, 85.0],
@@ -259,9 +264,15 @@ impl Shell {
     pub fn resize(&self, size: NSSize) {
         self.scroll
             .setFrame(rect(0.0, 0.0, size.width, size.height));
-        self.document.setFrameSize(NSSize::new(
+        let height = self.natural_height.get().max(size.height);
+        self.document.setFrameSize(NSSize::new(size.width, height));
+        // Settings retain their compact native form geometry at wider popup
+        // widths. Center the complete surface, including its header and tabs.
+        self.content.setFrame(rect(
+            ((size.width - 460.0) / 2.0).max(0.0),
+            0.0,
             460.0,
-            self.natural_height.get().max(size.height),
+            height,
         ));
     }
     pub fn paint(&self) {
@@ -310,10 +321,20 @@ impl Shell {
         }
         paint(&self.back, &self.back_surface, point, false, false);
         for action in self.actions.borrow().iter() {
-            paint(&action.button, &action.surface, point, false, true);
-            action
-                .button
-                .setContentTintColor(Some(&super::visual::primary_text_color()));
+            paint(
+                &action.button,
+                &action.surface,
+                point,
+                false,
+                !matches!(action.button.action(), Some(action) if action==sel!(toggleRemoteSection:) || action==sel!(copyWebLink:) || action==sel!(renewWebPairing:)),
+            );
+            let icon = matches!(action.button.action(),Some(action) if action==sel!(toggleRemoteSection:) || action==sel!(copyWebLink:) || action==sel!(renewWebPairing:));
+            let color = if icon {
+                super::visual::secondary_text_color()
+            } else {
+                super::visual::primary_text_color()
+            };
+            action.button.setContentTintColor(Some(&color));
         }
         for (index, (button, surface)) in self.tabs.iter().zip(&self.surfaces).enumerate() {
             paint(button, surface, point, index == self.selected.get(), false);

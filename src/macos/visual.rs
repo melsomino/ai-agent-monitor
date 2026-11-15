@@ -105,7 +105,7 @@ fn ellipse_light(
     NSGraphicsContext::restoreGraphicsState_class();
 }
 
-fn is_dark(view: &NSView) -> bool {
+pub(super) fn is_dark(view: &NSView) -> bool {
     // SAFETY: Standard immutable AppKit appearance names.
     unsafe {
         view.effectiveAppearance()
@@ -208,7 +208,7 @@ define_class!(
                 wave.translateXBy_yBy(0.0,BRAND_HEIGHT-offset);
                 wave.scaleXBy_yBy(1.0,-1.0);
                 wave.concat();
-                draw_brand_wave(width);
+                draw_brand_wave(width, is_dark(self));
                 NSGraphicsContext::restoreGraphicsState_class();
             }
             NSGraphicsContext::restoreGraphicsState_class();
@@ -259,7 +259,7 @@ impl MeshView {
     }
 }
 
-fn draw_brand_wave(width: f64) {
+fn draw_brand_wave(width: f64, dark: bool) {
     let upper = brand_wave(width, 0.0);
     upper.lineToPoint(NSPoint::new(width, BRAND_HEIGHT));
     upper.lineToPoint(NSPoint::new(0.0, BRAND_HEIGHT));
@@ -270,7 +270,11 @@ fn draw_brand_wave(width: f64) {
         NSSize::new(124.0 * width / 460.0, 22.0 * 44.0 / 60.0),
         &[
             (
-                appearance_color([219.0, 124.0, 222.0], [219.0, 124.0, 222.0], 0.5),
+                appearance_color(
+                    [199.0, 175.0, 224.0],
+                    [219.0, 124.0, 222.0],
+                    if dark { 0.5 } else { 0.16 },
+                ),
                 0.0,
             ),
             (NSColor::clearColor(), 1.0),
@@ -283,7 +287,11 @@ fn draw_brand_wave(width: f64) {
     gradient(
         &lower,
         &NSColor::clearColor(),
-        &appearance_color([11.0, 9.0, 20.0], [11.0, 9.0, 20.0], 0.58),
+        &appearance_color(
+            [153.0, 133.0, 184.0],
+            [11.0, 9.0, 20.0],
+            if dark { 0.58 } else { 0.07 },
+        ),
         90.0,
     );
     // One narrow contour, rather than two filled shapes sharing a baseline.
@@ -295,23 +303,43 @@ fn draw_brand_wave(width: f64) {
             0.0,
         ),
         (
-            appearance_color([99.0, 65.0, 111.0], [99.0, 65.0, 111.0], 0.35),
+            appearance_color(
+                [99.0, 65.0, 111.0],
+                [99.0, 65.0, 111.0],
+                0.35 * if dark { 1.0 } else { 0.5 },
+            ),
             0.21,
         ),
         (
-            appearance_color([214.0, 130.0, 198.0], [214.0, 130.0, 198.0], 0.85),
+            appearance_color(
+                [214.0, 130.0, 198.0],
+                [214.0, 130.0, 198.0],
+                0.85 * if dark { 1.0 } else { 0.5 },
+            ),
             0.42,
         ),
         (
-            appearance_color([239.0, 171.0, 235.0], [239.0, 171.0, 235.0], 1.0),
+            appearance_color(
+                [239.0, 171.0, 235.0],
+                [239.0, 171.0, 235.0],
+                if dark { 1.0 } else { 0.5 },
+            ),
             0.53,
         ),
         (
-            appearance_color([197.0, 121.0, 243.0], [197.0, 121.0, 243.0], 0.9),
+            appearance_color(
+                [197.0, 121.0, 243.0],
+                [197.0, 121.0, 243.0],
+                0.9 * if dark { 1.0 } else { 0.5 },
+            ),
             0.62,
         ),
         (
-            appearance_color([121.0, 80.0, 194.0], [121.0, 80.0, 194.0], 0.65),
+            appearance_color(
+                [121.0, 80.0, 194.0],
+                [121.0, 80.0, 194.0],
+                0.65 * if dark { 1.0 } else { 0.5 },
+            ),
             0.77,
         ),
         (NSColor::clearColor(), 1.0),
@@ -830,6 +858,10 @@ pub(super) fn primary_text_color() -> Retained<NSColor> {
 pub(super) fn secondary_text_color() -> Retained<NSColor> {
     appearance_color([112.0, 101.0, 127.0], [186.0, 178.0, 209.0], 1.0)
 }
+pub(super) fn request_ink_color() -> Retained<NSColor> {
+    appearance_color([255.0; 3], [51.0, 31.875, 0.0], 1.0)
+}
+
 pub(super) fn request_color() -> Retained<NSColor> {
     appearance_color([203.0, 119.0, 12.0], [255.0, 182.0, 78.0], 1.0)
 }

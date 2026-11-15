@@ -170,6 +170,9 @@ impl Desktop {
         quit.set_can_focus(false);
         bottom.pack_end(&quit, false, false, 0);
         bottom.pack_end(&gear, false, false, 0);
+        let github = gtk::LinkButton::with_label(crate::app::core::PROJECT_URL, "GitHub");
+        github.set_tooltip_text(Some("Open project on GitHub"));
+        bottom.pack_end(&github, false, false, 0);
         footer.pack_start(&bottom, false, false, 0);
         root.pack_end(&footer, false, false, 0);
         let (sender, events) = mpsc::channel();

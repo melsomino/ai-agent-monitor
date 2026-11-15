@@ -1,4 +1,5 @@
 //! Ephemeral pairing and device sessions. Secrets never enter monitor snapshots or logs.
+use super::Ingress;
 use crate::app::ids::nonce;
 use std::{
     collections::HashMap,
@@ -12,6 +13,7 @@ pub struct Device {
     pub name: String,
     pub expires: Instant,
     pub remote: bool,
+    pub ingress: Ingress,
 }
 pub struct Auth {
     pub active: bool,
@@ -40,7 +42,12 @@ impl Auth {
         self.pairing = Some((token.clone(), Instant::now() + PAIR_TTL));
         token
     }
-    pub fn pair(&mut self, token: &str, name: &str, remote: bool) -> Result<(String, Device), &'static str> {
+    pub fn pair(
+        &mut self,
+        token: &str,
+        name: &str,
+        ingress: Ingress,
+    ) -> Result<(String, Device), &'static str> {
         if !self.active
             || !self
                 .pairing
@@ -63,7 +70,8 @@ impl Auth {
             id: u64::from_str_radix(&nonce()[..16], 16).unwrap(),
             name: name.chars().take(80).collect(),
             expires: Instant::now() + DEVICE_TTL,
-            remote,
+            remote: ingress != Ingress::Local,
+            ingress,
         };
         self.devices.insert(secret.clone(), device.clone());
         Ok((secret, device))
@@ -84,17 +92,17 @@ mod tests {
         let mut auth = Auth::default();
         let old = auth.pair_token();
         let token = auth.pair_token();
-        assert!(auth.pair(&old, "phone", false).is_err());
-        assert!(auth.pair("wrong", "phone", false).is_err());
-        let (cookie, _) = auth.pair(&token, "phone", false).unwrap();
-        assert!(auth.pair(&token, "phone", false).is_err());
+        assert!(auth.pair(&old, "phone", Ingress::Local).is_err());
+        assert!(auth.pair("wrong", "phone", Ingress::Local).is_err());
+        let (cookie, _) = auth.pair(&token, "phone", Ingress::Local).unwrap();
+        assert!(auth.pair(&token, "phone", Ingress::Local).is_err());
         assert!(auth.device(&cookie).is_some());
         auth.active = false;
         assert!(auth.device(&cookie).is_none());
         auth.active = true;
         let expired = auth.pair_token();
         auth.pairing.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
-        assert!(auth.pair(&expired, "phone", false).is_err());
+        assert!(auth.pair(&expired, "phone", Ingress::Local).is_err());
         auth.devices.get_mut(&cookie).unwrap().expires = Instant::now() - Duration::from_secs(1);
         assert!(auth.device(&cookie).is_none());
     }

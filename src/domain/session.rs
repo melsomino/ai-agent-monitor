@@ -151,16 +151,21 @@ impl Session {
         self.pending_request_mut().map(|r| &mut r.approval)
     }
     pub fn progress(&self) -> Option<&str> {
-        for a in self.activities.iter().rev() {
-            match a {
-                SessionActivity::Message(m) if m.role == MessageRole::Agent => return None,
-                SessionActivity::Action(a) if a.current && !a.text.trim().is_empty() => {
-                    return Some(&a.text);
+        // The provider marks the current action using source item order. Its
+        // retained start time can precede a later-observed transcript message
+        // (for example while a command waited for approval). Do not infer that
+        // it has been superseded from the merged timeline's timestamp order.
+        self.activities
+            .iter()
+            .rev()
+            .find_map(|activity| match activity {
+                SessionActivity::Action(action)
+                    if action.current && !action.text.trim().is_empty() =>
+                {
+                    Some(action.text.as_str())
                 }
-                _ => {}
-            }
-        }
-        None
+                _ => None,
+            })
     }
     pub fn merge_previous(&mut self, previous: &Session) {
         let pending: Vec<_> = self

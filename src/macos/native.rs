@@ -39,9 +39,18 @@ define_class!(
             // SAFETY: Initialize our state before AppKit creates the shared application.
             unsafe { msg_send![super(this), init] }
         }
+        #[unsafe(method(sendEvent:))]
+        fn send_event(&self, event: &NSEvent) {
+            // SAFETY: Preserve normal event dispatch, then restore the menu edge cursor.
+            unsafe { let _: () = msg_send![super(self), sendEvent: event]; }
+            if let Some(controller) = self.ivars().controller.get() { controller.sync_resize_cursor(); }
+        }
         #[unsafe(method_id(nextEventMatchingMask:untilDate:inMode:dequeue:))]
         fn next_event(&self, mask: NSEventMask, expiration: Option<&NSDate>, mode: &NSRunLoopMode, dequeue: bool) -> Option<Retained<NSEvent>> {
             loop {
+                // AppKit menu tracking may replace the cursor while processing the
+                // previous event. Reapply ours after that work and before waiting.
+                if let Some(controller) = self.ivars().controller.get() { controller.sync_resize_cursor(); }
                 // SAFETY: Preserve AppKit's requested mask, deadline, mode and queue semantics.
                 let event: Option<Retained<NSEvent>> = unsafe {
                     msg_send![super(self), nextEventMatchingMask: mask, untilDate: expiration, inMode: mode, dequeue: dequeue]
@@ -49,6 +58,11 @@ define_class!(
                 let Some(event) = event else { break None; };
                 if dequeue && event.r#type() == NSEventType::KeyDown
                     && self.ivars().controller.get().is_some_and(|c|c.handle_session_key(&event))
+                {
+                    continue;
+                }
+                if dequeue && event.r#type() == NSEventType::LeftMouseDown
+                    && self.ivars().controller.get().is_some_and(|c|c.handle_width_mouse(&event))
                 {
                     continue;
                 }

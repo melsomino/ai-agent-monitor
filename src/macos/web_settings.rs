@@ -1,8 +1,8 @@
 //! In-popup management of the resident web listener. IPC work never blocks AppKit.
 use crate::web::Control;
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
-    runtime::AnyObject, sel,
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    rc::Retained, runtime::AnyObject, sel,
 };
 use objc2_app_kit::*;
 use objc2_foundation::*;
@@ -45,9 +45,24 @@ define_class!(
         }
     }
 );
+define_class!(
+    // SAFETY: Link-only button; AppKit calls cursor setup on the main thread.
+    #[unsafe(super(NSButton))]
+    #[thread_kind=MainThreadOnly]
+    #[derive(Debug)]
+    struct WebLink;
+    unsafe impl NSObjectProtocol for WebLink {}
+    impl WebLink {
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) { self.addCursorRect_cursor(self.bounds(), &NSCursor::pointingHandCursor()); }
+    }
+);
 #[derive(Debug)]
 pub(super) struct State {
     toggle: OnceCell<Retained<NSSwitch>>,
+    ngrok: OnceCell<Retained<super::remote_tunnel_settings::RemoteTunnelSettings>>,
+    tuna: OnceCell<Retained<super::remote_tunnel_settings::RemoteTunnelSettings>>,
+    layout_dirty: Cell<bool>,
     title: OnceCell<Retained<NSTextField>>,
     subtitle: OnceCell<Retained<NSTextField>>,
     remote_note: OnceCell<Retained<NSTextField>>,
@@ -62,6 +77,9 @@ pub(super) struct State {
     devices: OnceCell<Retained<NSTextField>>,
     renew: OnceCell<Retained<NSButton>>,
     copy: OnceCell<Retained<NSButton>>,
+    link: OnceCell<Retained<WebLink>>,
+    separator: OnceCell<Retained<NSBox>>,
+    footer: OnceCell<Retained<NSTextField>>,
     report: RefCell<Value>,
     links: RefCell<Vec<String>>,
     selected: Cell<usize>,
@@ -77,6 +95,9 @@ impl Default for State {
         let (tx, rx) = mpsc::channel();
         Self {
             toggle: OnceCell::new(),
+            ngrok: OnceCell::new(),
+            tuna: OnceCell::new(),
+            layout_dirty: Cell::new(false),
             title: OnceCell::new(),
             subtitle: OnceCell::new(),
             remote_note: OnceCell::new(),
@@ -91,6 +112,9 @@ impl Default for State {
             devices: OnceCell::new(),
             renew: OnceCell::new(),
             copy: OnceCell::new(),
+            link: OnceCell::new(),
+            separator: OnceCell::new(),
+            footer: OnceCell::new(),
             report: RefCell::new(Value::Null),
             links: RefCell::new(vec![]),
             selected: Cell::new(0),
@@ -127,6 +151,11 @@ define_class!(
                     self.ivars().selected.set(index as usize);self.render();
                 }
             }
+        }
+        #[unsafe(method(openWebLink:))]
+        fn open_link(&self,_sender:Option<&AnyObject>){
+            if let Some(link)=self.ivars().links.borrow().get(self.ivars().selected.get())
+                && let Some(url)=NSURL::URLWithString(&NSString::from_str(link)){NSWorkspace::sharedWorkspace().openURL(&url);}
         }
         #[unsafe(method(copyWebLink:))]
         fn copy_link(&self,_sender:Option<&AnyObject>){
@@ -175,6 +204,20 @@ impl WebSettings {
         }
         this.addSubview(&toggle);
         this.ivars().toggle.set(toggle).unwrap();
+        for (provider, storage) in [
+            (
+                super::remote_tunnel_settings::Provider::Ngrok,
+                &this.ivars().ngrok,
+            ),
+            (
+                super::remote_tunnel_settings::Provider::Tuna,
+                &this.ivars().tuna,
+            ),
+        ] {
+            let section = super::remote_tunnel_settings::RemoteTunnelSettings::new(mtm, provider);
+            this.addSubview(&section);
+            storage.set(section).unwrap();
+        }
         let remote_note = label("", rect(24.0, 388.0, 412.0, 28.0), 11.0, false);
         this.ivars().remote_note.set(remote_note).unwrap();
         // Inline choices avoid nesting another tracking menu inside the status menu.
@@ -185,6 +228,7 @@ impl WebSettings {
         let qr: Retained<QrView> = unsafe {
             msg_send![super(QrView::alloc(mtm).set_ivars(QrState::default())),initWithFrame:rect(24.0,88.0,200.0,200.0)]
         };
+        qr.setIdentifier(Some(ns_string!("web-pairing-qr")));
         this.addSubview(&qr);
         this.ivars().qr.set(qr).unwrap();
         let progress = NSProgressIndicator::initWithFrame(
@@ -207,12 +251,12 @@ impl WebSettings {
         this.ivars().note.set(note).unwrap();
         for (text, action, y, storage) in [
             (
-                "New QR code",
+                "arrow.clockwise",
                 sel!(renewWebPairing:),
                 124.0,
                 &this.ivars().renew,
             ),
-            ("Copy link", sel!(copyWebLink:), 88.0, &this.ivars().copy),
+            ("doc.on.doc", sel!(copyWebLink:), 88.0, &this.ivars().copy),
         ] {
             let button = unsafe {
                 NSButton::buttonWithTitle_target_action(
@@ -222,22 +266,75 @@ impl WebSettings {
                     mtm,
                 )
             };
-            button.setFrame(rect(240.0, y, 196.0, 28.0));
+            button.setTitle(ns_string!(""));
+            button.setImage(
+                NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str(text),
+                    None,
+                )
+                .as_deref(),
+            );
+            button.setImagePosition(NSCellImagePosition::ImageOnly);
+            let help = if text == "doc.on.doc" {
+                "Copy link"
+            } else {
+                "Generate new QR code"
+            };
+            button.setToolTip(Some(&NSString::from_str(help)));
+            unsafe {
+                let _: () = msg_send![&*button,setAccessibilityLabel:&*NSString::from_str(help)];
+            }
+            button.setFrame(rect(408.0, y, 28.0, 28.0));
             this.addSubview(&button);
             storage.set(button).unwrap();
         }
         let devices = label("", rect(24.0, 32.0, 412.0, 22.0), 11.0, false);
         this.ivars().devices.set(devices).unwrap();
-        label(
-            "Turning Web access off disconnects all browsers and stops the tunnel.",
+        let footer = label(
+            "Turning Web access off disconnects all browsers and stops the tunnels.",
             rect(24.0, 4.0, 412.0, 26.0),
             10.0,
             false,
         );
+        this.ivars().footer.set(footer).unwrap();
+        let link: Retained<WebLink> =
+            unsafe { msg_send![WebLink::alloc(mtm),initWithFrame:rect(24.0,300.0,376.0,28.0)] };
+        link.setBordered(false);
+        link.setAlignment(NSTextAlignment::Left);
+        link.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        if let Some(cell) = link.cell() {
+            cell.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+        }
+        unsafe {
+            link.setTarget(Some(&*this));
+            link.setAction(Some(sel!(openWebLink:)));
+        }
+        this.addSubview(&link);
+        this.ivars().link.set(link).unwrap();
+        let separator = NSBox::initWithFrame(NSBox::alloc(mtm), rect(24.0, 330.0, 412.0, 1.0));
+        separator.setBoxType(NSBoxType::Separator);
+        this.addSubview(&separator);
+        this.ivars().separator.set(separator).unwrap();
         this.render();
         this
     }
+    pub fn take_layout_changed(&self) -> bool {
+        self.ivars().layout_dirty.replace(false)
+    }
     pub fn poll(&self, visible: bool) {
+        for section in [
+            self.ivars().ngrok.get().unwrap(),
+            self.ivars().tuna.get().unwrap(),
+        ] {
+            if let Some(action) = section.take_action() {
+                self.request(action);
+            }
+        }
+        let section_changed = self.ivars().ngrok.get().unwrap().take_layout_changed()
+            | self.ivars().tuna.get().unwrap().take_layout_changed();
+        if section_changed {
+            self.render();
+        }
         while let Ok(result) = self.ivars().rx.borrow_mut().try_recv() {
             self.ivars().busy.set(false);
             match result {
@@ -308,7 +405,19 @@ impl WebSettings {
         let running = report["running"] == true;
         let toggle = self.ivars().toggle.get().unwrap();
         let error = self.ivars().error.borrow();
-        let remote_text = if !running {
+        let ngrok = &report["ngrok"];
+        let tuna = &report["tuna"];
+        for (section, status) in [
+            (self.ivars().ngrok.get().unwrap(), ngrok),
+            (self.ivars().tuna.get().unwrap(), tuna),
+        ] {
+            section.set_report(status.clone(), self.ivars().busy.get());
+        }
+        let section_height = self.ivars().ngrok.get().unwrap().frame().size.height
+            + self.ivars().tuna.get().unwrap().frame().size.height;
+        let remote_text = if let Some(error) = error.as_deref() {
+            error
+        } else if !running {
             error.as_deref().unwrap_or("")
         } else if let Some(error) = report["tunnel"]["error"].as_str() {
             error
@@ -331,14 +440,49 @@ impl WebSettings {
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect();
-        let address_height = urls.len() as f64 * 28.0;
+        let provider_index = |provider: &Value| {
+            urls.iter().position(|url| {
+                provider["url"]
+                    .as_str()
+                    .is_some_and(|origin| url.trim_end_matches('/') == origin.trim_end_matches('/'))
+            })
+        };
+        let ngrok_index = provider_index(ngrok);
+        let tuna_index = provider_index(tuna);
+        let cloud_index = provider_index(&report["tunnel"]).or_else(|| {
+            urls.iter()
+                .enumerate()
+                .find(|(index, url)| {
+                    Some(*index) != ngrok_index
+                        && Some(*index) != tuna_index
+                        && url.starts_with("https://")
+                })
+                .map(|(index, _)| index)
+        });
+        let mut route_indices = vec![cloud_index];
+        route_indices.extend(
+            (0..urls.len())
+                .filter(|index| {
+                    Some(*index) != ngrok_index
+                        && Some(*index) != tuna_index
+                        && Some(*index) != cloud_index
+                })
+                .map(Some),
+        );
+        let address_height = route_indices.len() as f64 * 34.0;
         let pane_height = if running {
-            380.0 + address_height + if remote_text.is_empty() { 0.0 } else { 40.0 }
+            426.0
+                + address_height
+                + section_height
+                + if remote_text.is_empty() { 0.0 } else { 40.0 }
         } else if error.is_some() {
             132.0
         } else {
             92.0
         };
+        if (self.frame().size.height - pane_height).abs() > 0.5 {
+            self.ivars().layout_dirty.set(true);
+        }
         self.setFrameSize(NSSize::new(460.0, pane_height));
         let title = self.ivars().title.get().unwrap();
         let subtitle = self.ivars().subtitle.get().unwrap();
@@ -346,10 +490,7 @@ impl WebSettings {
         subtitle.setFrameOrigin(NSPoint::new(24.0, pane_height - 68.0));
         toggle.setFrameOrigin(NSPoint::new(394.0, pane_height - 40.0));
         let status = self.ivars().remote_note.get().unwrap();
-        status.setFrameOrigin(NSPoint::new(
-            24.0,
-            if running { 308.0 + address_height } else { 4.0 },
-        ));
+        status.setFrameOrigin(NSPoint::new(24.0, if running { 346.0 } else { 4.0 }));
         let children = self.subviews();
         for index in 0..children.count() {
             let child = children.objectAtIndex(index);
@@ -359,13 +500,27 @@ impl WebSettings {
             child.setHidden(!running && !header);
         }
         status.setHidden(remote_text.is_empty());
-
+        let mut section_top = pane_height - 80.0;
+        for section in [
+            self.ivars().ngrok.get().unwrap(),
+            self.ivars().tuna.get().unwrap(),
+        ] {
+            section_top -= section.frame().size.height;
+            section.setFrameOrigin(NSPoint::new(0.0, section_top));
+            section.setHidden(!running);
+        }
         toggle.setState(if running {
             NSControlStateValueOn
         } else {
             NSControlStateValueOff
         });
         toggle.setEnabled(!self.ivars().busy.get());
+        self.ivars().address_document.get().unwrap().setFrame(rect(
+            24.0,
+            section_top - address_height,
+            412.0,
+            address_height,
+        ));
         let mut old_urls = self.ivars().urls.borrow_mut();
         if *old_urls != urls {
             let selected = old_urls.get(self.ivars().selected.get()).cloned();
@@ -390,46 +545,67 @@ impl WebSettings {
             }
             let height = address_height;
             document.setFrameSize(NSSize::new(412.0, height));
-            for (index, url) in urls.iter().enumerate() {
-                // SAFETY: This pane implements the action and retains every row.
+            for (row, index) in route_indices.iter().enumerate() {
+                let url = index.and_then(|index| urls.get(index));
+                let cloud = row == 0;
+                let name = if cloud {
+                    "Cloudflare"
+                } else {
+                    address_kind(url.unwrap())
+                };
                 let button = unsafe {
                     NSButton::radioButtonWithTitle_target_action(
-                        &NSString::from_str(url),
+                        &NSString::from_str(name),
                         Some(self),
                         Some(sel!(selectWebAddress:)),
                         self.mtm(),
                     )
                 };
-                let y = height - (index + 1) as f64 * 28.0;
-                let hint = address_kind(url);
-                let note = NSTextField::labelWithString(&NSString::from_str(hint), self.mtm());
-                note.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+                let y = height - (row + 1) as f64 * 34.0;
+                let note = NSTextField::labelWithString(ns_string!("ready"), self.mtm());
+                note.setIdentifier(Some(ns_string!("route-status")));
+                note.setFont(Some(&NSFont::systemFontOfSize(12.0)));
                 note.setTextColor(Some(&super::visual::secondary_text_color()));
                 note.setAlignment(NSTextAlignment::Right);
-                note.sizeToFit();
-                let note_width = note.frame().size.width.ceil();
-                note.setFrame(rect(412.0 - note_width, y + 6.0, note_width, 16.0));
-                button.setFrame(rect(0.0, y, 412.0 - note_width - 8.0, 28.0));
-                button.setToolTip(Some(&NSString::from_str(&format!("{url} — {hint}"))));
-                if let Some(cell) = button.cell() {
-                    cell.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
-                }
+                note.setFrame(rect(260.0, y + 6.0, 152.0, 18.0));
                 document.addSubview(&note);
-                button.setTag(index as isize);
+                button.setFrame(rect(0.0, y, 252.0, 28.0));
+                button.setTag(index.map_or(-1, |index| index as isize));
+                button.setToolTip(url.map(|url| NSString::from_str(url)).as_deref());
                 button.setFont(Some(&NSFont::systemFontOfSize(12.0)));
-                button.setContentTintColor(Some(&super::visual::primary_text_color()));
                 document.addSubview(&button);
                 buttons.push(button);
             }
             *old_urls = urls;
         }
-        for (index, button) in self.ivars().addresses.borrow().iter().enumerate() {
-            button.setEnabled(running);
-            button.setState(if index == self.ivars().selected.get() {
+        for button in self.ivars().addresses.borrow().iter() {
+            button.setEnabled(running && button.tag() >= 0);
+            button.setState(if button.tag() == self.ivars().selected.get() as isize {
                 NSControlStateValueOn
             } else {
                 NSControlStateValueOff
             });
+        }
+        for (section, index) in [
+            (self.ivars().ngrok.get().unwrap(), ngrok_index),
+            (self.ivars().tuna.get().unwrap(), tuna_index),
+        ] {
+            section.set_route(index, self.ivars().selected.get(), self);
+        }
+        let document = self.ivars().address_document.get().unwrap();
+        let children = document.subviews();
+        for index in 0..children.count() {
+            if let Some(label) = children.objectAtIndex(index).downcast_ref::<NSTextField>()
+                && label.frame().origin.y > address_height - 34.0
+            {
+                let caption = match report["tunnel"]["status"].as_str() {
+                    Some("connected") => "ready",
+                    Some("starting" | "reconnecting") => "connecting…",
+                    Some("failed") => "connection failed",
+                    _ => "not configured",
+                };
+                label.setStringValue(&NSString::from_str(caption));
+            }
         }
         *self.ivars().links.borrow_mut() = report["pairingLinks"]
             .as_array()
@@ -438,6 +614,80 @@ impl WebSettings {
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect();
         let valid = running && !self.ivars().links.borrow().is_empty();
+        let link = self.ivars().link.get().unwrap();
+        let address = old_urls
+            .get(self.ivars().selected.get())
+            .map(String::as_str)
+            .unwrap_or("");
+        let title = NSString::from_str(address);
+        let attributed =
+            NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &title);
+        unsafe {
+            attributed.addAttribute_value_range(
+                NSForegroundColorAttributeName,
+                &NSColor::linkColor(),
+                NSRange::new(0, title.length()),
+            );
+            attributed.addAttribute_value_range(
+                NSUnderlineStyleAttributeName,
+                &NSNumber::new_i32(1),
+                NSRange::new(0, title.length()),
+            );
+            attributed.addAttribute_value_range(
+                NSFontAttributeName,
+                &NSFont::systemFontOfSize(12.0),
+                NSRange::new(0, title.length()),
+            );
+        }
+        link.setAttributedTitle(&attributed);
+        link.setToolTip(Some(&title));
+        link.setEnabled(valid);
+        link.setFrame(rect(24.0, 298.0, 376.0, 28.0));
+        self.ivars()
+            .copy
+            .get()
+            .unwrap()
+            .setFrame(rect(408.0, 298.0, 28.0, 28.0));
+        self.ivars()
+            .renew
+            .get()
+            .unwrap()
+            .setFrame(rect(408.0, 268.0, 28.0, 28.0));
+        self.ivars()
+            .progress
+            .get()
+            .unwrap()
+            .setFrame(rect(24.0, 276.0, 316.0, 12.0));
+        self.ivars()
+            .remaining
+            .get()
+            .unwrap()
+            .setFrame(rect(348.0, 272.0, 52.0, 20.0));
+        self.ivars()
+            .separator
+            .get()
+            .unwrap()
+            .setFrame(rect(24.0, 334.0, 412.0, 1.0));
+        self.ivars()
+            .qr
+            .get()
+            .unwrap()
+            .setFrame(rect(24.0, 56.0, 200.0, 200.0));
+        self.ivars()
+            .note
+            .get()
+            .unwrap()
+            .setFrame(rect(240.0, 80.0, 196.0, 176.0));
+        self.ivars()
+            .devices
+            .get()
+            .unwrap()
+            .setFrame(rect(24.0, 30.0, 412.0, 18.0));
+        self.ivars()
+            .footer
+            .get()
+            .unwrap()
+            .setFrame(rect(24.0, 4.0, 412.0, 22.0));
         let is_remote = old_urls
             .get(self.ivars().selected.get())
             .is_some_and(|url| url.starts_with("https://"));
@@ -450,7 +700,13 @@ impl WebSettings {
         self.ivars().note.get().unwrap().setStringValue(&NSString::from_str(if !running {
             "Web access is off. Turn it on to connect your phone."
         } else if valid && is_remote {
-            "Scan with your phone’s camera.\n\nWorks outside your Wi-Fi. Traffic passes through Cloudflare.\n\nThe QR code renews automatically."
+            if old_urls.get(self.ivars().selected.get()).is_some_and(|url|ngrok["url"].as_str().is_some_and(|origin|url.trim_end_matches('/')==origin.trim_end_matches('/'))) {
+                "Scan with your phone’s camera.\n\nWorks outside your Wi-Fi. Traffic passes through ngrok.\n\nThe QR code renews automatically."
+            } else if old_urls.get(self.ivars().selected.get()).is_some_and(|url|tuna["url"].as_str().is_some_and(|origin|url.trim_end_matches('/')==origin.trim_end_matches('/'))) {
+                "Scan with your phone’s camera.\n\nWorks outside your Wi-Fi. Traffic passes through Tuna.\n\nThe QR code renews automatically."
+            } else {
+                "Scan with your phone’s camera.\n\nWorks outside your Wi-Fi. Traffic passes through Cloudflare.\n\nThe QR code renews automatically."
+            }
         } else if valid {
             "Scan with your phone’s camera.\n\nSame Wi-Fi network required.\n\nSingle-use link. The QR code renews automatically."
         } else {
@@ -496,11 +752,16 @@ impl WebSettings {
             .get()
             .unwrap()
             .setStringValue(&NSString::from_str(&format!("{seconds} sec")));
-        self.ivars()
-            .copy
-            .get()
-            .unwrap()
-            .setEnabled(running && seconds > 0 && !self.ivars().links.borrow().is_empty());
+        let valid = running
+            && seconds > 0
+            && self
+                .ivars()
+                .links
+                .borrow()
+                .get(self.ivars().selected.get())
+                .is_some();
+        self.ivars().copy.get().unwrap().setEnabled(valid);
+        self.ivars().link.get().unwrap().setEnabled(valid);
         running && (seconds == 0 || self.ivars().links.borrow().is_empty())
     }
     fn draw_qr(&self) {

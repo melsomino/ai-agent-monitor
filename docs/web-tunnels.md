@@ -1,64 +1,41 @@
-# Remote tunnel integration plan
+# Remote tunnel integration
 
-Status: **Cloudflare Quick Tunnel implemented experimentally; other providers planned**. Local HTTP access, pairing, incremental WebSocket updates and compression are implemented separately in [Web access](web-access.md). This document records options and the work required before a public tunnel can be enabled. Enabling Web access in macOS Settings authorizes local access and an automatic Quick Tunnel attempt through one switch. The CLI retains separate local and tunnel commands.
+Status: **Cloudflare Quick Tunnel, embedded ngrok Rust SDK and managed Tuna CLI implemented**. All three can run concurrently. The shared server, pairing, incremental WebSocket transport and compression are documented in [Web access](web-access.md); native/preview presentation is specified in [settings](design/components/settings.md#settings-tunnel-provider).
 
-## Objective and constraints
+## Access paths
 
-Let a phone use the existing browser frontend outside the Mac's LAN, without opening router ports or requiring a public IP on the Mac. The Mac remains the agent/monitor host; it must be awake and connected. A provider outage or a VPN blocking the provider can still interrupt service.
+- The normal HTTP listener exposes the configured local address and usable interface addresses. No tunnel is required on a reachable LAN.
+- Cloudflare uses a managed installed `cloudflared` child, an isolated temporary configuration and HTTP/2 transport. Quick Tunnels need no account but are intended for development/testing and have no uptime guarantee.
+- ngrok uses the official Rust SDK in-process, a personal authtoken in the platform credential store, and an HTTPS endpoint forwarded to its own ephemeral loopback listener. No ngrok executable, CLI configuration or process is used.
+- Tuna uses an installed official CLI with a personal API key from the platform credential store; its inspector and ambient user configuration are disabled.
+- All remote origins appear with LAN/loopback in one address list. QR and Copy link use the selected address. Pairing remains single-use and expires after two minutes.
 
-The first implementation should use the user's own tunnel account. Do not distribute a project-wide provider token inside the application. A future centrally managed offering would need separate device provisioning, credential isolation, billing controls and an operator backend; it is outside this plan.
+Enabling Web access through macOS Settings starts local access, discovers/connects saved ngrok and Tuna credentials and attempts Cloudflare. An unavailable connector or credential never disables the other paths. Web access is off after restarting the monitor; stored ngrok credentials persist. The Mac must be awake and reachable to its providers. Phone and Mac provider reachability are independent.
 
-## Provider choices
+## Lifecycle and authorization contract
 
-| Option | User setup | Integration | Constraints |
-|---|---|---|---|
-| ngrok | Account, authtoken and assigned/configured domain | Official Rust SDK can forward to the existing loopback listener, or an explicitly configured external agent can be used first | Account quotas, HTTP interstitial on Free, HTTPS termination at the provider by default |
-| Cloudflare Quick Tunnel | Installed `cloudflared`; no account/domain | Start a temporary connector and obtain its assigned origin | Development/test only; hostname changes; no uptime guarantee |
-| Named Cloudflare Tunnel | Account, Cloudflare-managed domain and configured tunnel | Use a user-provided connector credential and explicit public origin | More onboarding; standard HTTP proxy terminates public HTTPS at Cloudflare |
-| Tailscale Funnel | Tailscale account/client on host and Funnel configuration | Existing local service forwarded by Tailscale; phone uses a normal browser | Separate system client; Funnel is documented as beta; provider hostname and platform constraints |
+Each provider owns a distinct connector, private ingress, status, public origin and generation. Starting/restarting Cloudflare leaves ngrok untouched; configuring/reconnecting ngrok leaves Cloudflare untouched. A stale completion from an old generation cannot overwrite its replacement or revoke replacement devices.
 
-Provider limits/pricing are external and change independently of this repository. Verify them at implementation time rather than embedding fixed quotas in UI text. References checked 2026-11-14: [ngrok Rust SDK](https://github.com/ngrok/ngrok-rust), [ngrok HTTP/WebSocket/TLS behavior](https://ngrok.com/docs/gateway/endpoints/http), [ngrok pricing](https://ngrok.com/pricing), [Cloudflare Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/), [named Cloudflare setup](https://developers.cloudflare.com/tunnel/get-started/), [Tailscale Funnel](https://tailscale.com/docs/features/tailscale-funnel).
+Local, Cloudflare, ngrok and Tuna browser sessions have separate ingress identities. An exact HTTPS Host/Origin match is required on each provider listener, with Secure cookies and same-origin WSS CSP. No forwarded header can promote LAN traffic to remote authority. All existing command validation, history bounds, image authorization, size/device/socket limits and idempotency rules apply to both public routes.
 
-## Suggested first path
+Provider failure removes only that origin and revokes only that provider's browsers/history cursors. Other browser sessions remain valid. Closing unconfigured startup without a public origin does not rotate a local pairing link. Explicit `web tunnel-stop` stops all public paths; `web stop`/the settings switch stops all paths and revokes all devices. An ngrok SDK session is explicitly closed on cancellation, failure and stop; its forwarding task is aborted. Cloudflare children are stopped on owner drop.
 
-1. Add an explicit external-origin mode, tested with a user-managed tunnel forwarding to a loopback-only listener. This isolates proxy/authentication behavior from SDK lifecycle issues.
-2. Integrate ngrok as an optional provider through its Rust SDK, retaining the same HTTP/command/history server. Confirm current SDK/Axum compatibility, domain provisioning and plan behavior before choosing the dependency/configuration.
-3. Keep direct LAN mode available without a provider account. The Web access settings switch enables all available access paths, including the tunnel. A connector failure leaves LAN access available.
+The status API retains `tunnel` for Cloudflare and adds `ngrok` and `tuna`, including `status`, `url`, `error`, and a `tokenSaved` boolean. `urls` and `pairingLinks` combine all public origins and current local interfaces. No raw provider logs or credentials are included. The public hostname is accepted only from the provider's controlled status stream/SDK and validated against supported HTTPS provider domains. Custom domains are not configured by this integration.
 
-Quick Tunnel is the first implemented experimental provider. ngrok and named-tunnel support remain recommendations, not activated features.
+## Credentials and setup
 
-## Server contract and remaining provider work
+ngrok account onboarding uses the collapsible settings section: Get token opens the dashboard; Connect submits a new secure-field token through authenticated local IPC. The credential is stored separately from Telegram in Keychain (Ubuntu backend: Secret Service). The saved credential is represented only by “stored securely in macOS Keychain”, with Change to open a replacement input. Failed connections can reconnect with it. There is no project-wide provider token or operator backend. SDK network/account errors use static messages rather than raw errors. The CLI accepts no token argument; `web ngrok-start` uses the saved credential.
 
-Implemented for Quick Tunnel: separate loopback ingress, exact configured HTTPS Host/Origin, Secure remote cookies, ingress-scoped devices, remote-only revocation, scoped WSS CSP, managed child lifecycle and automatic selection of the remote QR. The items below remain the review checklist for adding another provider; account/credential setup is not part of Quick Tunnel.
+## Privacy and provider constraints
 
-- Model public origins as exact configured `(scheme, host, port)` values. A local interface address and a public HTTPS origin are different configuration concepts. Retain exact Host and Origin checks; do not replace them with `*` or accept arbitrary forwarded host headers.
-- Trust forwarding metadata only on the designated tunnel ingress. Prefer a separate loopback-only listener or explicit ingress identity so a LAN client cannot spoof `X-Forwarded-Proto`/`X-Forwarded-Host`. Define the provider's forwarding contract and reject ambiguous multi-value headers.
-- Generate pairing links from the accepted public origin. Keep the secret in the fragment and single-use with the existing two-minute expiry. Rotating a QR token must not restart the tunnel or change the public hostname.
-- Use Secure cookies on the public HTTPS route. Keep local HTTP cookies separate and working; prevent host/origin collisions between LAN and tunnel sessions. Define whether disabling the tunnel revokes only its devices or all Web devices before implementation.
-- Permit the exact same-origin WSS connection in the HTTP and document CSP. The client already selects `wss:` when loaded over HTTPS; its reconnect and diff-resync behavior must work through the provider.
-- Apply the same request-context, submission and idempotency validation to public ingress. Preserve device/socket/input/time limits and the read-only image boundary. The external origin must never become an unauthenticated response route.
-- Confirm negotiated WebSocket compression through the tunnel; do not assume a provider compresses or preserves extensions automatically. Measure billed traffic separately from logical JSON sizes and capture no message contents in diagnostics.
-- Keep secrets out of command arguments, URLs in logs, monitor snapshots and diagnostics. Provider configuration belongs in the platform credential store, with the same behavior expected on Ubuntu's credential backend.
+Both standard HTTP tunnel configurations terminate public TLS at the provider. Transport encryption and QR authorization do not provide end-to-end encryption against Cloudflare/ngrok. Provider billing, quotas, account requirements and browser interstitials apply independently; the UI does not embed fixed limits. Actual cellular/VPN availability must be verified from the target networks.
 
-## Proposed settings behavior
+References: [ngrok Rust SDK](https://docs.rs/ngrok/0.19.1/ngrok/), [ngrok HTTP endpoints](https://ngrok.com/docs/gateway/endpoints/http), [Cloudflare Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).
 
-- Use one Web access settings switch for local and available remote paths. A configured provider account does not itself start the server.
-- A provider setup state accepts the user's own credential and origin/domain, with connection verification and an explicit enable action. Preserve the working configuration until a replacement succeeds.
-- Show disabled, connecting, connected, reconnecting and failed states; display the exact active HTTPS origin and an actionable error without exposing credentials.
-- Keep a single QR/address selection model, with clear distinction between LAN and remote addresses. Only show a remote QR after the public route has been verified. Retain the implemented countdown and automatic pairing-token rotation.
-- On tunnel loss, show the unavailable state and reconnect with bounded backoff. On explicit disable/credential removal, stop publishing immediately and revoke access according to the chosen device policy. Local monitoring and Telegram continue to work.
-- Never auto-open firewall/router configuration, disable a VPN, or weaken certificate validation to make a provider connect.
+## Verification and remaining work
 
-Quick Tunnel starts automatically from the single macOS Web access settings switch, with connection/error states and no credential inputs. Other provider-account interactions remain proposed.
+Local tests cover exact Host/Origin, provider-specific cookies, simultaneous address projection, provider-scoped revocation, stale generation protection, pairing rotation, no-credential discovery, compression, history and stale actions. Native renderer tests and the interactive HTML check cover collapsed/expanded/not-configured/connected/failed/reconnect states and themes without accessing user credentials or provider accounts.
 
-## Privacy and provider trust
+Live ngrok connection/forwarding, cellular/VPN reachability, account quota failure, host sleep/wake, browser interstitials and runtime reconnection still require a personal account and manual end-to-end verification. Ubuntu uses the same backend but does not yet expose native token onboarding. Custom/named tunnels, credential removal and startup persistence remain separate future work; do not treat them as implemented.
 
-Standard ngrok HTTPS and Cloudflare HTTP tunnel configurations terminate TLS at their edge. This protects traffic in transit but does not hide application contents from that provider. Existing QR pairing is authorization, not content encryption. Do not describe it as end-to-end encryption.
-
-If hiding content from the relay is required, evaluate an authenticated key-exchange and encrypted-message design separately. A web application delivered by the same intermediary also has a frontend-code trust boundary; simply encrypting API JSON does not make that boundary disappear. Tailscale Funnel has a different TLS termination arrangement; assess each provider's actual transport rather than applying one privacy statement to all of them.
-
-## Acceptance and unresolved decisions
-
-Before release, test from a phone on cellular, with the Mac behind NAT and its ordinary VPN both on and off. Cover provider outage, host sleep/wake, tunnel restart, expired/used QR, revocation, credentials replaced/removed, domain changes, quotas, interstitial behavior, stale answers, duplicate message delivery, image authorization, compression and forced diff resync. Verify an incorrect Host/Origin and spoofed proxy headers fail. Confirm the LAN frontend still works with remote access disabled.
-
-Decisions remaining: initial supported provider; SDK versus external connector; supported plans; manual domain entry versus discovery; startup persistence; device revocation policy by ingress; whether provider-readable HTTP is acceptable; and who owns support/billing if a centrally managed service is later offered. Runtime verification on both macOS and Ubuntu is required before claiming cross-platform support.
+Tuna setup, supported public domains, CLI requirement and live-account verification limits: [Tuna web access](web-access.md#remote-access-with-tuna). Tuna credentials are stored separately and passed through the child environment; no provider-wide shared credential is included. TLS/privacy claims for ngrok/Cloudflare do not automatically apply to Tuna. The official Tuna CLI flags were checked locally; live account forwarding remains unverified without a key.

@@ -18,6 +18,7 @@ final class Check:NSObject,WKNavigationDelegate {
    window.aam.destroy();window.aam=window.AAMMonitor.mount(document.getElementById('aam-ui-preview'),event=>events.push(event));
    const snapshot={version:'preview',theme:'dark',sessions:[],applications:[{id:'vscode',name:'VS Code',icon:''},{id:'terminal',name:'Terminal',icon:''}],usage:[]};
    window.aam.setSnapshot(snapshot);
+   document.querySelector('[data-command="github"]').click();assert(events.at(-1)?.type==='link'&&events.at(-1).url==='https://github.com/melsomino/ai-agent-monitor','GitHub action opens the fixed project URL');
    document.querySelector('[data-command="settings"]').click();await pause(30);
    assert(document.querySelectorAll('[role="tab"]').length===5,'Five settings tabs');
    assert(document.activeElement.classList.contains('aam-settings-screen'),'No automatic Back keyboard focus');
@@ -47,17 +48,52 @@ final class Check:NSObject,WKNavigationDelegate {
     assert(document.querySelectorAll('[data-web-address]').length===2,'Inline local addresses');
     assert(document.querySelector('.aam-web-qr')&&document.querySelector('[data-web-remaining]').textContent==='120 sec','QR and countdown');
     document.querySelector('[data-web-address="http://127.0.0.1:8765/"]').click();action('copy-web');
-    assert(events.at(-1).type==='copy'&&events.at(-1).text.startsWith('http://127.0.0.1:8765/#pair=preview-only-'),'Copy uses selected address');
-    assert(document.querySelector('.aam-web-remote-note').textContent.includes('Connecting'),'Tunnel starts automatically');await pause(850);
-    assert(document.querySelectorAll('[data-web-address]').length===3,'Remote address added');const addresses=document.querySelector('.aam-web-addresses');assert(addresses.scrollHeight<=addresses.clientHeight+1,'Address list must not scroll internally');
+    assert(events.at(-1).type==='copy'&&events.at(-1).text.startsWith('http://127.0.0.1:8765/#pair=preview-only-'),'Copy uses selected address');assert(document.querySelector('.aam-web-link-url').textContent==='http://127.0.0.1:8765/','Visible link omits pairing nonce');const copied=events.at(-1).text;action('open-web');assert(events.at(-1).type==='link'&&events.at(-1).url===copied,'Clickable URL uses same full pairing link');assert(document.querySelector('.aam-web-link-panel').compareDocumentPosition(document.querySelector('.aam-web-pairing'))&Node.DOCUMENT_POSITION_FOLLOWING,'Link and countdown precede QR');
+    assert([...document.querySelectorAll('.aam-web-route')].some(row=>row.textContent.includes('Cloudflare')&&row.textContent.includes('connecting…')),'Tunnel starts automatically');assert(document.querySelectorAll('.aam-web-route').length===5,'All connection methods have one row');assert(document.querySelector('[data-setting-action="toggle-ngrok"]').previousElementSibling.textContent==='ngrok','Disclosure immediately follows provider name');await pause(850);
+    assert(document.querySelectorAll('[data-web-address]').length>=3,'Remote address added');const addresses=document.querySelector('.aam-web-addresses');assert(addresses.scrollHeight<=addresses.clientHeight+1,'Address list must not scroll internally');
     assert(document.querySelector('[data-web-address]:checked').dataset.webAddress.startsWith('https://'),'New HTTPS origin selected');
+    const section=()=>document.querySelector('[data-setting-action="toggle-ngrok"]');
+    if(section().getAttribute('aria-expanded')!=='true')action('toggle-ngrok');
+    if(document.querySelector('.aam-ngrok-token input')){
+      const dashboard=document.querySelector('[data-setting-action="ngrok-dashboard"]');
+      assert(dashboard.querySelector('.aam-token-key')&&dashboard.previousElementSibling.matches('input'),'Key link immediately follows token input');
+      action('ngrok-dashboard');assert(events.at(-1).type==='link'&&events.at(-1).url.includes('dashboard.ngrok.com'),'Dashboard action opens browser');
+      const hint=document.querySelector('.aam-ngrok-storage');assert(hint.textContent==='Will be stored securely in macOS Keychain','Future storage caption');assert(Math.abs(hint.getBoundingClientRect().left-document.querySelector('.aam-ngrok-token input').getBoundingClientRect().left)<1,'Storage caption aligns with token input');
+      const input=document.querySelector('.aam-ngrok-token input');input.value='invalid';input.dispatchEvent(new Event('input',{bubbles:true}));action('connect-ngrok');await pause(850);
+      assert(document.querySelector('.aam-ngrok-status').textContent.includes('connection failed'),'Failed ngrok disclosure status');
+      assert(document.querySelector('.aam-ngrok-saved').textContent.includes('stored securely in macOS Keychain')&&!document.querySelector('.aam-ngrok-token input'),'Saved token is never exposed');
+      assert(document.querySelector('[data-setting-action="connect-ngrok"]').textContent==='Reconnect','Failed connection exposes Reconnect');
+      action('connect-ngrok');await pause(850);
+    }
+    assert(document.querySelector('.aam-ngrok-status').textContent==='ready','ngrok connected disclosure');
+    assert(!document.querySelector('[data-setting-action="connect-ngrok"]'),'Connected saved token has no Connect button');
+    action('change-ngrok-token');const replacement=document.querySelector('.aam-ngrok-token input');assert(replacement&&document.querySelector('[data-setting-action="connect-ngrok"]').disabled,'Change opens empty replacement field');assert(document.querySelector('label[for="aam-ngrok-token"]').getBoundingClientRect().bottom<=replacement.getBoundingClientRect().top,'Token label sits above field');action('cancel-ngrok-token');assert(document.querySelector('.aam-ngrok-saved'),'Cancel preserves saved connection');
+    assert(document.querySelectorAll('[data-web-address]').length>=4,'Both remote addresses and local addresses coexist');
+    document.querySelector('[data-web-address="https://ngrok-preview.example/"]').click();
+    assert(document.querySelector('.aam-web-instructions').textContent.includes('through ngrok'),'ngrok privacy instruction');
+    const cf=document.querySelector('[data-web-address="https://monitor-preview.example/"]');assert(cf,'Cloudflare remains available');cf.click();assert(document.querySelector('.aam-web-instructions').textContent.includes('through Cloudflare'),'Selected route controls privacy instruction');
+    document.querySelector('[data-web-address="https://ngrok-preview.example/"]').click();
+    action('toggle-ngrok');assert(document.querySelector('#aam-ngrok-details').hidden,'Details collapse');action('toggle-ngrok');
+    const tunaSection=()=>document.querySelector('[data-setting-action="toggle-tuna"]');
+    if(tunaSection().getAttribute('aria-expanded')!=='true')action('toggle-tuna');
+    const tunaInput=document.querySelector('.aam-tuna-token input');
+    if(tunaInput){
+      assert(document.querySelector('[data-setting-action="connect-tuna"]').disabled,'Tuna Connect waits for API key');
+      action('tuna-dashboard');assert(events.at(-1).url.startsWith('https://my.tuna.am/api_keys'),'Tuna account link');
+      tunaInput.value='synthetic-tuna-api-key';tunaInput.dispatchEvent(new Event('input',{bubbles:true}));action('connect-tuna');await pause(850);
+    }
+    assert(document.querySelector('.aam-tuna-status').textContent==='ready','Tuna connects independently');
+    assert(document.querySelectorAll('[data-web-address]').length===5,'Three tunnel addresses plus LAN and loopback');
+    document.querySelector('[data-web-address="https://tuna-preview.example/"]').click();action('copy-web');assert(events.at(-1).text.startsWith('https://tuna-preview.example/#pair='),'Tuna pairing link');
+    assert(document.querySelector('.aam-web-instructions').textContent.includes('through Tuna'),'Tuna privacy instruction');
+    action('change-tuna-token');assert(document.querySelector('.aam-tuna-token input'),'Tuna replacement input');action('cancel-tuna-token');assert(document.querySelector('.aam-tuna-saved'),'Cancel preserves Tuna credential');
     const before=document.querySelector('.aam-web-qr path').getAttribute('d');action('renew-web');
     assert(document.querySelector('.aam-web-qr path').getAttribute('d')!==before,'QR renewal changes matrix');
     const now=performance.now.bind(performance);performance.now=()=>now()+121000;const old=document.querySelector('.aam-web-qr path').getAttribute('d');await pause(1500);
     assert(document.querySelector('.aam-web-qr path').getAttribute('d')!==old,'Expired QR renews automatically');
     assert(document.querySelector('[data-web-remaining]').textContent.match(/^11[89] sec$|^120 sec$/),'Countdown restarts');
     assert(document.documentElement.scrollWidth<=innerWidth,'Settings overflow horizontally');
-    assert(document.querySelectorAll('[data-web-address]').length===3,'Local addresses remain available with tunnel');
+    assert(document.querySelectorAll('[data-web-address]').length===5,'Local addresses remain available with all tunnels');
     running().click();assert(!document.querySelector('.aam-web-qr')&&!document.querySelector('[data-web-address]'),'Stop removes all access paths');
     running().click();running().click();await pause(850);assert(!document.querySelector('[data-web-address]'),'Stop during tunnel startup stays stopped');
    }

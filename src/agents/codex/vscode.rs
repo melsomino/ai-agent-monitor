@@ -305,11 +305,24 @@ fn resolve(
     resolve_live(storage, ids, live, cache).workspaces
 }
 
+#[cfg(test)]
 fn resolve_live(
     storage: &Path,
     ids: &HashSet<String>,
     live: &HashMap<PathBuf, HashSet<u32>>,
     cache: &mut HashMap<PathBuf, CachedLog>,
+) -> LiveSessions {
+    resolve_live_with_writers(storage, ids, live, cache, &HashMap::new())
+}
+
+/// A writer is fallback evidence only for its live, current extension host.
+/// Explicit role changes always win, including `none` for a closed chat.
+fn resolve_live_with_writers(
+    storage: &Path,
+    ids: &HashSet<String>,
+    live: &HashMap<PathBuf, HashSet<u32>>,
+    cache: &mut HashMap<PathBuf, CachedLog>,
+    writers: &HashMap<String, HashSet<u32>>,
 ) -> LiveSessions {
     let mut result = LiveSessions {
         complete: true,
@@ -365,6 +378,19 @@ fn resolve_live(
                 {
                     window_roles.insert(id, role);
                 }
+            }
+        }
+        for id in ids {
+            if !window_roles.contains_key(id)
+                && writers.get(id).is_some_and(|parents| parents.contains(pid))
+            {
+                window_roles.insert(
+                    id.clone(),
+                    Role {
+                        timestamp: start.clone(),
+                        name: "owner".into(),
+                    },
+                );
             }
         }
         for (id, role) in window_roles {
@@ -424,6 +450,16 @@ pub fn live_sessions_cached(
     storage: &Path,
     cache: &mut LogCache,
 ) -> Option<LiveSessions> {
+    live_sessions_with_writers(ids, storage, cache, "", Path::new(""))
+}
+
+pub fn live_sessions_with_writers(
+    ids: &HashSet<String>,
+    storage: &Path,
+    cache: &mut LogCache,
+    output: &str,
+    home: &Path,
+) -> Option<LiveSessions> {
     if ids.is_empty() {
         return Some(LiveSessions {
             complete: true,
@@ -435,8 +471,46 @@ pub fn live_sessions_cached(
         return None;
     }
     let live = live_logs(&paths).ok()?;
-    let resolved = resolve_live(storage, ids, &live, &mut cache.0);
+    let resolved = resolve_live_with_writers(
+        storage,
+        ids,
+        &live,
+        &mut cache.0,
+        &writer_parents(output, home),
+    );
     resolved.complete.then_some(resolved)
+}
+
+/// lsof supplies parent identity with the same snapshot as the writable rollout.
+/// Ignore lock files, readers, similarly named tools and incomplete process records.
+fn writer_parents(output: &str, home: &Path) -> HashMap<String, HashSet<u32>> {
+    let mut writers: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut parent = None;
+    let mut codex = false;
+    let mut writable = false;
+    for line in output.lines() {
+        if line.starts_with('p') {
+            parent = None;
+            codex = false;
+            writable = false;
+        } else if let Some(value) = line.strip_prefix('R') {
+            parent = value.parse::<u32>().ok().filter(|pid| *pid > 1);
+        } else if let Some(value) = line.strip_prefix('c') {
+            codex = value == "codex";
+        } else if line.starts_with('f') {
+            writable = false;
+        } else if let Some(value) = line.strip_prefix('a') {
+            writable = value == "u" || value == "w";
+        } else if let Some(value) = line.strip_prefix('n')
+            && codex
+            && writable
+            && let Some(parent) = parent
+            && let Some(id) = super::session_id(Path::new(value), home)
+        {
+            writers.entry(id).or_default().insert(parent);
+        }
+    }
+    writers
 }
 
 #[cfg(test)]
@@ -497,6 +571,68 @@ mod tests {
         let log = host.parent().unwrap().join("openai.chatgpt/Codex.log");
         fs::write(&log, "").unwrap();
         (host, log)
+    }
+
+    #[test]
+    fn rotated_membership_uses_only_a_current_live_hosts_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("Code/User/workspaceStorage");
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let (host, log) = window(&storage, 1, 123, &project);
+        let ids = HashSet::from([CHAT.to_owned()]);
+        let live = HashMap::from([(host.clone(), HashSet::from([123]))]);
+        let writers = HashMap::from([(CHAT.to_owned(), HashSet::from([123]))]);
+        let mut cache = HashMap::new();
+        // A fresh monitor has never seen the membership record, now rotated away.
+        let resolved = resolve_live_with_writers(&storage, &ids, &live, &mut cache, &writers);
+        assert!(resolved.active.contains(CHAT));
+        assert_eq!(resolved.workspaces.get(CHAT), Some(&project));
+        // A transcript alone or a writer owned by another process proves nothing.
+        assert!(
+            resolve_live_with_writers(&storage, &ids, &live, &mut cache, &HashMap::new())
+                .active
+                .is_empty()
+        );
+        let wrong = HashMap::from([(CHAT.to_owned(), HashSet::from([999]))]);
+        assert!(
+            resolve_live_with_writers(&storage, &ids, &live, &mut cache, &wrong)
+                .active
+                .is_empty()
+        );
+        assert!(
+            resolve_live_with_writers(&storage, &ids, &HashMap::new(), &mut cache, &writers)
+                .active
+                .is_empty()
+        );
+        // An explicit closed role defeats even a still-open child writer.
+        fs::write(&log, role(3, CHAT, "none")).unwrap();
+        assert!(
+            resolve_live_with_writers(&storage, &ids, &live, &mut cache, &writers)
+                .active
+                .is_empty()
+        );
+        fs::write(&log, "").unwrap();
+        append(&host, &line(4, "Extension host with pid 456 started"));
+        let restarted = HashMap::from([(host, HashSet::from([456]))]);
+        assert!(
+            resolve_live_with_writers(&storage, &ids, &restarted, &mut cache, &writers)
+                .active
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn writer_parent_evidence_excludes_readers_locks_other_tools_and_stale_process_fields() {
+        let home = Path::new("/example/.codex");
+        let path = format!("/example/.codex/sessions/2026/10/28/rollout-{CHAT}.jsonl");
+        let output = format!(
+            "p10\nR123\nccodex\nf5\nau\nn{path}\np11\nccodex\nf5\nau\nn{path}\np12\nR456\nccodex\nf5\nar\nn{path}\np13\nR789\nccodex-helper\nf5\nau\nn{path}\np14\nR222\nccodex\nf5\nau\nn/example/.codex/thread-writer-locks/{CHAT}.lock\nf6\nar\nn{path}\np15\nR333\nccodex\nf5\nau\nn/another/.codex/sessions/rollout-{CHAT}.jsonl\np16\nR124\nccodex\nf5\naw\nn{path}\n"
+        );
+        assert_eq!(
+            writer_parents(&output, home),
+            HashMap::from([(CHAT.to_owned(), HashSet::from([123, 124]))])
+        );
     }
 
     #[test]

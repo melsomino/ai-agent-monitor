@@ -34,6 +34,14 @@ final class Check:NSObject,WKNavigationDelegate{
    scope.click();if(!code.hidden)throw Error('Scope was not collapsed');
    document.querySelector('[data-response="allow"]').click();
    await until(()=>command,'Approval was not submitted');
+   await until(()=>document.querySelector('.aam-compose-input')&&!document.querySelector('.aam-question'),'Composer not enabled after approval');
+   const message='Please continue.\\nInclude all checks.';
+   let compose=document.querySelector('.aam-compose-input');compose.value=message;compose.dispatchEvent(new Event('input',{bubbles:true}));
+   compose.closest('form').querySelector('button').click();
+   await until(()=>document.getElementById('aam-remote-notice').textContent.includes('Test delivery failure')&&!document.querySelector('.aam-compose-input').disabled,'Failed message did not restore the composer');
+   compose=document.querySelector('.aam-compose-input');if(compose.value!==message)throw Error('Failed message lost its multiline draft');
+   compose.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+   await until(()=>document.querySelector('.aam-compose-input')?.value===''&&!document.querySelector('.aam-compose-input').disabled,'Successful retry did not clear the draft');
    const demo={sessions:[{id:'composer-test',title:'Draft test',appId:'test',app:'Test',status:'idle',expanded:true,activities:[],directory:'/demo',history:{messages:[]}}],usage:[]};
    window.aam.setSnapshot(demo);await pause(50);
    let input=document.querySelector('.aam-compose-input');const compact=input.getBoundingClientRect().height;
@@ -46,7 +54,7 @@ final class Check:NSObject,WKNavigationDelegate{
    if(input.value!==draft||input.selectionStart!==5||input.selectionEnd!==10||document.activeElement!==input)throw Error('Composer resize/redraw lost draft, selection or focus');
    input.value='Short';input.dispatchEvent(new Event('input',{bubbles:true}));await pause(50);
    if(input.getBoundingClientRect().height!==compact)throw Error('Composer did not shrink');
-   return 'Pairing, compressed WebSocket, diffs, history, approval and growing message drafts passed';
+   return 'Pairing, compressed WebSocket, diffs, history, approval, real multiline message send/retry and growing drafts passed';
   """,arguments:[:],in:nil,in:.page){result in
    switch result{case .failure(let error):print("FAIL \(error)");exit(1);case .success(let value):
     print("PASS \(value)");web.takeSnapshot(with:nil){image,error in

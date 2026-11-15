@@ -1376,6 +1376,101 @@ mod tests {
         );
     }
     #[test]
+    fn approval_resume_keeps_current_caption_even_when_item_predates_latest_message() {
+        use crate::domain::session::{Client, ConnectionState, Session};
+        use crate::domain::session_activity::*;
+        let state = json!({"id":"chat","requests":[request()],"threadRuntimeStatus":{"type":"active","activeFlags":["waitingOnApproval"]},"turns":[{"turnId":"turn","turnStartedAtMs":1000,"items":[{"type":"agentMessage","id":"before"},{"type":"commandExecution","id":"command","command":"python3 - <<'PY'\nprint('checks')\nPY","status":"inProgress"}]}]});
+        let mut live = HashMap::from([(
+            "chat".into(),
+            Live {
+                owner: "owner".into(),
+                revision: 1,
+                state: Arc::new(state.clone()),
+            },
+        )]);
+        let (published, observed) = tokio::sync::watch::channel(Arc::new(live.clone()));
+        let (wanted, _requests) = tokio::sync::watch::channel(HashSet::new());
+        let runtime = Runtime {
+            socket: Default::default(),
+            wanted,
+            observed,
+            state: RefCell::new(State::default()),
+            epoch: 0,
+        };
+        let ids = HashSet::from(["chat".into()]);
+        let waiting = runtime.views(&ids).remove("chat").unwrap();
+        assert_eq!(waiting.activity, Activity::Confirmation);
+        let mut session = Session {
+            agent: "codex",
+            id: "chat".into(),
+            title: "Caption regression".into(),
+            cwd: "/demo".into(),
+            workspace: None,
+            git_branch: None,
+            model: None,
+            model_display_name: None,
+            reasoning_effort: None,
+            updated_at: 0,
+            client: Client::VSCode,
+            activity: waiting.activity,
+            target: None,
+            connection: ConnectionState::live(true),
+            activities: waiting.activities,
+        };
+        session.upsert_activity(SessionActivity::Message(SessionMessage {
+            id: "rollout:before".into(),
+            started_at: millis(2000),
+            updated_at: millis(2000),
+            role: MessageRole::Agent,
+            text: "Running the checks next.".into(),
+            images: vec![],
+        }));
+        let mut active = state;
+        active["requests"] = json!([]);
+        active["threadRuntimeStatus"]["activeFlags"] = json!([]);
+        live.get_mut("chat").unwrap().state = Arc::new(active.clone());
+        published.send_replace(Arc::new(live.clone()));
+        let view = runtime.views(&ids).remove("chat").unwrap();
+        session.activity = view.activity;
+        session.observe_activities(view.activities);
+        assert_eq!(
+            session.work_caption(),
+            Some("Running python3 - <<'PY' print('checks') PY")
+        );
+        assert_eq!(
+            session.activities.front().unwrap().started_at(),
+            millis(1000),
+            "retain the original chronological start time"
+        );
+        active["turns"][0]["items"][1]["status"] = json!("completed");
+        active["turns"][0]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"reasoning","id":"empty","summary":[]}));
+        live.get_mut("chat").unwrap().state = Arc::new(active.clone());
+        published.send_replace(Arc::new(live.clone()));
+        let view = runtime.views(&ids).remove("chat").unwrap();
+        session.observe_activities(view.activities);
+        assert_eq!(
+            session.work_caption(),
+            Some("Running python3 - <<'PY' print('checks') PY")
+        );
+        active["turns"][0]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"agentMessage","id":"after"}));
+        live.get_mut("chat").unwrap().state = Arc::new(active);
+        published.send_replace(Arc::new(live));
+        let view = runtime.views(&ids).remove("chat").unwrap();
+        session.observe_activities(view.activities);
+        assert_eq!(
+            session.progress(),
+            None,
+            "a new owner message clears the current caption"
+        );
+    }
+
+    #[test]
     fn owner_wire_patches_retain_the_last_caption_until_the_next_agent_message() {
         fn wire(change: Value) -> Value {
             projection::decode(&serde_json::to_vec(&json!({"params":{"change":change}})).unwrap())

@@ -122,8 +122,8 @@ button:disabled { cursor: default; opacity: .45; }
   #aam-ui-preview .aam-session.is-expanded > .aam-row .aam-toggle .aam-icon { transform: rotate(90deg); }
   #aam-ui-preview .aam-detail { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .18s ease; }
   #aam-ui-preview .aam-session.is-expanded > .aam-detail { grid-template-rows: 1fr; }
-  #aam-ui-preview .aam-clip { overflow: hidden; min-height: 0; visibility: hidden; }
-  #aam-ui-preview .aam-session.is-expanded > .aam-detail > .aam-clip { visibility: visible; }
+  #aam-ui-preview .aam-clip { overflow: hidden; min-height: 0; visibility: hidden; transition: visibility 0s linear .18s; }
+  #aam-ui-preview .aam-session.is-expanded > .aam-detail > .aam-clip { visibility: visible; transition-delay: 0s; }
   #aam-ui-preview .aam-detail-content { position: relative; padding: 2px calc(var(--aam-inset) - 6px) 12px calc(var(--aam-inset) + 23px); }
   #aam-ui-preview .aam-session { position: relative; }
   #aam-ui-preview .aam-session.is-expanded::before { content: ""; position: absolute; left: calc(var(--aam-inset) + 5px); top: calc(var(--aam-header-height, var(--aam-row)) * .5 + 5.8px); bottom: 12px; width: 1px; background: var(--aam-line); mask-image: var(--aam-thread-mask, none); pointer-events: none; }
@@ -524,7 +524,7 @@ button:disabled { cursor: default; opacity: .45; }
 #aam-ui-preview { --aam-session-body:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iLTAuOCAwIDIyIDE2Ij4KICA8IS0tIFNpbmdsZSBmcm9udCByb2JvdCwgdXNpbmcgdGhlIG1lbnUgYmFyIGFzc2V0J3MgaGVhZCwgZWFycyBhbmQgZXllIGdlb21ldHJ5LiAtLT4KICA8cGF0aCBmaWxsPSJibGFjayIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNNi4yIC40aDcuNmE0LjggNC44IDAgMCAxIDQuOCA0Ljh2NS42YTQuOCA0LjggMCAwIDEtNC44IDQuOEg2LjJhNC44IDQuOCAwIDAgMS00LjgtNC44VjUuMkE0LjggNC44IDAgMCAxIDYuMiAuNFptMCAzYTMuMiAzLjIgMCAwIDAtMy4yIDMuMnYyLjhhMy4yIDMuMiAwIDAgMCAzLjIgMy4yaDcuNkEzLjIgMy4yIDAgMCAwIDE3IDkuNFY2LjZhMy4yIDMuMiAwIDAgMC0zLjItMy4yWiIvPgogIDxnIGZpbGw9ImJsYWNrIj4KICAgIDxyZWN0IHg9IjAiIHk9IjQuOSIgd2lkdGg9IjMuMiIgaGVpZ2h0PSI2LjIiIHJ4PSIxLjMiLz4KICAgIDxyZWN0IHg9IjE3LjIiIHk9IjQuOSIgd2lkdGg9IjMuMiIgaGVpZ2h0PSI2LjIiIHJ4PSIxLjMiLz4KICA8L2c+Cjwvc3ZnPgo="); }
 
 /* One glass hover surface for every enabled interactive control. */
-#aam-ui-preview .aam-product :is(button:not(.aam-open):enabled, a[href]):hover,
+#aam-ui-preview .aam-product :is(button:not(.aam-open):enabled, a[href]:not(.aam-web-link-url)):hover,
 #aam-ui-preview .aam-answer:has(input:enabled):hover .aam-answer-text {
   background: var(--aam-hover-surface);
   box-shadow: var(--aam-hover-shadow);
@@ -738,11 +738,11 @@ button:disabled { cursor: default; opacity: .45; }
 #aam-ui-preview .aam-web-addresses label { display:flex; align-items:center; gap:7px; height:28px; font-size:12px; cursor:pointer; }
 #aam-ui-preview .aam-web-addresses span { overflow-wrap:anywhere; }
 #aam-ui-preview .aam-web-addresses input[type=radio] { width:13px; height:13px; flex:0 0 13px; margin:0; padding:0; accent-color:#9382e2; }
-#aam-ui-preview .aam-web-pairing { display:grid; grid-template-columns:minmax(0,200px) minmax(0,1fr); gap:16px; min-height:226px; }
+#aam-ui-preview .aam-web-pairing { display:grid; grid-template-columns:minmax(0,200px) minmax(0,1fr); gap:16px; min-height:0; }
 #aam-ui-preview .aam-web-qr { display:block; width:100%; max-width:200px; aspect-ratio:1; background:white; border-radius:10px; shape-rendering:crispEdges; }
 #aam-ui-preview .aam-web-countdown { display:flex; align-items:center; gap:6px; margin-top:10px; font-size:11px; color:var(--aam-secondary); }
 #aam-ui-preview .aam-web-countdown progress { min-width:0; flex:1; width:100%; height:10px; accent-color:#a18ae8; }
-#aam-ui-preview .aam-web-countdown span { white-space:nowrap; min-width:42px; }
+#aam-ui-preview .aam-web-countdown > [data-web-remaining] { white-space:nowrap; min-width:42px; }
 #aam-ui-preview .aam-web-instructions p { margin:0 0 12px; font-size:12px; color:var(--aam-secondary); line-height:1.45; }
 #aam-ui-preview .aam-web-instructions .aam-action { display:flex; width:100%; margin-top:6px; }
 #aam-ui-preview .aam-settings-screen input:disabled { opacity:.45; cursor:default; }
@@ -759,3 +759,64 @@ button:disabled { cursor: default; opacity: .45; }
 /* All connection addresses participate in the settings document's natural height. */
 #aam-ui-preview .aam-web-addresses { height:auto; overflow:visible; }
 #aam-ui-preview .aam-web-title + .aam-settings-intro { margin-bottom:12px; }
+
+/* The light header uses a soft lavender wash rather than the dark wave's shadow. */
+#aam-ui-preview[data-theme="light"] .aam-wave #aam-wave-shade-0 stop:first-child { stop-color:#9985b8; stop-opacity:.07; }
+#aam-ui-preview[data-theme="light"] .aam-wave #aam-wave-pool-0 stop:first-child { stop-color:#c7afe0; stop-opacity:.20; }
+#aam-ui-preview[data-theme="light"] .aam-wave #aam-wave-pool-0 stop:nth-child(2) { stop-color:#c7afe0; stop-opacity:.08; }
+#aam-ui-preview[data-theme="light"] .aam-wave > g > path { opacity:.12; }
+#aam-ui-preview[data-theme="light"] .aam-wave > path:last-child { opacity:.5; }
+#aam-ui-preview[data-theme="light"] .aam-menu { box-shadow:0 16px 45px #51426b20,inset 0 0 0 1px #ffffff70; }
+
+/* Crisp header artwork and white status ink in light appearance. */
+#aam-ui-preview[data-theme="light"] .aam-brand-robot { filter:none; }
+#aam-ui-preview[data-theme="light"] .aam-brand-robot::before { background:linear-gradient(150deg,#6599e8,#7d5fe2 75%); }
+#aam-ui-preview[data-theme="light"] .aam-brand-robot::after { background:#247ea8; filter:none; }
+#aam-ui-preview[data-theme="light"] .aam-state svg .aam-cutout { fill:white; }
+#aam-ui-preview[data-theme="light"] .aam-request-mark svg > :not(circle) { stroke:white; }
+
+/* Keep quota capsules at their default popup width when the host grows. */
+#aam-ui-preview .aam-usage-windows { width:100%; max-width:428px; margin-inline:auto; }
+
+#aam-ui-preview :is(.aam-ngrok-heading,.aam-tuna-heading) {display:flex;align-items:center;gap:6px;min-height:28px;color:var(--aam-text);}
+#aam-ui-preview :is(.aam-ngrok-status,.aam-tuna-status) {color:var(--aam-secondary);}
+#aam-ui-preview .aam-product :is(.aam-ngrok-disclosure,.aam-tuna-disclosure) {flex:0 0 28px;width:28px;height:28px;min-height:28px;display:grid;place-items:center;padding:0;border:0;border-radius:50%;background:transparent;color:var(--aam-secondary);font:inherit;}
+#aam-ui-preview .aam-product :is(.aam-ngrok-disclosure,.aam-tuna-disclosure):hover {background:var(--aam-hover-surface);box-shadow:var(--aam-hover-shadow);color:var(--aam-text);}
+#aam-ui-preview :is(.aam-ngrok-section,.aam-tuna-section) {margin:12px 0;}
+#aam-ui-preview :is(.aam-ngrok-token,.aam-tuna-token) {margin:12px 0;}
+#aam-ui-preview :is(.aam-ngrok-token-label,.aam-tuna-token-label) {display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;}
+#aam-ui-preview :is(.aam-ngrok-token-row,.aam-tuna-token-row) {display:flex;align-items:center;gap:8px;}
+#aam-ui-preview :is(.aam-ngrok-token-row,.aam-tuna-token-row) input {flex:1;min-width:0;padding:8px 12px;border:1px solid var(--aam-line);border-radius:12px;background:light-dark(#ffffff70,#282231);color:inherit;font:inherit;}
+#aam-ui-preview :is(.aam-ngrok-token,.aam-tuna-token) :is(.aam-ngrok-storage,.aam-tuna-storage) {display:block;margin-top:8px;color:var(--aam-secondary);font-size:11px;}
+#aam-ui-preview :is(.aam-ngrok-dashboard,.aam-tuna-dashboard) {display:flex;align-items:center;justify-content:center;gap:4px;flex:0 0 56px;width:56px;min-width:56px;padding:6px;align-self:center;}
+#aam-ui-preview :is(.aam-ngrok-dashboard,.aam-tuna-dashboard) .aam-icon {width:16px;height:16px;flex:0 0 16px;}
+#aam-ui-preview :is(.aam-ngrok-saved,.aam-tuna-saved) {display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin:12px 0;}
+#aam-ui-preview :is(.aam-ngrok-storage-status,.aam-tuna-storage-status) {color:var(--aam-secondary);}
+
+#aam-ui-preview :is(#aam-ngrok-details,#aam-tuna-details) {position:relative;padding-left:14px;}
+#aam-ui-preview :is(#aam-ngrok-details,#aam-tuna-details)::before {content:"";position:absolute;left:0;top:0;bottom:0;width:1px;background:linear-gradient(to bottom,light-dark(#6d5a9f55,#a3a3e65c) 0%,light-dark(#6d5a9f2e,#8b7fbd2e) 45%,#8b7fbd0d 75%,transparent 100%);pointer-events:none;}
+
+#aam-ui-preview .aam-tuna-dashboard {flex-basis:56px;width:56px;min-width:56px;}
+
+/* Preview connection methods: select the route independently of its settings disclosure. */
+#aam-ui-preview .aam-web-addresses .aam-web-route { display:flex;align-items:center;gap:6px;min-height:34px; }
+#aam-ui-preview .aam-web-addresses .aam-web-route label { gap:9px;height:34px;min-width:0; }
+#aam-ui-preview .aam-web-addresses .aam-web-route small { margin-left:auto; }
+#aam-ui-preview .aam-web-addresses :is(.aam-ngrok-section,.aam-tuna-section) { margin:0; }
+#aam-ui-preview .aam-web-route label:has(input:disabled) { cursor:default; }
+#aam-ui-preview .aam-web-route input:disabled { opacity:1; }
+
+#aam-ui-preview .aam-web-link-panel {border-top:1px solid var(--aam-line);padding-top:8px;margin:10px 0 12px;display:grid;gap:2px;}
+#aam-ui-preview .aam-web-link-row {display:grid;grid-template-columns:minmax(0,1fr) 28px;align-items:center;gap:8px;min-width:0;min-height:28px;font-size:12px;}
+#aam-ui-preview .aam-web-link-url {flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--aam-secondary);}
+#aam-ui-preview .aam-web-link-panel .aam-web-countdown {display:grid;grid-template-columns:minmax(0,1fr) 42px 28px;align-items:center;gap:8px;margin:0;min-height:28px;}
+
+#aam-ui-preview a.aam-web-link-url {color:var(--aam-key-focus);text-decoration:underline;text-underline-offset:2px;cursor:pointer;background:transparent;box-shadow:none;}
+#aam-ui-preview a.aam-web-link-url:focus-visible {outline:2px solid var(--aam-key-focus);outline-offset:3px;border-radius:4px;}
+
+
+#aam-ui-preview .aam-web-link-icon .aam-icon {display:block;width:14px;height:14px;min-width:0;line-height:0;}
+
+#aam-ui-preview .aam-web-footer {margin-top:8px;}
+#aam-ui-preview .aam-web-footer .aam-settings-help {margin:0 0 4px;line-height:1.35;}
+#aam-ui-preview .aam-web-footer small {display:block;line-height:1.35;}

@@ -37,7 +37,6 @@ use std::{
 };
 
 const MENU_WIDTH: f64 = 460.0;
-const LIST_WIDTH: f64 = 438.0;
 
 const SESSION_HEADER_HEIGHT: f64 = session_layout::ROW_HEIGHT;
 const SESSION_TEXT_LEFT: f64 = session_layout::TEXT_LEFT;
@@ -45,11 +44,9 @@ const DETAIL_WIDTH: f64 = session_layout::DETAIL_WIDTH;
 const LIST_BOTTOM_PADDING: f64 = 14.0;
 const SESSION_HOVER_PADDING: f64 = 0.0;
 const SESSION_HEADER_HOVER_LEFT: f64 = SESSION_TEXT_LEFT - 9.0;
-const SESSION_HEADER_HOVER_WIDTH: f64 = LIST_WIDTH - 2.0 * SESSION_HEADER_HOVER_LEFT;
 const MESSAGE_TOP_GAP: f64 = 4.0;
 const BUTTON_HOVER_PADDING: f64 = 0.0;
 const ICON_BUTTON_SIZE: f64 = 28.0;
-const QUESTION_CARD_WIDTH: f64 = DETAIL_WIDTH;
 
 #[derive(Clone, Default)]
 struct MessageHistory {
@@ -152,6 +149,7 @@ fn request_controls(session: &Session) -> Vec<RequestControl> {
 pub struct State {
     monitor: OnceCell<crate::actors::monitor::Handle>,
     revision: Cell<u64>,
+    popup_width: Cell<f64>,
     ui_sender: OnceCell<crate::macos::bridge::Sender>,
     ui_incoming: OnceCell<RefCell<tokio::sync::mpsc::Receiver<crate::macos::bridge::Event>>>,
     forms: RefCell<Vec<Retained<answers::AnswerForm>>>,
@@ -260,6 +258,8 @@ pub struct State {
     focus_answer_on_open: Cell<bool>,
     keyboard_handler: RefCell<Option<hotkey::MenuKeyboard>>,
     pointer_timer: RefCell<Option<Retained<NSTimer>>>,
+    resize_cursor_active: Cell<bool>,
+    previous_menu_application: RefCell<Option<Retained<NSRunningApplication>>>,
     last_pointer: Cell<Option<NSPoint>>,
 }
 
@@ -374,6 +374,12 @@ define_class!(
     unsafe impl NSMenuDelegate for MenuController {
         #[unsafe(method(menuWillOpen:))]
         fn will_open(&self, _menu: &NSMenu) {
+            self.acquire_menu_cursor_owner();
+            if let Some(screen) = self.ivars().status.get().and_then(|s| s.button(self.mtm()))
+                .and_then(|b| b.window()).and_then(|w| w.screen()) {
+                let maximum = (screen.visibleFrame().size.width - 8.0).max(MENU_WIDTH);
+                if self.menu_width() > maximum { self.change_width(maximum); }
+            }
             self.ivars().menu_open.set(true);
             self.ivars().focus_answer_on_open.set(true);
             // NSMenu handles this shortcut as a native key equivalent while it
@@ -389,6 +395,7 @@ define_class!(
         fn did_close(&self, _menu: &NSMenu) {
             self.ivars().menu_open.set(false);
             self.close_panel();
+            self.restore_menu_application();
             self.install_shortcut();
         }
     }
@@ -410,7 +417,7 @@ define_class!(
         }
 
         #[unsafe(method(pollState:))]
-        fn poll_state(&self,_timer:&NSTimer){self.drain_ui();self.receive_sessions();if let Some(web)=self.ivars().web_settings.get(){let height=web.frame().size.height;web.poll(self.ivars().menu_open.get()&&self.ivars().settings_active.get()&&self.ivars().settings_selected.get()==4);if height!=web.frame().size.height{self.layout_settings();}}}
+        fn poll_state(&self,_timer:&NSTimer){self.drain_ui();self.receive_sessions();if let Some(web)=self.ivars().web_settings.get(){let height=web.frame().size.height;web.poll(self.ivars().menu_open.get()&&self.ivars().settings_active.get()&&self.ivars().settings_selected.get()==4);let changed=web.take_layout_changed();if height!=web.frame().size.height||changed{self.layout_settings();}}}
         #[unsafe(method(pollPointer:))]
         fn poll_pointer(&self, _timer: &NSTimer) {
             self.constrain_menu_to_work_area();
@@ -534,6 +541,14 @@ define_class!(
                 self.ivars().acknowledge_finished(&session.key());
                 self.dismiss_menu();
                 self.monitor().open(session);
+            }
+        }
+
+        #[unsafe(method(openProject:))]
+        fn open_project(&self, _sender: Option<&AnyObject>) {
+            self.dismiss_menu();
+            if let Some(url) = NSURL::URLWithString(&NSString::from_str(core::PROJECT_URL)) {
+                NSWorkspace::sharedWorkspace().openURL(&url);
             }
         }
 
@@ -804,14 +819,36 @@ fn pointer_changed(view: &NSView) {
         controller.update_hover();
     }
 }
-fn route_wheel(view: &NSView, event: &NSEvent) {
+pub(super) fn route_wheel(view: &NSView, event: &NSEvent) {
     if let Some(controller) = owner(view) {
         controller.route_scroll(event);
     }
 }
+const RESIZE_EDGE_WIDTH: f64 = 6.0;
+const RESIZE_CORNER_INSET: f64 = 18.0;
+
+fn resize_edge(point: NSPoint, bounds: NSRect) -> Option<bool> {
+    let x = point.x - bounds.origin.x;
+    let y = point.y - bounds.origin.y;
+    if bounds.size.height <= 2.0 * RESIZE_CORNER_INSET
+        || y <= RESIZE_CORNER_INSET
+        || y >= bounds.size.height - RESIZE_CORNER_INSET
+    {
+        return None;
+    }
+    if (0.0..=RESIZE_EDGE_WIDTH).contains(&x) {
+        Some(true)
+    } else if (bounds.size.width - RESIZE_EDGE_WIDTH..=bounds.size.width).contains(&x) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[derive(Default)]
 struct PanelState {
     owner: OnceCell<objc2::rc::Weak<MenuController>>,
+    resize_drag: Cell<Option<(f64, NSRect, bool, f64)>>,
 }
 
 impl std::fmt::Debug for PanelState {
@@ -829,6 +866,33 @@ define_class!(
     struct PanelView;
     unsafe impl NSObjectProtocol for PanelView {}
     impl PanelView {
+        #[unsafe(method(mouseDown:))]
+        fn begin_resize(&self, event: &NSEvent) {
+            if let Some(controller) = self.ivars().owner.get().and_then(|o| o.load()) {
+                controller.handle_width_mouse(event);
+            }
+        }
+        #[unsafe(method(mouseDragged:))]
+        fn drag_resize(&self, _event: &NSEvent) {
+            if let Some((x, frame, left, initial_width)) = self.ivars().resize_drag.get()
+                && let Some(controller) = self.ivars().owner.get().and_then(|o| o.load()) {
+                let delta = NSEvent::mouseLocation().x - x;
+                controller.change_width(initial_width + if left { -delta } else { delta });
+                if let Some(window) = self.window() {
+                    // change_width synchronizes both the item and its native
+                    // host. Only anchor the opposite edge here; do not reuse
+                    // a window/item delta from an earlier native layout.
+                    let mut origin = window.frame().origin;
+                    origin.x = if left { frame.origin.x + frame.size.width - window.frame().size.width } else { frame.origin.x };
+                    window.setFrameOrigin(origin);
+                    controller.constrain_menu_to_work_area();
+                }
+                controller.paint_resize_cursor(true);
+            }
+        }
+        #[unsafe(method(mouseUp:))]
+        fn end_resize(&self, _event: &NSEvent) { self.ivars().resize_drag.set(None); }
+
         #[unsafe(method(drawRect:))]
         fn draw_background(&self, _dirty: NSRect) {
             // Keep the native menu material underneath, but attenuate wallpaper
@@ -850,7 +914,9 @@ define_class!(
             // AppKit can resize the tracking window after our layout and before
             // painting. Extend the fill in that same frame, not on the next tick.
             if let Some(controller) = self.ivars().owner.get().and_then(|owner| owner.load()) {
+                controller.sync_window_width();
                 controller.constrain_menu_to_work_area();
+                controller.sync_backdrop();
                 controller.sync_header_extension();
                 controller.sync_footer_extension();
             }
@@ -862,6 +928,39 @@ define_class!(
         fn wheel(&self, event: &NSEvent) { route_wheel(self,event); }
     }
 );
+impl PanelView {
+    fn track_resize(&self, left: bool) {
+        if let Some(window) = self.window() {
+            self.ivars().resize_drag.set(Some((
+                NSEvent::mouseLocation().x,
+                window.frame(),
+                left,
+                self.bounds().size.width,
+            )));
+            if let Some(controller) = self.ivars().owner.get().and_then(|o| o.load()) {
+                controller.paint_resize_cursor(true);
+            }
+            let app = NSApplication::sharedApplication(self.mtm());
+            while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::LeftMouseDragged | NSEventMask::LeftMouseUp,
+                Some(&NSDate::distantFuture()),
+                ns_string!("NSEventTrackingRunLoopMode"),
+                true,
+            ) {
+                self.drag_resize(sel!(mouseDragged:), &event);
+                if event.r#type() == NSEventType::LeftMouseUp {
+                    break;
+                }
+            }
+            self.ivars().resize_drag.set(None);
+            if let Some(controller) = self.ivars().owner.get().and_then(|o| o.load()) {
+                NSUserDefaults::standardUserDefaults()
+                    .setDouble_forKey(controller.menu_width(), ns_string!("MonitorWindowWidth"));
+                controller.sync_resize_cursor();
+            }
+        }
+    }
+}
 define_class!(
     // SAFETY: Standard NSScrollView override, confined to the main thread.
     #[unsafe(super(NSScrollView))]
@@ -925,7 +1024,7 @@ impl SessionRowView {
             rect(
                 SESSION_HEADER_HOVER_LEFT,
                 frame.size.height - SESSION_HEADER_HEIGHT + 3.0,
-                SESSION_HEADER_HOVER_WIDTH,
+                frame.size.width - 2.0 * SESSION_HEADER_HOVER_LEFT,
                 SESSION_HEADER_HEIGHT - 6.0,
             ),
             15.0,
@@ -1329,7 +1428,7 @@ fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
-fn detail_text_color(approval: bool) -> Retained<NSColor> {
+pub(super) fn detail_text_color(approval: bool) -> Retained<NSColor> {
     let (dark_rgb, light_rgb) = if approval {
         ([245.0, 242.0, 255.0], [41.0, 36.0, 59.0])
     } else {
@@ -1360,6 +1459,70 @@ fn center_label(label: &NSTextField, center_y: f64) {
 }
 
 impl MenuController {
+    fn menu_width(&self) -> f64 {
+        let width = self.ivars().popup_width.get();
+        if width >= MENU_WIDTH {
+            width
+        } else {
+            MENU_WIDTH
+        }
+    }
+    fn list_width(&self) -> f64 {
+        self.menu_width() - 22.0
+    }
+    fn detail_width(&self) -> f64 {
+        DETAIL_WIDTH + self.menu_width() - MENU_WIDTH
+    }
+    fn header_hover_width(&self) -> f64 {
+        self.list_width() - 2.0 * SESSION_HEADER_HOVER_LEFT
+    }
+
+    fn change_width(&self, width: f64) {
+        let maximum = self
+            .ivars()
+            .root
+            .get()
+            .and_then(|v| v.window())
+            .and_then(|w| w.screen())
+            .map_or(1000.0, |s| s.visibleFrame().size.width - 8.0);
+        let width = width.clamp(MENU_WIDTH.min(maximum), maximum).round();
+        if (self.menu_width() - width).abs() < 1.0 {
+            return;
+        }
+        self.ivars().popup_width.set(width);
+        if let Some(menu) = self.ivars().menu.get() {
+            menu.setMinimumWidth(width);
+        }
+        self.render_footer();
+        self.render_rows(&self.ivars().filtered_sessions());
+        self.resize_content(self.ivars().content_height.get());
+    }
+
+    fn sync_window_width(&self) {
+        if !self.ivars().menu_open.get() {
+            return;
+        }
+        let Some(root) = self.ivars().root.get() else {
+            return;
+        };
+        let Some(window) = root.window() else {
+            return;
+        };
+        let width = self.menu_width();
+        // NSMenu caches its widest measured item. Its tracking window can grow
+        // back to that cached width after our custom item has already shrunk.
+        // The controller owns both widths; never add an old window/item delta.
+        root.setAutoresizingMask(NSAutoresizingMaskOptions::ViewNotSizable);
+        let mut frame = window.frame();
+        if (frame.size.width - width).abs() > 0.5 {
+            frame.size.width = width;
+            window.setFrame_display(frame, false);
+        }
+        if (root.frame().size.width - width).abs() > 0.5 {
+            root.setFrameSize(NSSize::new(width, root.frame().size.height));
+        }
+    }
+
     pub fn shutdown(&self) {
         if let Some(timer) = self.ivars().snapshot_timer.get() {
             timer.invalidate();
@@ -1609,6 +1772,36 @@ impl MenuController {
         true
     }
 
+    #[allow(deprecated)] // Explicit user menu actions must also work on older supported macOS.
+    fn acquire_menu_cursor_owner(&self) {
+        let app = NSApplication::sharedApplication(self.mtm());
+        if app.isActive() || self.ivars().previous_menu_application.borrow().is_some() {
+            return;
+        }
+        let own_application = NSRunningApplication::currentApplication();
+        *self.ivars().previous_menu_application.borrow_mut() = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .filter(|previous| previous != &own_application);
+        // NSCursor.set only changes this process's cursor while another app owns
+        // the foreground cursor. Give the open interactive menu that ownership.
+        app.activateIgnoringOtherApps(true);
+    }
+
+    #[allow(deprecated)]
+    fn restore_menu_application(&self) {
+        let previous = self.ivars().previous_menu_application.borrow_mut().take();
+        let own_application = NSRunningApplication::currentApplication();
+        if let Some(previous) = previous
+            && !previous.isTerminated()
+            && NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .is_some_and(|current| current == own_application)
+        {
+            // A user switch to another app wins; never switch back over it.
+            previous.activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
+        }
+    }
+
     fn dismiss_menu(&self) {
         if self.ivars().menu_open.get()
             && let Some(menu) = self.ivars().menu.get()
@@ -1629,6 +1822,7 @@ impl MenuController {
         if let Some(button) = state.status.get().and_then(|item| item.button(self.mtm()))
             && button.window().is_some()
         {
+            self.acquire_menu_cursor_owner();
             // SAFETY: AppKit owns the attached status menu's button action.
             unsafe {
                 button.performClick(None);
@@ -2555,12 +2749,16 @@ impl MenuController {
             badge.setTitlePosition(NSTitlePosition::NoTitle);
             badge.setBorderWidth(0.0);
             badge.setCornerRadius(7.0);
-            badge.setFillColor(&NSColor::systemOrangeColor());
+            badge.setFillColor(&appearance_color(
+                [203.0, 119.0, 12.0],
+                [255.0, 159.0, 10.0],
+                1.0,
+            ));
             content.addSubview(&badge);
             let count = self.label(&content, "", rect(28.0, 0.0, 14.0, 14.0), 10.0, 0.3, false);
             count.setFont(Some(&NSFont::systemFontOfSize(10.0)));
             count.setAlignment(NSTextAlignment::Center);
-            count.setTextColor(Some(&NSColor::blackColor()));
+            count.setTextColor(Some(&appearance_color([255.0; 3], [0.0; 3], 1.0)));
             center_label(&count, height / 2.0);
             let working_count =
                 self.label(&content, "", rect(28.0, 0.0, 14.0, 18.0), 12.0, 0.23, false);
@@ -2578,8 +2776,10 @@ impl MenuController {
             finished_badge.setTitlePosition(NSTitlePosition::NoTitle);
             finished_badge.setBorderWidth(0.0);
             finished_badge.setCornerRadius(7.0);
-            finished_badge.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
-                0.45, 0.78, 1.0, 1.0,
+            finished_badge.setFillColor(&appearance_color(
+                [62.0, 109.0, 185.0],
+                [114.75, 198.9, 255.0],
+                1.0,
             ));
             finished_badge.setHidden(true);
             content.addSubview(&finished_badge);
@@ -2589,8 +2789,10 @@ impl MenuController {
                 .expect("finished badge initialized once");
             let finished_count =
                 self.label(&content, "", rect(28.0, 0.0, 14.0, 14.0), 10.0, 0.4, false);
-            finished_count.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
-                0.07, 0.15, 0.21, 1.0,
+            finished_count.setTextColor(Some(&appearance_color(
+                [255.0; 3],
+                [17.85, 38.25, 53.55],
+                1.0,
             )));
             finished_count.setFont(Some(&NSFont::systemFontOfSize(10.0)));
             finished_count.setAlignment(NSTextAlignment::Center);
@@ -2913,11 +3115,24 @@ impl MenuController {
 
     fn build_menu(&self) {
         let mtm = self.mtm();
+        #[cfg(not(test))]
+        {
+            let saved = NSUserDefaults::standardUserDefaults()
+                .doubleForKey(ns_string!("MonitorWindowWidth"));
+            if saved.is_finite() && saved >= MENU_WIDTH {
+                let maximum =
+                    NSScreen::mainScreen(mtm).map_or(1000.0, |s| s.visibleFrame().size.width - 8.0);
+                self.ivars()
+                    .popup_width
+                    .set(saved.min(maximum).max(MENU_WIDTH));
+            }
+        }
         // NSMenu supplies the system background and owns presentation/dismissal.
         // SAFETY: NSView's initializer is valid for this ivar-free subclass.
         let allocated = PanelView::alloc(mtm).set_ivars(PanelState::default());
-        let view: Retained<PanelView> =
-            unsafe { msg_send![super(allocated),initWithFrame:rect(0.0,0.0,MENU_WIDTH,476.0)] };
+        let view: Retained<PanelView> = unsafe {
+            msg_send![super(allocated),initWithFrame:rect(0.0,0.0,self.menu_width(),476.0)]
+        };
         view.ivars()
             .owner
             .set(objc2::rc::Weak::new(self))
@@ -2931,8 +3146,10 @@ impl MenuController {
             .set(backdrop)
             .expect("backdrop initialized once");
         // SAFETY: OverlayView has no ivars or custom initialization.
-        let toolbar =
-            NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, LIST_WIDTH, BRAND_HEIGHT));
+        let toolbar = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            rect(0.0, 0.0, self.list_width(), BRAND_HEIGHT),
+        );
         let hero = SessionRobot::new(mtm, rect(8.0, 31.0, 40.0, 35.0), Activity::Idle);
         toolbar.addSubview(&hero);
         let title = self.label(
@@ -2959,11 +3176,12 @@ impl MenuController {
         let overview = self.label(
             &toolbar,
             "",
-            rect(61.0, 28.0, LIST_WIDTH - 73.0, 18.0),
+            rect(61.0, 28.0, self.list_width() - 73.0, 18.0),
             11.0,
             0.0,
             true,
         );
+        overview.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
         self.ivars()
             .overview
             .set(overview)
@@ -2971,31 +3189,65 @@ impl MenuController {
         let caption = self.label(&view, "", rect(20.0, 445.0, 286.0, 18.0), 10.0, 0.0, true);
         caption.setHidden(true);
         for (symbol, action, x, tooltip) in [
+            (
+                "github",
+                sel!(openProject:),
+                333.0,
+                "Open project on GitHub",
+            ),
             ("gearshape", sel!(settings:), 366.0, "Settings"),
             ("power", sel!(quit:), 399.0, "Quit AI Agent Monitor"),
         ] {
-            let button =
-                self.action_button(&toolbar, "", action, "", rect(x, 44.0, 28.0, 28.0), false);
-            if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                &NSString::from_str(symbol),
-                Some(&NSString::from_str(tooltip)),
-            ) {
+            let button = self.action_button(
+                &toolbar,
+                "",
+                action,
+                "",
+                rect(x + self.menu_width() - MENU_WIDTH, 44.0, 28.0, 28.0),
+                false,
+            );
+            button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+            if let Some(control) = self.ivars().buttons.borrow().last() {
+                control
+                    .background
+                    .setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+            }
+            let image = if symbol == "github" {
+                Some(
+                    NSImage::initWithData(
+                        NSImage::alloc(),
+                        &NSData::with_bytes(include_bytes!("../../assets/github.svg")),
+                    )
+                    .expect("valid GitHub vector icon"),
+                )
+            } else {
+                NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str(symbol),
+                    Some(&NSString::from_str(tooltip)),
+                )
+            };
+            if let Some(image) = image {
                 image.setTemplate(true);
                 image.setSize(NSSize::new(15.0, 15.0));
                 button.setImage(Some(&image));
             }
             button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
             button.setToolTip(Some(&NSString::from_str(tooltip)));
+            // SAFETY: Every icon-only header control has a public native accessibility label.
+            unsafe {
+                let _: () =
+                    msg_send![&*button, setAccessibilityLabel: &*NSString::from_str(tooltip)];
+            }
         }
         *self.ivars().toolbar_buttons.borrow_mut() =
             std::mem::take(&mut *self.ivars().buttons.borrow_mut());
         // SAFETY: NSView's designated initializer is valid for this subclass.
         let list: Retained<SessionListView> = unsafe {
-            msg_send![SessionListView::alloc(mtm), initWithFrame: rect(0.0, 0.0, LIST_WIDTH, 400.0)]
+            msg_send![SessionListView::alloc(mtm), initWithFrame: rect(0.0, 0.0, self.list_width(), 400.0)]
         };
         // SAFETY: NSScrollView's initializer is valid for this ivar-free subclass.
         let scroll: Retained<SessionScrollView> = unsafe {
-            msg_send![SessionScrollView::alloc(mtm), initWithFrame: rect(11.0, 4.0, LIST_WIDTH, 460.0)]
+            msg_send![SessionScrollView::alloc(mtm), initWithFrame: rect(11.0, 4.0, self.list_width(), 460.0)]
         };
         scroll.setDrawsBackground(false);
         scroll.setHasVerticalScroller(true);
@@ -3007,7 +3259,8 @@ impl MenuController {
         scroll.setHorizontalScrollElasticity(NSScrollElasticity::None);
         scroll.setDocumentView(Some(&list));
         view.addSubview(&scroll);
-        let footer = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, MENU_WIDTH, 36.0));
+        let footer =
+            NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, self.menu_width(), 36.0));
         view.addSubview(&footer);
         self.ivars()
             .footer
@@ -3018,7 +3271,7 @@ impl MenuController {
         view.setPostsFrameChangedNotifications(true);
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("AI Agent Monitor"));
         menu.setAutoenablesItems(false);
-        menu.setMinimumWidth(MENU_WIDTH);
+        menu.setMinimumWidth(self.menu_width());
         menu.setDelegate(Some(ProtocolObject::from_ref(self)));
         // SAFETY: nil action and an empty key equivalent create an inert container item.
         let item = unsafe {
@@ -3148,7 +3401,7 @@ impl MenuController {
 
     fn client_group_heading(&self, client: Client) -> Retained<StatusContentView> {
         let view: Retained<StatusContentView> = unsafe {
-            msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, LIST_WIDTH, 26.0)]
+            msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, self.list_width(), 26.0)]
         };
         let icon = self.client_icon(client);
         icon.setFrame(rect(session_layout::ICON_LEFT + 2.0, 3.0, 20.0, 20.0));
@@ -3173,7 +3426,12 @@ impl MenuController {
         let line_x = SESSION_TEXT_LEFT + name.frame().size.width + 12.0;
         let divider = NSBox::initWithFrame(
             NSBox::alloc(self.mtm()),
-            rect(line_x, 13.0, (LIST_WIDTH - line_x - 12.0).max(0.0), 0.5),
+            rect(
+                line_x,
+                13.0,
+                (self.list_width() - line_x - 12.0).max(0.0),
+                0.5,
+            ),
         );
         divider.setBoxType(NSBoxType::Custom);
         divider.setTitlePosition(NSTitlePosition::NoTitle);
@@ -3236,7 +3494,7 @@ impl MenuController {
     fn status_icon(&self, view: &NSView, activity: Activity, finished: bool, y: f64) {
         if activity == Activity::Working {
             let disc: Retained<WorkingStatusView> = unsafe {
-                msg_send![WorkingStatusView::alloc(self.mtm()), initWithFrame: rect(LIST_WIDTH - 61.0, y - 1.0, 18.0, 18.0)]
+                msg_send![WorkingStatusView::alloc(self.mtm()), initWithFrame: rect(self.list_width() - 61.0, y - 1.0, 18.0, 18.0)]
             };
             disc.setToolTip(Some(ns_string!("Working")));
             view.addSubview(&disc);
@@ -3252,11 +3510,11 @@ impl MenuController {
             let ink = if is_finished {
                 appearance_color([255.0; 3], [21.0, 49.0, 73.0], 1.0)
             } else {
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.2, 0.125, 0.0, 1.0)
+                visual::request_ink_color()
             };
             // Match the preview's 18-point symbol viewport and 15-point disc.
             let disc: Retained<StatusContentView> = unsafe {
-                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(LIST_WIDTH - 61.0, y - 1.0, 18.0, 18.0)]
+                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(self.list_width() - 61.0, y - 1.0, 18.0, 18.0)]
             };
             let circle = NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(1.5, 1.5, 15.0, 15.0));
             circle.setBoxType(NSBoxType::Custom);
@@ -3306,7 +3564,7 @@ impl MenuController {
             Some(&NSString::from_str(activity.label())),
         ) {
             image.setTemplate(true);
-            let frame = rect(LIST_WIDTH - 59.0, y + 1.0, 14.0, 14.0);
+            let frame = rect(self.list_width() - 59.0, y + 1.0, 14.0, 14.0);
             let icon = NSImageView::imageViewWithImage(&image, self.mtm());
             icon.setFrame(frame);
             icon.setContentTintColor(Some(&color));
@@ -3905,6 +4163,7 @@ impl MenuController {
     }
 
     fn stop_pointer_tracking(&self) {
+        self.paint_resize_cursor(false);
         if let Some(timer) = self.ivars().pointer_timer.borrow_mut().take() {
             timer.invalidate();
         }
@@ -3912,7 +4171,59 @@ impl MenuController {
         self.clear_hover();
     }
 
+    #[allow(deprecated)] // Keep the horizontal resize cursor on older supported macOS versions.
+    fn paint_resize_cursor(&self, active: bool) {
+        let was_active = self.ivars().resize_cursor_active.replace(active);
+        if !active && !was_active {
+            return;
+        }
+        let cursor = NSCursor::resizeLeftRightCursor();
+        if active {
+            // Native menu tracking does not reliably honor NSView cursor rects.
+            cursor.set();
+        } else if was_active && NSCursor::currentCursor() == cursor {
+            // Only release the cursor we own; leave native text/link cursors alone.
+            NSCursor::arrowCursor().set();
+        }
+    }
+
+    /// Handle the tracking window's real edges before NSMenu consumes its gutters.
+    pub(super) fn handle_width_mouse(&self, event: &NSEvent) -> bool {
+        if !self.ivars().menu_open.get() || event.r#type() != NSEventType::LeftMouseDown {
+            return false;
+        }
+        let Some(root) = self.ivars().root.get() else {
+            return false;
+        };
+        let Some(window) = root.window() else {
+            return false;
+        };
+        if event
+            .window(self.mtm())
+            .is_some_and(|other| other.windowNumber() != window.windowNumber())
+        {
+            return false;
+        }
+        let Some(left) = resize_edge(NSEvent::mouseLocation(), window.frame()) else {
+            return false;
+        };
+        root.track_resize(left);
+        true
+    }
+
+    pub(super) fn sync_resize_cursor(&self) {
+        let active = self.ivars().menu_open.get()
+            && self.ivars().root.get().is_some_and(|root| {
+                root.ivars().resize_drag.get().is_some()
+                    || root.window().is_some_and(|window| {
+                        resize_edge(NSEvent::mouseLocation(), window.frame()).is_some()
+                    })
+            });
+        self.paint_resize_cursor(active);
+    }
+
     fn sample_pointer(&self) {
+        self.sync_resize_cursor();
         let state = self.ivars();
         if state.settings_active.get() {
             if let Some(shell) = state.settings_shell.get() {
@@ -4201,7 +4512,7 @@ impl MenuController {
                         .as_ref()
                         .and_then(|row| row.ivars().background.get())
                         .map(|background| background.frame().size.width)
-                        .unwrap_or(SESSION_HEADER_HOVER_WIDTH),
+                        .unwrap_or(self.header_hover_width()),
                     height: SESSION_HEADER_HEIGHT + SESSION_HOVER_PADDING * 2.0,
                 }
             })
@@ -4324,7 +4635,7 @@ impl MenuController {
                 thread.setNeedsDisplay(true);
             }
             if let Some(detail) = &item.detail {
-                detail.setFrame(rect(0.0, 0.0, LIST_WIDTH, detail_height));
+                detail.setFrame(rect(0.0, 0.0, self.list_width(), detail_height));
                 detail.setAlphaValue(progress);
                 detail.setHidden(progress <= 0.0);
                 detail.scrollToPoint(NSPoint::new(0.0, 0.0));
@@ -4342,13 +4653,16 @@ impl MenuController {
         drop(layout);
         drop(expanded);
         drop(reveal);
-        list.setFrameSize(NSSize::new(LIST_WIDTH, y.max(52.0)));
+        list.setFrameSize(NSSize::new(self.list_width(), y.max(52.0)));
         let viewport = self.resize_content(y);
         if state.animation_epoch.get() != epoch {
             return;
         }
         let document_height = y + state.footer_height.get();
-        list.setFrameSize(NSSize::new(LIST_WIDTH, document_height.max(viewport)));
+        list.setFrameSize(NSSize::new(
+            self.list_width(),
+            document_height.max(viewport),
+        ));
         list.scrollPoint(NSPoint::new(
             origin.x,
             origin.y.min((document_height - viewport).max(0.0)),
@@ -4571,7 +4885,7 @@ impl MenuController {
         // Use the same flipped coordinate system as the expanded detail document.
         // SAFETY: This ivar-free view uses NSView's initializer.
         let view: Retained<SessionListView> = unsafe {
-            msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, DETAIL_WIDTH, 0.0)]
+            msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, self.detail_width(), 0.0)]
         };
         let directory = session.working_directory();
         let full_directory = directory.display().to_string();
@@ -4606,7 +4920,7 @@ impl MenuController {
             let label = self.label(
                 &view,
                 &value,
-                rect(18.0, y, DETAIL_WIDTH - 18.0, height),
+                rect(18.0, y, self.detail_width() - 18.0, height),
                 11.0,
                 0.0,
                 false,
@@ -4623,7 +4937,7 @@ impl MenuController {
             view.addSubview(&icon);
             y += height;
         }
-        view.setFrameSize(NSSize::new(DETAIL_WIDTH, y));
+        view.setFrameSize(NSSize::new(self.detail_width(), y));
         (view, y)
     }
 
@@ -4638,6 +4952,7 @@ impl MenuController {
                 .iter()
                 .find(|session| session.key() == composer.session())
             {
+                composer.set_width(self.detail_width());
                 composer.sync(&snapshot, session);
             }
         }
@@ -4722,24 +5037,32 @@ impl MenuController {
                         .get(&key)
                         .filter(|panel| panel.matches_request(session))
                         .cloned();
-                    existing.unwrap_or_else(|| {
-                        let panel = inline_questions::Panel::create(
-                            session.clone(),
-                            self.monitor().clone(),
-                            QUESTION_CARD_WIDTH - 26.0,
-                            &detail_text_color(true),
-                        );
-                        self.ivars()
-                            .question_panels
-                            .borrow_mut()
-                            .insert(key, panel.clone());
-                        panel
-                    })
+                    existing
+                        .map(|panel| panel.resized(self.detail_width() - 26.0))
+                        .unwrap_or_else(|| {
+                            let panel = inline_questions::Panel::create(
+                                session.clone(),
+                                self.monitor().clone(),
+                                self.detail_width() - 26.0,
+                                &detail_text_color(true),
+                            );
+                            self.ivars()
+                                .question_panels
+                                .borrow_mut()
+                                .insert(key, panel.clone());
+                            panel
+                        })
                 })
             } else {
                 None
             };
             if let Some(panel) = &inline {
+                if let Some(key) = session.approval_key() {
+                    self.ivars()
+                        .question_panels
+                        .borrow_mut()
+                        .insert(key, panel.clone());
+                }
                 let enabled = session.authoritative()
                     && session
                         .approval_key()
@@ -4767,11 +5090,7 @@ impl MenuController {
             let is_question = session.approval().is_some();
             let question_padding = if is_question { 13.0 } else { 0.0 };
             let metadata_gap = if is_question { 8.0 } else { 0.0 };
-            let content_width = (if is_question {
-                QUESTION_CARD_WIDTH
-            } else {
-                DETAIL_WIDTH
-            }) - 2.0 * question_padding;
+            let content_width = self.detail_width() - 2.0 * question_padding;
             let content_x = SESSION_TEXT_LEFT + question_padding;
             // Include the expanded button's visible bounds in the card padding.
             let control_inset = if is_question {
@@ -4876,10 +5195,11 @@ impl MenuController {
                             self.mtm(),
                             self.monitor().clone(),
                             session,
-                            DETAIL_WIDTH,
+                            self.detail_width(),
                         )
                     })
                     .clone();
+                composer.set_width(self.detail_width());
                 composer.sync(&snapshot, session);
                 Some(composer)
             } else {
@@ -4894,7 +5214,8 @@ impl MenuController {
                             .is_some_and(|progress| *progress > 0.0)
                 })
                 .map(|text| {
-                    let (view, glow) = super::work_caption::new(self.mtm(), text, DETAIL_WIDTH);
+                    let (view, glow) =
+                        super::work_caption::new(self.mtm(), text, self.detail_width());
                     self.ivars().work_glows.borrow_mut().push(glow);
                     view
                 });
@@ -4915,12 +5236,12 @@ impl MenuController {
                         .is_some_and(|progress| *progress > 0.0))
             {
                 for (text, images) in &earlier {
-                    let label = self.message_with_images(text, images, DETAIL_WIDTH, false);
+                    let label = self.message_with_images(text, images, self.detail_width(), false);
                     let height = label.frame().size.height;
                     label.setFrame(rect(
                         SESSION_TEXT_LEFT,
                         MESSAGE_TOP_GAP + earlier_height,
-                        DETAIL_WIDTH,
+                        self.detail_width(),
                         height,
                     ));
                     earlier_height += height + 8.0;
@@ -4954,7 +5275,7 @@ impl MenuController {
                     })
                     .unwrap_or(text);
                 let first_width = if earlier_height > 0.0 || !history.messages.is_empty() {
-                    DETAIL_WIDTH
+                    self.detail_width()
                 } else {
                     content_width
                 };
@@ -5020,11 +5341,11 @@ impl MenuController {
                 })
                 .unwrap_or(0.0);
             let height = SESSION_HEADER_HEIGHT + detail_height;
-            let row = SessionRowView::create(self.mtm(), rect(0.0, y, LIST_WIDTH, height));
+            let row = SessionRowView::create(self.mtm(), rect(0.0, y, self.list_width(), height));
             if !new_group {
                 let separator = NSBox::initWithFrame(
                     NSBox::alloc(self.mtm()),
-                    rect(0.0, height - 0.5, LIST_WIDTH, 0.5),
+                    rect(0.0, height - 0.5, self.list_width(), 0.5),
                 );
                 separator.setBoxType(NSBoxType::Custom);
                 separator.setTitlePosition(NSTitlePosition::NoTitle);
@@ -5044,9 +5365,9 @@ impl MenuController {
                 .unseen_finished
                 .contains_key(&session.key());
             let title_right = if session.activity == Activity::Idle && !finished {
-                LIST_WIDTH - 36.0
+                self.list_width() - 36.0
             } else {
-                LIST_WIDTH - 68.0
+                self.list_width() - 68.0
             };
             let text_width = title_right - SESSION_TEXT_LEFT - 12.0 - 42.0;
             let robot_button = self.action_button(
@@ -5126,7 +5447,7 @@ impl MenuController {
                     sel!(markFinishedSeen:),
                     &session.key(),
                     rect(
-                        LIST_WIDTH - 63.0,
+                        self.list_width() - 63.0,
                         height - SESSION_HEADER_HEIGHT / 2.0 - 12.0,
                         22.0,
                         24.0,
@@ -5195,7 +5516,7 @@ impl MenuController {
                 sel!(expandSession:),
                 &session.key(),
                 rect(
-                    LIST_WIDTH - 33.0,
+                    self.list_width() - 33.0,
                     height - SESSION_HEADER_HEIGHT / 2.0 - 12.0,
                     26.0,
                     24.0,
@@ -5241,12 +5562,12 @@ impl MenuController {
                 // The clip only reveals content; the main list is the sole scroller.
                 // SAFETY: NSClipView initializes this ivar-free subclass.
                 let clip: Retained<RevealClipView> = unsafe {
-                    msg_send![RevealClipView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, LIST_WIDTH, detail_height)]
+                    msg_send![RevealClipView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, self.list_width(), detail_height)]
                 };
                 clip.setDrawsBackground(false);
                 // SAFETY: NSView's initializer is valid for this ivar-free subclass.
                 let document: Retained<SessionListView> = unsafe {
-                    msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, LIST_WIDTH, detail_height)]
+                    msg_send![SessionListView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, self.list_width(), detail_height)]
                 };
                 let question_top = MESSAGE_TOP_GAP + earlier_height;
                 let message_top = question_top + question_padding;
@@ -5259,7 +5580,7 @@ impl MenuController {
                     let frame = rect(
                         SESSION_TEXT_LEFT,
                         question_top,
-                        QUESTION_CARD_WIDTH,
+                        self.detail_width(),
                         footer_y - question_top - metadata_gap,
                     );
                     // SAFETY: Decorative view ignores hit testing, preserving text selection,
@@ -5444,7 +5765,7 @@ impl MenuController {
                             },
                             first_top,
                             if earlier_height > 0.0 {
-                                DETAIL_WIDTH
+                                self.detail_width()
                             } else {
                                 content_width
                             },
@@ -5699,7 +6020,7 @@ impl MenuController {
         *self.ivars().layout.borrow_mut() = layout;
         self.layout_rows();
         if self.ivars().menu_open.get() {
-            for panel in &panels {
+            for panel in self.ivars().question_panels.borrow().values() {
                 panel.resume_editing();
             }
             for composer in &composers {
@@ -5850,7 +6171,7 @@ impl MenuController {
         );
         let document = document.max(scroll.contentView().bounds().size.height);
         view.set_brand_wave(!state.settings_active.get());
-        view.sync(source.origin.x, offset, document, MENU_WIDTH);
+        view.sync(source.origin.x, offset, document, self.menu_width());
     }
 
     fn sync_backdrop(&self) {
@@ -5879,7 +6200,7 @@ impl MenuController {
             0.0,
             active_scroll.contentView().bounds().origin.y,
             document,
-            MENU_WIDTH,
+            self.menu_width(),
         );
         if let Some(slice) = state.header_extension.get() {
             self.sync_mesh_slice(slice);
@@ -5914,17 +6235,28 @@ impl MenuController {
         for index in 0..children.count() {
             children.objectAtIndex(index).removeFromSuperview();
         }
-        footer.setFrame(rect(0.0, 0.0, MENU_WIDTH, height));
+        footer.setFrame(rect(0.0, 0.0, self.menu_width(), height));
         if !query.is_empty() {
             self.label(
                 footer,
                 &format!("Filter: {query}"),
-                rect(26.0, height - 22.0, MENU_WIDTH - 52.0, 18.0),
+                rect(26.0, height - 22.0, self.menu_width() - 52.0, 18.0),
                 11.0,
                 0.0,
                 true,
             );
         }
+        let quota_width = self.menu_width().min(MENU_WIDTH);
+        let quota = NSView::initWithFrame(
+            NSView::alloc(self.mtm()),
+            rect(
+                (self.menu_width() - quota_width) / 2.0,
+                0.0,
+                quota_width,
+                height,
+            ),
+        );
+        footer.addSubview(&quota);
         for index in 0..windows.len().max(1) {
             let window = windows.get(index);
             let remaining = window.and_then(|window| window.remaining(now));
@@ -5951,15 +6283,15 @@ impl MenuController {
                 .map(|window| format!("Codex {}", window.label()))
                 .unwrap_or_else(|| "Codex usage".to_owned());
             let y = height - 16.0 - filter_rows as f64 * 20.0 - 36.0 - index as f64 * 40.0;
-            let panel = glass_box(self.mtm(), rect(16.0, y, MENU_WIDTH - 32.0, 36.0), 3);
+            let panel = glass_box(self.mtm(), rect(16.0, y, quota_width - 32.0, 36.0), 3);
             panel.setBoxType(NSBoxType::Custom);
             panel.setTitlePosition(NSTitlePosition::NoTitle);
             panel.setCornerRadius(17.0);
-            footer.addSubview(&panel);
+            quota.addSubview(&panel);
             let icon = visual::QuotaSymbol::new(self.mtm(), rect(29.0, y + 9.0, 18.0, 18.0));
-            footer.addSubview(&icon);
+            quota.addSubview(&icon);
             let name = self.label(
-                footer,
+                &quota,
                 &name_text,
                 rect(56.0, y + 8.0, 150.0, 20.0),
                 11.0,
@@ -5971,7 +6303,7 @@ impl MenuController {
             let name_width = name.frame().size.width.ceil();
             name.setFrame(rect(56.0, y + 8.0, name_width, 20.0));
             let date = self.label(
-                footer,
+                &quota,
                 &reset,
                 rect(0.0, y + 8.0, 80.0, 20.0),
                 11.0,
@@ -5980,10 +6312,10 @@ impl MenuController {
             );
             date.sizeToFit();
             let date_width = date.frame().size.width.ceil().max(15.0);
-            let date_x = MENU_WIDTH - 29.0 - date_width;
+            let date_x = quota_width - 29.0 - date_width;
             date.setFrame(rect(date_x, y + 8.0, date_width, 20.0));
             let percent = self.label(
-                footer,
+                &quota,
                 &percentage,
                 rect(0.0, y + 8.0, 40.0, 20.0),
                 11.0,
@@ -5999,7 +6331,7 @@ impl MenuController {
             let track: Retained<UsageTrack> = unsafe {
                 msg_send![super(UsageTrack::alloc(self.mtm()).set_ivars(UsageTrackState { remaining: remaining.map(f64::from) })),initWithFrame:rect(track_x,y+14.0,track_width,8.0)]
             };
-            footer.addSubview(&track);
+            quota.addSubview(&track);
             let tooltip = NSString::from_str(&if let (Some(window), Some(usage)) =
                 (window, usage.as_ref())
             {
@@ -6108,23 +6440,23 @@ impl MenuController {
         context.setAllowsImplicitAnimation(false);
         let mut resized = false;
         if let Some(root) = state.root.get() {
-            let size = NSSize::new(MENU_WIDTH, height);
+            let size = NSSize::new(self.menu_width(), height);
             if root.frame().size != size {
                 root.setFrameSize(size);
                 resized = true;
             }
         }
         if let Some(scroll) = state.scroll.get() {
-            scroll.setFrame(rect(11.0, 0.0, LIST_WIDTH, viewport));
+            scroll.setFrame(rect(11.0, 0.0, self.list_width(), viewport));
         }
         if let Some(toolbar) = state.toolbar.get() {
-            toolbar.setFrame(rect(0.0, 0.0, LIST_WIDTH, BRAND_HEIGHT));
+            toolbar.setFrame(rect(0.0, 0.0, self.list_width(), BRAND_HEIGHT));
         }
         if let Some(caption) = state.caption.get() {
             caption.setFrame(rect(49.0, height - BRAND_HEIGHT - 40.0, 360.0, 18.0));
         }
         if settings && let Some(shell) = state.settings_shell.get() {
-            shell.resize(NSSize::new(MENU_WIDTH, height));
+            shell.resize(NSSize::new(self.menu_width(), height));
         }
         self.sync_backdrop();
         NSAnimationContext::endGrouping();
@@ -6136,6 +6468,7 @@ impl MenuController {
             self.sync_header_extension();
             self.sync_footer_extension();
         }
+        self.sync_window_width();
         viewport
     }
 
@@ -6453,6 +6786,39 @@ pub(crate) mod visual_test;
 
 #[cfg(test)]
 mod close_tests {
+    #[test]
+    fn resize_edges_cover_native_padding_and_exclude_corners() {
+        use super::{rect, resize_edge};
+        use objc2_foundation::NSPoint;
+        let window = rect(-800.0, 200.0, 480.0, 600.0);
+        let item = rect(-780.0, 210.0, 460.0, 580.0);
+        let left = NSPoint::new(-798.0, 500.0);
+        assert_eq!(resize_edge(left, window), Some(true));
+        assert_eq!(
+            resize_edge(left, item),
+            None,
+            "native left padding is outside the custom item"
+        );
+        assert_eq!(
+            resize_edge(NSPoint::new(-322.0, 500.0), window),
+            Some(false)
+        );
+        assert_eq!(
+            resize_edge(NSPoint::new(-778.0, 500.0), window),
+            None,
+            "internal item edge is not a window edge"
+        );
+        for point in [
+            NSPoint::new(-798.0, 202.0),
+            NSPoint::new(-798.0, 798.0),
+            NSPoint::new(-322.0, 202.0),
+            NSPoint::new(-322.0, 798.0),
+            NSPoint::new(-560.0, 202.0),
+        ] {
+            assert_eq!(resize_edge(point, window), None);
+        }
+    }
+
     #[test]
     fn menu_avoids_side_and_bottom_docks_on_offset_screens() {
         use super::{menu_work_area_origin, rect};

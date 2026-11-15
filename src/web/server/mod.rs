@@ -1,6 +1,7 @@
 //! Opt-in resident HTTP frontend. Management is available only over authenticated local IPC.
 mod auth;
 mod projection;
+mod tuna;
 mod tunnel;
 mod updates;
 use crate::{
@@ -27,7 +28,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -42,7 +43,7 @@ use yawc::{
     frame::{Frame, OpCode},
 };
 
-#[derive(Debug, Clone, clap::Subcommand, Serialize, Deserialize)]
+#[derive(Clone, clap::Subcommand, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Control {
     /// Start the web frontend (use 0.0.0.0:8765 for access from your LAN).
@@ -52,7 +53,17 @@ pub enum Control {
     },
     /// Start an experimental, account-free Cloudflare Quick Tunnel.
     TunnelStart,
-    /// Stop the Quick Tunnel and revoke remote browser sessions.
+    /// Start the built-in ngrok SDK using the saved personal authtoken.
+    NgrokStart,
+    /// Start Tuna using its installed official CLI and saved API key.
+    TunaStart,
+    /// Store a Tuna API key through authenticated local IPC.
+    #[command(skip)]
+    TunaConfigure { token: String },
+    /// Save a personal authtoken and connect through the built-in SDK (local IPC only).
+    #[command(skip)]
+    NgrokConfigure { token: String },
+    /// Stop all public tunnels and revoke remote browser sessions.
     TunnelStop,
     /// Print the current listening address and paired devices.
     Status,
@@ -63,6 +74,18 @@ pub enum Control {
     /// Stop web access and invalidate all device sessions.
     Stop,
 }
+impl std::fmt::Debug for Control {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NgrokConfigure { .. } => f.write_str("NgrokConfigure { token: [REDACTED] }"),
+            Self::TunaConfigure { .. } => f.write_str("TunaConfigure { token: [REDACTED] }"),
+            _ => f
+                .debug_tuple("WebControl")
+                .field(&std::mem::discriminant(self))
+                .finish(),
+        }
+    }
+}
 pub struct Controller {
     monitor: monitor::Handle,
     server: AsyncMutex<Option<Server>>,
@@ -72,6 +95,8 @@ struct Server {
     task: JoinHandle<()>,
     listen: SocketAddr,
     tunnel: Option<tunnel::QuickTunnel>,
+    ngrok: Option<tunnel::QuickTunnel>,
+    tuna: Option<tunnel::QuickTunnel>,
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -91,29 +116,58 @@ struct ContextState {
     auth: Mutex<Auth>,
     authorities: Mutex<Vec<String>>,
     tunnel: Mutex<tunnel::Status>,
+    ngrok: Mutex<tunnel::Status>,
+    tuna: Mutex<tunnel::Status>,
     sockets: Arc<Semaphore>,
     generation: AtomicU64,
+    ngrok_configured: AtomicBool,
+    tuna_configured: AtomicBool,
     revoked: tokio::sync::watch::Sender<()>,
 }
 impl ContextState {
+    fn tunnel_status(&self, provider: &str) -> &Mutex<tunnel::Status> {
+        if provider == "ngrok" {
+            &self.ngrok
+        } else if provider == "tuna" {
+            &self.tuna
+        } else {
+            &self.tunnel
+        }
+    }
+    fn close_provider(&self, provider: &'static str) {
+        self.retire_remote(
+            None,
+            tunnel::Status {
+                provider,
+                ..Default::default()
+            },
+        );
+    }
     fn close_remote(&self) {
-        self.retire_remote(None, tunnel::Status::default());
+        self.close_provider("cloudflare");
+        self.close_provider("ngrok");
+        self.close_provider("tuna");
     }
     fn retire_remote(&self, generation: Option<u64>, status: tunnel::Status) {
-        let mut current = self.tunnel.lock().unwrap();
+        let provider = status.provider;
+        let mut current = self.tunnel_status(provider).lock().unwrap();
         if generation.is_some_and(|generation| current.generation != generation) {
             return;
         }
+        let had_origin = current.origin.is_some();
         *current = status;
         let mut auth = self.auth.lock().unwrap();
         let removed: Vec<_> = auth
             .devices
             .values()
-            .filter(|d| d.remote)
+            .filter(|d| d.ingress.provider() == Some(provider))
             .map(|d| d.id)
             .collect();
-        auth.devices.retain(|_, d| !d.remote);
-        auth.pair_token();
+        auth.devices
+            .retain(|_, d| d.ingress.provider() != Some(provider));
+        if had_origin || !removed.is_empty() {
+            auth.pair_token();
+        }
         drop(auth);
         for id in removed {
             let _ = self.monitor.send(Command::ForgetHistory {
@@ -131,6 +185,12 @@ impl Controller {
         }
     }
     pub async fn control(&self, action: Control) -> Result<Value> {
+        if let Control::NgrokConfigure { token } = &action {
+            tunnel::validate_ngrok_token(token.trim())?;
+        }
+        if let Control::TunaConfigure { token } = &action {
+            tuna::validate_key(token.trim())?;
+        }
         let mut server = self.server.lock().await;
         if let Control::Start { listen } = action {
             if server.is_some() {
@@ -146,7 +206,35 @@ impl Controller {
                 task,
                 listen,
                 tunnel: None,
+                ngrok: None,
+                tuna: None,
             });
+        }
+        if matches!(action, Control::Start { .. })
+            && let Some(server) = server.as_mut()
+        {
+            // Discover the saved credential once, off the IPC/runtime thread.
+            // A missing token is a normal unconfigured state, not a failed tunnel.
+            match tunnel::QuickTunnel::start_ngrok(server.context.clone(), None).await {
+                Ok(connector) => server.ngrok = Some(connector),
+                Err(error) => {
+                    let mut status = server.context.ngrok.lock().unwrap();
+                    status.phase = "failed";
+                    status.error = Some(format!("{error:#}"));
+                }
+            }
+        }
+        if matches!(action, Control::Start { .. })
+            && let Some(server) = server.as_mut()
+        {
+            match tuna::start(server.context.clone(), None).await {
+                Ok(connector) => server.tuna = Some(connector),
+                Err(error) => {
+                    let mut status = server.context.tuna.lock().unwrap();
+                    status.phase = "failed";
+                    status.error = Some(format!("{error:#}"));
+                }
+            }
         }
         if matches!(action, Control::Stop) {
             server.take();
@@ -155,15 +243,61 @@ impl Controller {
         let Some(server) = server.as_mut() else {
             return Ok(json!({"running":false}));
         };
-        if matches!(action, Control::TunnelStop | Control::TunnelStart) {
+        if matches!(action, Control::TunnelStop) {
             server.tunnel.take();
+            server.ngrok.take();
+            server.tuna.take();
             server.context.close_remote();
         }
-        if matches!(action, Control::TunnelStart) {
-            match tunnel::QuickTunnel::start(server.context.clone()).await {
-                Ok(tunnel) => server.tunnel = Some(tunnel),
+        if matches!(
+            action,
+            Control::TunnelStart | Control::NgrokStart | Control::NgrokConfigure { .. }
+        ) {
+            let ngrok = matches!(action, Control::NgrokStart | Control::NgrokConfigure { .. });
+            let provider = if ngrok { "ngrok" } else { "cloudflare" };
+            if ngrok {
+                server.ngrok.take();
+            } else {
+                server.tunnel.take();
+            }
+            server.context.close_provider(provider);
+            let started = if ngrok {
+                let token = match &action {
+                    Control::NgrokConfigure { token } => Some(token.trim().to_owned()),
+                    _ => None,
+                };
+                tunnel::QuickTunnel::start_ngrok(server.context.clone(), token).await
+            } else {
+                tunnel::QuickTunnel::start(server.context.clone()).await
+            };
+            match started {
+                Ok(tunnel) => {
+                    if ngrok {
+                        server.ngrok = Some(tunnel);
+                    } else {
+                        server.tunnel = Some(tunnel);
+                    }
+                }
                 Err(error) => {
-                    let mut status = server.context.tunnel.lock().unwrap();
+                    let mut status = server.context.tunnel_status(provider).lock().unwrap();
+                    status.provider = provider;
+                    status.phase = "failed";
+                    status.error = Some(format!("{error:#}"));
+                    return Err(error);
+                }
+            }
+        }
+        if matches!(action, Control::TunaStart | Control::TunaConfigure { .. }) {
+            server.tuna.take();
+            server.context.close_provider("tuna");
+            let token = match &action {
+                Control::TunaConfigure { token } => Some(token.trim().to_owned()),
+                _ => None,
+            };
+            match tuna::start(server.context.clone(), token).await {
+                Ok(connector) => server.tuna = Some(connector),
+                Err(error) => {
+                    let mut status = server.context.tuna.lock().unwrap();
                     status.phase = "failed";
                     status.error = Some(format!("{error:#}"));
                     return Err(error);
@@ -172,6 +306,8 @@ impl Controller {
         }
         *server.context.authorities.lock().unwrap() = authorities(server.listen);
         let tunnel = server.context.tunnel.lock().unwrap().clone();
+        let ngrok = server.context.ngrok.lock().unwrap().clone();
+        let tuna = server.context.tuna.lock().unwrap().clone();
         let mut auth = server.context.auth.lock().unwrap();
         if let Control::Revoke { id } = action {
             auth.devices.retain(|_, d| d.id != id);
@@ -182,7 +318,14 @@ impl Controller {
         }
         if matches!(
             action,
-            Control::Start { .. } | Control::Pair | Control::TunnelStart | Control::TunnelStop
+            Control::Start { .. }
+                | Control::Pair
+                | Control::TunnelStart
+                | Control::NgrokStart
+                | Control::NgrokConfigure { .. }
+                | Control::TunaStart
+                | Control::TunaConfigure { .. }
+                | Control::TunnelStop
         ) {
             auth.pair_token();
         }
@@ -205,9 +348,13 @@ impl Controller {
             .filter(|a| !a.starts_with("localhost:"))
             .map(|a| format!("http://{a}/"))
             .collect();
-        if let Some(origin) = &tunnel.origin {
-            urls.insert(0, format!("{origin}/"));
-        }
+        let mut remote_urls: Vec<_> = [&tunnel, &ngrok, &tuna]
+            .into_iter()
+            .filter_map(|status| status.origin.as_ref())
+            .map(|origin| format!("{origin}/"))
+            .collect();
+        remote_urls.append(&mut urls);
+        let urls = remote_urls;
         let links: Vec<_> = token
             .as_ref()
             .map(|token| {
@@ -221,7 +368,7 @@ impl Controller {
             .and_then(|link| qrcode::QrCode::new(link).ok())
             .map(|qr| qr.render::<qrcode::render::unicode::Dense1x2>().build());
         Ok(
-            json!({"running":auth.active&&!server.task.is_finished(),"listen":server.listen,"urls":urls,"pairingLinks":links,"pairingExpiresIn":expires,"qr":qr,"tunnel":{"enabled":server.tunnel.is_some(),"status":tunnel.phase,"url":tunnel.origin,"error":tunnel.error},"devices":auth.devices.values().map(|d|json!({"id":d.id,"name":d.name,"remote":d.remote})).collect::<Vec<_>>()}),
+            json!({"running":auth.active&&!server.task.is_finished(),"listen":server.listen,"urls":urls,"pairingLinks":links,"pairingExpiresIn":expires,"qr":qr,"tunnel":{"enabled":server.tunnel.is_some(),"provider":tunnel.provider,"tokenSaved":server.context.ngrok_configured.load(Ordering::Relaxed),"status":tunnel.phase,"url":tunnel.origin,"error":tunnel.error},"ngrok":{"enabled":server.ngrok.is_some(),"tokenSaved":server.context.ngrok_configured.load(Ordering::Relaxed),"status":ngrok.phase,"url":ngrok.origin,"error":ngrok.error},"tuna":{"clientInstalled":tuna::installed(),"enabled":server.tuna.is_some(),"tokenSaved":server.context.tuna_configured.load(Ordering::Relaxed),"status":tuna.phase,"url":tuna.origin,"error":tuna.error},"devices":auth.devices.values().map(|d|json!({"id":d.id,"name":d.name,"remote":d.remote})).collect::<Vec<_>>()}),
         )
     }
 }
@@ -235,8 +382,20 @@ fn start_server(
         auth: Mutex::new(Auth::default()),
         authorities: Mutex::new(authorities(listen)),
         tunnel: Mutex::new(tunnel::Status::default()),
+        ngrok: Mutex::new(tunnel::Status {
+            provider: "ngrok",
+            phase: "not_configured",
+            ..Default::default()
+        }),
+        tuna: Mutex::new(tunnel::Status {
+            provider: "tuna",
+            phase: "not_configured",
+            ..Default::default()
+        }),
         sockets: Arc::new(Semaphore::new(8)),
         generation: AtomicU64::new(1),
+        ngrok_configured: AtomicBool::new(false),
+        tuna_configured: AtomicBool::new(false),
         revoked: tokio::sync::watch::channel(()).0,
     });
     let app = router(context.clone());
@@ -293,6 +452,18 @@ fn authorities(listen: SocketAddr) -> Vec<String> {
 enum Ingress {
     Local,
     Tunnel,
+    Ngrok,
+    Tuna,
+}
+impl Ingress {
+    fn provider(self) -> Option<&'static str> {
+        match self {
+            Self::Local => None,
+            Self::Tunnel => Some("cloudflare"),
+            Self::Ngrok => Some("ngrok"),
+            Self::Tuna => Some("tuna"),
+        }
+    }
 }
 #[derive(Clone)]
 struct Guard {
@@ -348,7 +519,7 @@ fn device(context: &ContextState, headers: &HeaderMap, ingress: Ingress) -> Opti
         .lock()
         .unwrap()
         .device(cookie(headers)?)
-        .filter(|d| d.remote == (ingress == Ingress::Tunnel))
+        .filter(|d| d.ingress == ingress)
 }
 async fn guard(State(guard): State<Guard>, request: Request, next: Next) -> Response {
     let context = &guard.context;
@@ -369,8 +540,13 @@ async fn guard(State(guard): State<Guard>, request: Request, next: Next) -> Resp
         {
             format!("http://{host}")
         }
-        Ingress::Tunnel => {
-            let origin = context.tunnel.lock().unwrap().origin.clone();
+        Ingress::Tunnel | Ingress::Ngrok | Ingress::Tuna => {
+            let origin = context
+                .tunnel_status(guard.ingress.provider().unwrap())
+                .lock()
+                .unwrap()
+                .origin
+                .clone();
             match origin.filter(|origin| origin.strip_prefix("https://") == Some(host)) {
                 Some(origin) => origin,
                 None => {
@@ -434,7 +610,7 @@ async fn guard(State(guard): State<Guard>, request: Request, next: Next) -> Resp
 fn websocket_origin(host: &str, ingress: Ingress) -> String {
     format!(
         "{}://{host}",
-        if ingress == Ingress::Tunnel {
+        if ingress != Ingress::Local {
             "wss"
         } else {
             "ws"
@@ -537,10 +713,10 @@ async fn pair(
         .auth
         .lock()
         .unwrap()
-        .pair(&input.token, &input.name, ingress == Ingress::Tunnel)
+        .pair(&input.token, &input.name, ingress)
         .map_err(|e| error(StatusCode::UNAUTHORIZED, e))?;
     let mut response = Json(json!({"device":device.id})).into_response();
-    let secure = if ingress == Ingress::Tunnel {
+    let secure = if ingress != Ingress::Local {
         "; Secure"
     } else {
         ""
@@ -641,7 +817,7 @@ async fn stream(
             .lock()
             .unwrap()
             .device(&token)
-            .filter(|d| d.remote == (ingress == Ingress::Tunnel))
+            .filter(|d| d.ingress == ingress)
         else {
             break;
         };
@@ -679,7 +855,7 @@ async fn stream(
                         },
                         Ok(StreamInput::History { protocol, id, session }) if protocol==updates::PROTOCOL && valid_operation_id(&id) && session.len()<=512=>{
                             // Revalidate immediately before dispatch, not only before waiting for input.
-                            let current=context.auth.lock().unwrap().device(&token).filter(|d|d.remote==(ingress==Ingress::Tunnel));
+                            let current=context.auth.lock().unwrap().device(&token).filter(|d|d.ingress==ingress);
                             let Some(current)=current else {break;};
                             let result=if let Some((_,original,reply))=history_replies.iter().find(|(key,_,_)|key==&id) {
                                 if original==&session {reply.clone()}else{json!({"error":"Request ID was already used for another session."})}

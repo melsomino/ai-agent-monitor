@@ -227,6 +227,27 @@ impl Composer {
     pub(super) fn field(&self) -> &NSTextField {
         &self.ivars().field
     }
+    pub(super) fn set_width(&self, width: f64) {
+        let s = self.ivars();
+        s.view
+            .setFrameSize(NSSize::new(width, s.view.frame().size.height));
+        s.field
+            .setFrameSize(NSSize::new(width - 90.0, s.field.frame().size.height));
+        s.surface
+            .setFrameSize(NSSize::new(width - 66.0, s.surface.frame().size.height));
+        s.focus_ring
+            .setFrameSize(NSSize::new(width - 62.0, s.focus_ring.frame().size.height));
+        for view in [
+            &*s.button as &NSView,
+            &*s.background as &NSView,
+            &*s.caption as &NSView,
+        ] {
+            view.setFrameOrigin(NSPoint::new(width - 60.0, view.frame().origin.y));
+        }
+        s.feedback
+            .setFrameSize(NSSize::new(width - 8.0, s.feedback.frame().size.height));
+        self.resize_to_fit();
+    }
     /// Measure the current draft at its actual wrapping width, including live edits.
     pub(super) fn resize_to_fit(&self) -> bool {
         let state = self.ivars();

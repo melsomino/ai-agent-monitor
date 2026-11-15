@@ -77,6 +77,16 @@ fn export(bitmap: &NSBitmapImageRep, name: &str) {
     }
 }
 
+fn table_view(view: &NSView) -> Option<Retained<NSTextView>> {
+    if let Some(text) = view.downcast_ref::<NSTextView>()
+        && !text.isEditable()
+    {
+        return Some(Retained::from(text));
+    }
+    let children = view.subviews();
+    (0..children.count()).find_map(|i| table_view(&children.objectAtIndex(i)))
+}
+
 fn editable(view: &NSView) -> Option<Retained<NSTextField>> {
     if let Some(field) = view.downcast_ref::<NSTextField>()
         && field.isEditable()
@@ -293,6 +303,7 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
         window.setAppearance(Some(&appearance));
         root.setAppearance(Some(&appearance));
         window.setContentView(Some(root));
+
         let hover_row = controller
             .ivars()
             .layout
@@ -463,6 +474,72 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             "editing must own the single keyboard focus"
         );
         export(&bitmap(root), &format!("{name}-input-focused"));
+        let open_before_resize = controller.ivars().menu_open.replace(true);
+        field
+            .currentEditor()
+            .unwrap()
+            .setString(ns_string!("Keep this custom answer while resizing."));
+        field
+            .currentEditor()
+            .unwrap()
+            .setSelectedRange(NSRange::new(5, 4));
+        controller.change_width(680.0);
+        assert_eq!(
+            root.window().unwrap().frame().size.width,
+            root.frame().size.width,
+            "tracking host and custom content must agree on width"
+        );
+        for control in controller.ivars().toolbar_buttons.borrow().iter() {
+            assert_eq!(
+                control.button.frame(),
+                control.background.frame(),
+                "header hover must follow its icon after resizing"
+            );
+        }
+        let resized_field = editable(root).expect("resized custom answer");
+        assert_eq!(
+            resized_field.currentEditor().unwrap().string().to_string(),
+            "Keep this custom answer while resizing."
+        );
+        assert_eq!(
+            resized_field.currentEditor().unwrap().selectedRange(),
+            NSRange::new(5, 4)
+        );
+        assert!(resized_field.frame().size.width > field.frame().size.width + 200.0);
+        export(&bitmap(root), &format!("{name}-wide-questions"));
+        for width in [520.0, 740.0, 580.0, 680.0, 460.0] {
+            controller.change_width(width);
+            assert_eq!(
+                root.window().unwrap().frame().size.width,
+                root.frame().size.width
+            );
+            assert_eq!(
+                controller.ivars().backdrop.get().unwrap().frame(),
+                root.bounds(),
+                "mesh must cover the complete item after every resize"
+            );
+            for control in controller.ivars().toolbar_buttons.borrow().iter() {
+                assert_eq!(
+                    control.button.frame(),
+                    control.background.frame(),
+                    "hover must remain aligned through grow/shrink reversals"
+                );
+            }
+        }
+        // Reproduce a later native-menu layout restoring its previous wider size.
+        let mut stale = window.frame();
+        stale.size.width += 110.0;
+        window.setFrame_display(stale, false);
+        controller.sync_window_width();
+        controller.sync_backdrop();
+        assert_eq!(window.frame().size.width, root.frame().size.width);
+        assert_eq!(window.frame().size.width, 460.0);
+        assert_eq!(
+            controller.ivars().backdrop.get().unwrap().frame(),
+            root.bounds()
+        );
+        controller.ivars().menu_open.set(open_before_resize);
+
         for panel in controller.ivars().question_panels.borrow().values() {
             panel.stop_editing();
         }
@@ -556,8 +633,41 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             .reveal
             .borrow_mut()
             .insert(table_session.key(), 1.0);
-        controller.render_rows(&[table_session]);
+        controller.render_rows(std::slice::from_ref(&table_session));
         export(&bitmap(root), &format!("{name}-markdown-table"));
+        let saved_sessions = controller.ivars().all.borrow().clone();
+        *controller.ivars().all.borrow_mut() = vec![table_session];
+        let narrow_table_width = table_view(root)
+            .unwrap()
+            .enclosingScrollView()
+            .unwrap()
+            .frame()
+            .size
+            .width;
+        controller.change_width(680.0);
+        assert_eq!(
+            table_view(root)
+                .unwrap()
+                .enclosingScrollView()
+                .unwrap()
+                .frame()
+                .size
+                .width,
+            narrow_table_width + 220.0,
+            "the native table must use the expanded message width"
+        );
+        let quota_name = text_label(root, "Codex Weekly").expect("quota label");
+        // SAFETY: The fixture owns the complete attached view tree.
+        let quota_group = unsafe { quota_name.superview() }.unwrap();
+        assert_eq!(quota_group.frame().size.width, MENU_WIDTH);
+        assert_eq!(
+            quota_group.frame().origin.x,
+            110.0,
+            "default-width quota group must be centered in the wider host"
+        );
+        export(&bitmap(root), &format!("{name}-wide-table"));
+        controller.change_width(460.0);
+        *controller.ivars().all.borrow_mut() = saved_sessions;
         let image = crate::domain::media::Image {
             id: "synthetic-mesh".into(),
             mime: "image/png",
@@ -639,21 +749,78 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             false,
             mtm,
         );
-        assert!(short.downcast_ref::<NSTextView>().is_some());
+        let short_text = table_view(&short).unwrap();
+        assert!(
+            !short_text
+                .enclosingScrollView()
+                .unwrap()
+                .hasHorizontalScroller()
+        );
+        let long_text = table_view(&long).unwrap();
+        let scroller = long_text.enclosingScrollView().unwrap();
+        assert!(scroller.hasHorizontalScroller());
+        assert_eq!(scroller.frame().size.width, 240.0);
+        assert_eq!(
+            long_text.frame().size.width,
+            480.0,
+            "wide table must be capped at twice the message width"
+        );
+        scroller
+            .contentView()
+            .scrollToPoint(NSPoint::new(120.0, 0.0));
+        scroller.reflectScrolledClipView(&scroller.contentView());
+        assert!(
+            scroller.contentView().bounds().origin.x > 0.0,
+            "the table must actually scroll horizontally"
+        );
+        export(&bitmap(root), &format!("{name}-scrollable-tables"));
         assert!(
             long.frame().size.height > short.frame().size.height,
             "table height must include wrapped cells"
         );
         // SAFETY: These test-owned TextKit views remain on the main thread.
         unsafe {
-            let text = long.downcast_ref::<NSTextView>().unwrap();
+            let text = table_view(&long).unwrap();
             let manager = text.layoutManager().unwrap();
             let container = text.textContainer().unwrap();
             assert!(
-                manager.usedRectForTextContainer(&container).size.width <= 241.0,
-                "table must fit its message width"
+                manager.usedRectForTextContainer(&container).size.width <= 481.0,
+                "cell wrapping must stay inside the capped table width"
             );
         }
+        let mixed = crate::macos::markdown::message(
+            "Text before the table wraps at the normal message width.\n\n| Name | Count |\n| --- | ---: |\n| abcdefghijklmnopqrstuvwxy abcdefghijk | 10 |\n\nText after the table also wraps at the normal message width.",
+            240.0,
+            &NSColor::labelColor(),
+            false,
+            mtm,
+        );
+        assert_eq!(mixed.subviews().count(), 3, "only the table should scroll");
+        assert!(
+            mixed
+                .subviews()
+                .objectAtIndex(0)
+                .downcast_ref::<NSTextField>()
+                .is_some()
+        );
+        assert!(
+            mixed
+                .subviews()
+                .objectAtIndex(2)
+                .downcast_ref::<NSTextField>()
+                .is_some()
+        );
+        for index in 0..3 {
+            assert_eq!(
+                mixed.subviews().objectAtIndex(index).frame().size.width,
+                240.0
+            );
+        }
+        let natural_width = table_view(&mixed).unwrap().frame().size.width;
+        assert!(
+            natural_width > 240.0 && natural_width < 480.0,
+            "moderately wide tables must fit their measured content rather than always using the cap"
+        );
         let idle = sessions[0].clone();
         controller.ivars().expanded.borrow_mut().insert(idle.key());
         controller
@@ -737,6 +904,40 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             composer.field().currentEditor().unwrap().selectedRange(),
             selection
         );
+        // Horizontal resize must reflow native text without discarding a live draft.
+        let original_sessions = controller.ivars().all.borrow().clone();
+        *controller.ivars().all.borrow_mut() = vec![idle.clone()];
+        let narrow_height = composer.view().frame().size.height;
+        controller.change_width(680.0);
+        assert_eq!(root.frame().size.width, 680.0);
+        assert_eq!(
+            controller.ivars().list.get().unwrap().frame().size.width,
+            658.0
+        );
+        assert_eq!(composer.view().frame().size.width, DETAIL_WIDTH + 220.0);
+        assert!(composer.view().frame().size.height < narrow_height);
+        assert!(composer.editing());
+        assert_eq!(
+            composer
+                .field()
+                .currentEditor()
+                .unwrap()
+                .string()
+                .to_string(),
+            long_draft
+        );
+        assert_eq!(
+            composer.field().currentEditor().unwrap().selectedRange(),
+            selection
+        );
+        export(&bitmap(root), &format!("{name}-wide-composer"));
+        controller.change_width(460.0);
+        assert_eq!(composer.view().frame().size.height, narrow_height);
+        assert_eq!(
+            composer.field().currentEditor().unwrap().selectedRange(),
+            selection
+        );
+        *controller.ivars().all.borrow_mut() = original_sessions;
         let path = text_label(root, "/demo/task-board").unwrap();
         let input_frame =
             root.convertRect_fromView(composer.view().bounds(), Some(composer.view()));
@@ -890,23 +1091,246 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             );
             assert!(shell.controls().len() >= 5);
             export(&bitmap(root), &format!("{name}-settings-{index}"));
+            controller.change_width(680.0);
+            let settings_parent = unsafe { pane.superview() }.unwrap();
+            assert_eq!(settings_parent.frame().origin.x, 110.0);
+            assert_eq!(settings_parent.frame().size.width, 460.0);
+            assert_eq!(
+                shell
+                    .back
+                    .convertPoint_toView(NSPoint::new(0.0, 0.0), Some(root))
+                    .x,
+                128.0
+            );
+            assert_eq!(
+                shell.scroll.documentView().unwrap().frame().size.width,
+                680.0
+            );
+            export(&bitmap(root), &format!("{name}-settings-{index}-wide"));
+            controller.change_width(460.0);
         }
         let web = controller.ivars().web_settings.get().unwrap();
         web.set_report(serde_json::json!({"running":true,"urls":["http://192.0.2.1:8765/"],"pairingLinks":["http://192.0.2.1:8765/#pair=demo-preview-token"],"pairingExpiresIn":120,"devices":[]}));
         controller.layout_settings();
         let web_bitmap = bitmap(root);
-        let scale = web_bitmap.pixelsWide() as f64 / 460.0;
+        let qr = (0..web.subviews().count())
+            .map(|index| web.subviews().objectAtIndex(index))
+            .find(|view| {
+                view.identifier()
+                    .is_some_and(|id| id.to_string() == "web-pairing-qr")
+            })
+            .unwrap();
+        let qr_bitmap = qr
+            .bitmapImageRepForCachingDisplayInRect(qr.bounds())
+            .unwrap();
+        qr.cacheDisplayInRect_toBitmapImageRep(qr.bounds(), &qr_bitmap);
+        let scale = qr_bitmap.pixelsWide() as f64 / 200.0;
+        let code = qrcode::QrCode::new("http://192.0.2.1:8765/#pair=demo-preview-token").unwrap();
+        let unit = (200.0 / (code.width() + 8) as f64).floor();
+        let finder = (200.0 - unit * (code.width() + 8) as f64) / 2.0 + 4.5 * unit;
         assert!(
             rgb(
-                &web_bitmap,
-                (60.0 * scale) as isize,
-                ((web.frame().size.height - 102.0) * scale) as isize
+                &qr_bitmap,
+                (finder * scale) as isize,
+                (finder * scale) as isize
             )
             .iter()
-            .all(|c| *c < 0.05),
+            .all(|value| *value < 0.05),
             "QR finder must be black in both themes"
         );
+        let web_action = |action| {
+            (0..web.subviews().count())
+                .find_map(|index| {
+                    web.subviews()
+                        .objectAtIndex(index)
+                        .downcast::<NSButton>()
+                        .ok()
+                        .filter(|button| button.action() == Some(action))
+                })
+                .unwrap()
+        };
+        let copy = web_action(sel!(copyWebLink:));
+        let renew = web_action(sel!(renewWebPairing:));
+        let link = web_action(sel!(openWebLink:));
+        assert_eq!(copy.frame().size, NSSize::new(28.0, 28.0));
+        assert_eq!(copy.frame().origin.x, renew.frame().origin.x);
+        assert_eq!(copy.frame().size, renew.frame().size);
+        assert!(copy.title().is_empty() && renew.title().is_empty());
+        assert!(copy.image().is_some() && renew.image().is_some());
+        assert_eq!(link.title().to_string(), "http://192.0.2.1:8765/");
+        assert!(!link.toolTip().unwrap().to_string().contains("pair="));
         export(&web_bitmap, &format!("{name}-settings-web-qr"));
+        let connected_report = serde_json::json!({"running":true,"ngrok":{"tokenSaved":true,"status":"connected","url":"https://fixture.ngrok-free.app"},"tunnel":{"provider":"cloudflare","status":"connected","url":"https://fixture.trycloudflare.com"},"urls":["https://fixture.trycloudflare.com/","https://fixture.ngrok-free.app/","http://192.0.2.1:8765/"],"pairingLinks":["https://fixture.trycloudflare.com/#pair=demo-preview-token","https://fixture.ngrok-free.app/#pair=demo-preview-token","http://192.0.2.1:8765/#pair=demo-preview-token"],"pairingExpiresIn":120,"devices":[]});
+        web.set_report(connected_report.clone());
+        let disclosure = shell
+            .controls()
+            .into_iter()
+            .find_map(|control| {
+                control
+                    .downcast::<NSButton>()
+                    .ok()
+                    .filter(|button| button.action() == Some(sel!(toggleRemoteSection:)))
+            })
+            .unwrap();
+        let collapsed_height = web.frame().size.height;
+        // SAFETY: The retained settings pane owns this action target.
+        unsafe {
+            disclosure.performClick(None);
+        }
+        web.poll(false);
+        assert!(web.frame().size.height > collapsed_height);
+        assert!(web.take_layout_changed());
+        assert!(text_label(web, "ready").is_some());
+        controller.layout_settings();
+        export(&bitmap(root), &format!("{name}-settings-web-ngrok"));
+        let sections = web.subviews();
+        let ngrok_section = (0..sections.count())
+            .find_map(|index| {
+                let view = sections.objectAtIndex(index);
+                view.identifier()
+                    .is_some_and(|id| id.to_string() == "ngrok-section")
+                    .then_some(view)
+            })
+            .unwrap();
+        let action_button = |action| {
+            let children = ngrok_section.subviews();
+            (0..children.count())
+                .find_map(|index| {
+                    children
+                        .objectAtIndex(index)
+                        .downcast::<NSButton>()
+                        .ok()
+                        .filter(|button| button.action() == Some(action))
+                })
+                .expect("fixture settings action")
+        };
+        assert_eq!(disclosure.frame().size, NSSize::new(28.0, 28.0));
+        assert!(disclosure.title().to_string().is_empty());
+        assert!(
+            !text_label(web, "stored securely in macOS Keychain")
+                .unwrap()
+                .isHidden()
+        );
+        // SAFETY: These controls target the fixture-owned pane, not live IPC.
+        unsafe {
+            action_button(sel!(changeRemoteKey:)).performClick(None);
+        }
+        web.poll(false);
+        let children = ngrok_section.subviews();
+        let token = (0..children.count())
+            .find_map(|index| {
+                children
+                    .objectAtIndex(index)
+                    .downcast::<NSSecureTextField>()
+                    .ok()
+            })
+            .unwrap();
+        assert!(!token.isHidden());
+        assert!(
+            text_label(web, "Token:").unwrap().frame().origin.y
+                >= token.frame().origin.y + token.frame().size.height
+        );
+        assert_eq!(
+            token.frame().origin.x,
+            text_label(web, "Will be stored securely in macOS Keychain")
+                .unwrap()
+                .frame()
+                .origin
+                .x
+        );
+        let connect = action_button(sel!(connectRemote:));
+        assert!(!connect.isEnabled());
+        if let Some(editor) = token.currentEditor() {
+            editor.setString(ns_string!("synthetic-replacement-token"));
+        } else {
+            token.setStringValue(ns_string!("synthetic-replacement-token"));
+        }
+        web.set_report(connected_report.clone());
+        assert!(connect.isEnabled());
+        assert!(
+            !token.isHidden(),
+            "status polling must preserve replacement editing"
+        );
+        controller.layout_settings();
+        export(&bitmap(root), &format!("{name}-settings-web-ngrok-change"));
+        // SAFETY: Cancel only updates this fixture's local draft state.
+        unsafe {
+            action_button(sel!(cancelRemoteKey:)).performClick(None);
+        }
+        web.poll(false);
+        assert!(token.isHidden());
+        assert!(
+            !text_label(web, "stored securely in macOS Keychain")
+                .unwrap()
+                .isHidden()
+        );
+        let mut failed = connected_report;
+        failed["ngrok"]["status"] = serde_json::json!("failed");
+        failed["ngrok"]["error"] =
+            serde_json::json!("Connection interrupted. Check your account and network.");
+        failed["ngrok"]["url"] = serde_json::Value::Null;
+        failed["urls"].as_array_mut().unwrap().remove(1);
+        failed["pairingLinks"].as_array_mut().unwrap().remove(1);
+        web.set_report(failed);
+        assert!(text_label(web, "connection failed").is_some());
+        assert!(
+            shell
+                .controls()
+                .iter()
+                .filter_map(|control| control.downcast_ref::<NSButton>())
+                .any(|button| button.title().to_string() == "Reconnect")
+        );
+        controller.layout_settings();
+        export(&bitmap(root), &format!("{name}-settings-web-ngrok-failed"));
+        let tuna_section = (0..sections.count())
+            .find_map(|index| {
+                let view = sections.objectAtIndex(index);
+                view.identifier()
+                    .is_some_and(|id| id.to_string() == "tuna-section")
+                    .then_some(view)
+            })
+            .unwrap();
+        let tuna_buttons = tuna_section.subviews();
+        let tuna_disclosure = (0..tuna_buttons.count())
+            .find_map(|index| {
+                tuna_buttons
+                    .objectAtIndex(index)
+                    .downcast::<NSButton>()
+                    .ok()
+                    .filter(|button| button.action() == Some(sel!(toggleRemoteSection:)))
+            })
+            .unwrap();
+        // SAFETY: The Tuna section belongs to this fixture; opening it performs no IPC.
+        unsafe {
+            tuna_disclosure.performClick(None);
+        }
+        web.poll(false);
+        controller.layout_settings();
+        assert!(text_label(&tuna_section, "API key:").is_some());
+        export(
+            &bitmap(root),
+            &format!("{name}-settings-web-tuna-unconfigured"),
+        );
+        web.set_report(serde_json::json!({"running":true,"tuna":{"status":"connected","tokenSaved":true,"clientInstalled":true,"url":"https://fixture.ru.tuna.am"},"ngrok":{"status":"connected","tokenSaved":true,"url":"https://fixture.ngrok-free.app"},"tunnel":{"status":"connected","url":"https://fixture.trycloudflare.com"},"urls":["https://fixture.trycloudflare.com/","https://fixture.ngrok-free.app/","https://fixture.ru.tuna.am/","http://192.0.2.1:8765/"],"pairingLinks":["https://fixture.trycloudflare.com/#pair=synthetic-test-link","https://fixture.ngrok-free.app/#pair=synthetic-test-link","https://fixture.ru.tuna.am/#pair=synthetic-test-link","http://192.0.2.1:8765/#pair=synthetic-test-link"],"pairingExpiresIn":120,"devices":[]}));
+        controller.layout_settings();
+        assert!(
+            !text_label(&tuna_section, "stored securely in macOS Keychain")
+                .unwrap()
+                .isHidden()
+        );
+        export(
+            &bitmap(root),
+            &format!("{name}-settings-web-tuna-connected"),
+        );
+        unsafe {
+            tuna_disclosure.performClick(None);
+        }
+        web.poll(false);
+        // SAFETY: The retained settings pane owns this action target.
+        unsafe {
+            disclosure.performClick(None);
+        }
+        web.poll(false);
         let children = web.subviews();
         let progress = (0..children.count())
             .find_map(|i| {
@@ -946,6 +1370,7 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             let mut rows = Vec::new();
             if let Some(button) = view.downcast_ref::<NSButton>()
                 && button.action() == Some(sel!(selectWebAddress:))
+                && button.tag() >= 0
             {
                 // SAFETY: The pane retains this row throughout the test.
                 rows.push(

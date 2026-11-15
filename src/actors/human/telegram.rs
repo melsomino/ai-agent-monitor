@@ -1135,7 +1135,7 @@ impl Worker {
         if let Some(text) = self.outbox.front() {
             match self.api(
                 "sendMessage",
-                json!({"chat_id":self.config.chat,"text":text,"reply_markup":command_keyboard()}),
+                json!({"chat_id":self.config.chat,"text":text,"link_preview_options":{"is_disabled":true},"reply_markup":command_keyboard()}),
             ) {
                 Ok(_) => {
                     self.outbox.pop_front();
@@ -1307,6 +1307,7 @@ impl Worker {
                 "setMyCommands",
                 json!({"scope":{"type":"chat","chat_id":chat},"commands":[
                     {"command":"sessions","description":"List all open agent sessions"},
+                    {"command":"web_access","description":"Get links to open the monitor in a browser"},
                     {"command":"info","description":"Show the selected session folder and Git branch"},
                     {"command":"help","description":"Show available commands"}
                 ]}),
@@ -1339,13 +1340,17 @@ impl Worker {
                 self.remember_selection();
                 return Ok(());
             }
+            BotCommand::WebAccess => {
+                anyhow::ensure!(self.outbox.len()<128,"Previous command replies are still sending. Please try again shortly.");
+                web_access_links_with(|action|crate::app::ipc::request(&crate::app::ipc::Request::Web{action}))?
+            }
             BotCommand::Info => {
                 if self.browser.as_mut().is_some_and(|browser|browser.open_info()) {return Ok(());}
                 vec!["Select a session in Sessions first.".into()]
             }
             BotCommand::Status => vec![format!("AI Agent Monitor {}\nNotifications: {}\nPending questions: {}",
                 core::VERSION, if self.config.enabled {"enabled"} else {"paused"}, self.pending.len())],
-            BotCommand::Help => vec!["/sessions — List all open sessions, including idle sessions\n/status — Monitor and notification status\n/info — Selected session folder and Git branch\n/help — Show these commands\n\nOpen a session and type in chat to send a message to that agent. Previous message loads an earlier agent message. Use answer buttons on question messages, or reply to one to enter a custom answer.\nCommands require your computer and monitor to be running.".into()],
+            BotCommand::Help => vec!["/sessions — List all open sessions, including idle sessions\n/web_access — Get browser connection links\n/status — Monitor and notification status\n/info — Selected session folder and Git branch\n/help — Show these commands\n\nOpen a session and type in chat to send a message to that agent. Previous message loads an earlier agent message. Use answer buttons on question messages, or reply to one to enter a custom answer.\nCommands require your computer and monitor to be running.".into()],
         };
         anyhow::ensure!(
             self.outbox.len() + messages.len() <= 128,
@@ -1560,6 +1565,7 @@ impl Worker {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BotCommand {
     Sessions,
+    WebAccess,
     Status,
     Info,
     Help,
@@ -1583,6 +1589,7 @@ fn bot_command(text: &str, username: &str) -> Option<BotCommand> {
     };
     match command {
         "/sessions" => Some(BotCommand::Sessions),
+        "/web_access" | "/web" => Some(BotCommand::WebAccess),
         "/status" => Some(BotCommand::Status),
         "/info" => Some(BotCommand::Info),
         "/help" | "/start" => Some(BotCommand::Help),
@@ -1593,6 +1600,68 @@ fn command_keyboard() -> Value {
     json!({"keyboard":[[{"text":"Sessions"},{"text":"Help"}]],
         "resize_keyboard":true,"is_persistent":true,"input_field_placeholder":"Choose a command or reply to a question"})
 }
+/// Called only for a paired private-chat command. The local management API
+/// creates fresh, expiring browser links; this command never enables a server.
+fn web_access_links_with(
+    mut request: impl FnMut(crate::web::Control) -> Result<Value>,
+) -> Result<Vec<String>> {
+    let report = request(crate::web::Control::Pair)?;
+    if report["running"] != true {
+        return Ok(vec!["Web access is off. Enable it in AI Agent Monitor → Settings → Web, then use Web access again.".into()]);
+    }
+    let links = report["pairingLinks"]
+        .as_array()
+        .context("Cannot create web connection links. Please try again.")?;
+    anyhow::ensure!(
+        !links.is_empty(),
+        "Cannot create web connection links. Please try again."
+    );
+    let header = "Web access\n\n";
+    let footer = "These links share one single-use code, valid for 2 minutes.\nLocal addresses work only when your phone can reach that network.";
+    let mut messages = Vec::new();
+    let mut message = header.to_owned();
+    for link in links {
+        let link = link.as_str().context("Invalid web connection link")?;
+        let url = url::Url::parse(link).context("Invalid web connection link")?;
+        let origin = url.origin().ascii_serialization();
+        let kind = if report["ngrok"]["url"]
+            .as_str()
+            .is_some_and(|value| value.trim_end_matches('/') == origin)
+        {
+            "ngrok tunnel"
+        } else if report["tuna"]["url"]
+            .as_str()
+            .is_some_and(|value| value.trim_end_matches('/') == origin)
+        {
+            "Tuna tunnel"
+        } else if report["tunnel"]["url"]
+            .as_str()
+            .is_some_and(|value| value.trim_end_matches('/') == origin)
+        {
+            "Cloudflare tunnel"
+        } else if url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }) {
+            "This computer (monitor host only)"
+        } else {
+            "Local network"
+        };
+        let entry = format!("{kind}\n{link}\n\n");
+        if message.encode_utf16().count() + entry.encode_utf16().count() + footer.len() > 3800 {
+            messages.push(message);
+            message = header.to_owned();
+        }
+        message.push_str(&entry);
+    }
+    message.push_str(footer);
+    messages.push(message);
+    Ok(messages)
+}
+
 fn pairing_matches(user: i64, chat: i64, kind: &str, text: &str, code: &str, valid: bool) -> bool {
     valid
         && user > 0
@@ -2892,7 +2961,45 @@ mod tests {
         assert_eq!(bot_command("Sessions in this project", "my_bot"), None);
         assert_eq!(command_keyboard()["keyboard"][0][0]["text"], "Sessions");
         assert_eq!(command_keyboard()["keyboard"][0][1]["text"], "Help");
+        for text in ["/web_access", "/web", "/web_access@MY_BOT"] {
+            assert_eq!(bot_command(text, "my_bot"), Some(BotCommand::WebAccess));
+        }
+        assert_eq!(bot_command("/web_access@other_bot", "my_bot"), None);
     }
+    #[test]
+    fn web_access_returns_all_fresh_links_without_starting_services() {
+        let cf = "https://fixture.trycloudflare.com/#pair=synthetic-pair-token";
+        let ng = "https://fixture.ngrok-free.app/#pair=synthetic-pair-token";
+        let tuna = "https://fixture.ru.tuna.am/#pair=synthetic-pair-token";
+        let lan = "http://192.0.2.10:8765/#pair=synthetic-pair-token";
+        let local = "http://127.0.0.1:8765/#pair=synthetic-pair-token";
+        let messages=web_access_links_with(|action|{
+            assert!(matches!(action,crate::web::Control::Pair));
+            Ok(json!({"running":true,"tunnel":{"url":"https://fixture.trycloudflare.com"},"ngrok":{"url":"https://fixture.ngrok-free.app"},"tuna":{"url":"https://fixture.ru.tuna.am"},"pairingLinks":[cf,ng,tuna,lan,local]}))
+        }).unwrap();
+        let text = messages.join("\n");
+        for link in [cf, ng, tuna, lan, local] {
+            assert!(text.contains(link));
+        }
+        for caption in [
+            "ngrok tunnel",
+            "Tuna tunnel",
+            "Cloudflare tunnel",
+            "Local network",
+            "This computer",
+            "single-use",
+            "2 minutes",
+        ] {
+            assert!(text.contains(caption));
+        }
+        let off = web_access_links_with(|action| {
+            assert!(matches!(action, crate::web::Control::Pair));
+            Ok(json!({"running":false}))
+        })
+        .unwrap();
+        assert!(off[0].contains("Web access is off"));
+    }
+
     #[test]
     fn paused_notifications_allow_paired_commands_but_not_answers() {
         let mut worker = worker();

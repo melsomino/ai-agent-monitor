@@ -2,6 +2,7 @@
 (() => {
   'use strict';
   const paths = {
+    github:'<path d="M9 19c-4.3 1.4-4.3-2.5-6-3m12 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7a5.44 5.44 0 0 0-1.5-3.78 5.07 5.07 0 0 0-.09-3.77S17.73.62 15 2.43a13.38 13.38 0 0 0-7 0C5.27.62 4.09.97 4.09.97A5.07 5.07 0 0 0 4 4.74a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 8 18.13V22"/>',
     'arrow-right':'<path d="M5 12h14m-6-6 6 6-6 6"/>',
     'chevron-up':'<path d="m5 15 7-7 7 7"/>',
     'chevron-right':'<path d="m9 5 7 7-7 7"/>', 'chevron-down':'<path d="m5 9 7 7 7-7"/>',
@@ -33,13 +34,14 @@
     root.innerHTML = '<div class="aam-stage"><div class="aam-product"></div></div>';
     const product = root.querySelector('.aam-product');
     product.append(document.getElementById('aam-shell').content.cloneNode(true)); product.tabIndex = -1;
+    product.querySelector('[data-command="github"]').innerHTML = icon('github');
     product.querySelector('[data-command="settings"]').innerHTML = icon('settings');
     product.querySelector('[data-command="quit"]').innerHTML = icon('power');
     const list = product.querySelector('.aam-list'), groups = product.querySelector('.aam-session-groups');
     const expanded = new Set(), contexts = new Set(), histories = new Set(), signatures = new Map();
-    const historySignatures = new Map(), drafts = new Map();
+    const historySignatures = new Map(), drafts = new Map(), composerSizes = new WeakMap(), threadMasks = new WeakMap();
     let snapshot = {sessions:[],usage:[],version:'',loading:true}, query = '', counter = 0, composing = false;
-    let layoutPending = false, pointerY = null;
+    let layoutPending = false, destroyed = false, pointerY = null;
     const emit = message => send(message);
     const settings = options.settings === false ? {active:()=>false,update:()=>{},open:()=>{},close:()=>{},destroy:()=>{}} : window.AAMSettings.mount(product, emit, scheduleLayout);
     if(options.settings === false) product.querySelector('[data-command="settings"]').hidden = true;
@@ -158,6 +160,13 @@
           let node = Array.from(group.querySelector('.aam-group-sessions').children).find(node => node.dataset.session === session.id);
           const signature = JSON.stringify(session);
           if (signatures.get(session.id) === signature && node) continue;
+          // A completion acknowledgment changes the badge, not the detail document.
+          // Keep its running disclosure transition, editor and scroll position intact.
+          const prior=signatures.has(session.id)?JSON.parse(signatures.get(session.id)):null;
+          const idleShape=value=>JSON.stringify({...value,status:'idle',completion:null,expanded:null});
+          if(node&&prior&&['idle','finished'].includes(prior.status)&&['idle','finished'].includes(session.status)&&idleShape(prior)===idleShape(session)) {
+            node.dataset.status=session.status;node.querySelector('.aam-state-slot').innerHTML=status(session);signatures.set(session.id,signature);continue;
+          }
           const saved = preserve(node), template = document.createElement('template'); template.innerHTML=sessionMarkup(session);
           const fresh=template.content.firstElementChild;
           if (node) node.replaceWith(fresh); else group.querySelector('.aam-group-sessions').append(fresh);
@@ -211,9 +220,10 @@
     }
     function scheduleLayout() {
       if(layoutPending)return;layoutPending=true;
-      // Keep prototype geometry current even when a hidden browser document
-      // suspends animation frames.
-      queueMicrotask(()=>{layoutPending=false;layout();});
+      let ran=false,timer;
+      const run=()=>{if(ran)return;ran=true;clearTimeout(timer);layoutPending=false;if(!destroyed)layout();};
+      // Batch visible work once per frame, with a fallback for occluded WebKit views.
+      if(document.hidden)queueMicrotask(run);else {requestAnimationFrame(run);timer=setTimeout(run,50);}
     }
     function layout() {
       if (settings.active()) {
@@ -228,7 +238,12 @@
         article.style.setProperty('--aam-header-height',box.height+'px');
         const articleBox=article.getBoundingClientRect(),lineTop=articleBox.top+box.height/2+5.8;
         const lineX=articleBox.left+parseFloat(getComputedStyle(product.closest('.aam-stage')).getPropertyValue('--aam-inset'))+5.5;
-        const cuts=Array.from(article.querySelectorAll('.aam-message-dot,.aam-request-mark'))
+        const marks=Array.from(article.querySelectorAll('.aam-message-dot,.aam-request-mark'));
+        const rounded=value=>Math.round(value*100)/100;
+        const maskKey=JSON.stringify([box.height,lineX-articleBox.left,...marks.map(mark=>{const b=mark.getBoundingClientRect();return [rounded(b.left-articleBox.left),rounded(b.top-articleBox.top),b.width,b.height,getComputedStyle(mark).display];})]);
+        if(threadMasks.get(article)===maskKey)continue;
+        threadMasks.set(article,maskKey);
+        const cuts=marks
           .filter(mark=>mark.getClientRects().length&&getComputedStyle(mark).display!=='none')
           .map(mark=>{
             if(mark.classList.contains('aam-message-dot')){const bounds=mark.getBoundingClientRect();return {top:bounds.top+.1,bottom:bounds.bottom-.1};}
@@ -260,11 +275,18 @@
       previousHover();
     }
     function resizeComposer(input) {
-      const before=input.style.height;
-      input.style.height='0px';
-      const height=Math.max(32,input.scrollHeight);
-      input.style.height=height+'px';
-      return before!==input.style.height;
+      const width=input.getBoundingClientRect().width,style=getComputedStyle(input);
+      const key=JSON.stringify([width,input.value,style.font,style.lineHeight,style.padding,style.borderWidth,style.boxSizing]);
+      const cached=composerSizes.get(input);if(cached?.key===key)return false;
+      // Measure off-flow: collapsing the live field even momentarily can move the
+      // scroll anchor or clamp scrollTop during the disclosure's ResizeObserver ticks.
+      const measure=input.cloneNode(false);measure.removeAttribute('id');measure.removeAttribute('data-focus');
+      measure.setAttribute('aria-hidden','true');measure.tabIndex=-1;measure.value=input.value;
+      Object.assign(measure.style,{position:'absolute',visibility:'hidden',pointerEvents:'none',height:'0px',minHeight:'0px',width:width+'px',flex:'none'});
+      input.parentElement.append(measure);
+      const height=Math.max(32,measure.scrollHeight);measure.remove();
+      const changed=input.style.height!==height+'px';if(changed)input.style.height=height+'px';
+      composerSizes.set(input,{key});return changed;
     }
     function previousHover(){
       for(const messages of product.querySelectorAll('.aam-messages')){
@@ -292,6 +314,7 @@
       else if(command==='open'){seen(session);emit({type:'open',session:session.id});}
       else if(command==='seen')seen(session);
       else if(command==='history'){seen(session);histories.add(session.id);signatures.delete(session.id);setSnapshot(snapshot);emit({type:'history',session:session.id});}
+      else if(command==='github')emit({type:'link',url:'https://github.com/melsomino/ai-agent-monitor'});
       else if(command)emit({type:command});
       if(button.dataset.response)emit({type:'submit',session:session.id,context:session.request.context,action:button.dataset.response});
       if(button.dataset.preset!==undefined)emit({type:'submit',session:session.id,context:session.request.context,answers:{[button.dataset.question]:[button.dataset.preset]}});
@@ -305,7 +328,7 @@
     product.addEventListener('change',event=>{if(event.target.matches('input[type="radio"]')){event.target.closest('fieldset').querySelector('.aam-custom')?.setCustomValidity('');updateFormValidity(event.target.closest('form'));}});
     product.addEventListener('submit',event=>{
       if(event.target.matches('.aam-composer')) {
-        event.preventDefault();const form=event.target, session=sessionFor(form), text=form.querySelector('input').value;
+        event.preventDefault();const form=event.target, session=sessionFor(form), text=form.querySelector('.aam-compose-input').value;
         if(!session.request&&['idle','finished'].includes(session.status)&&session.authoritative!==false&&text.trim()&&Array.from(text).length<=16000) {
           if(!options.live)drafts.delete(session.id);emit({type:'message',session:session.id,text});
         }
@@ -343,7 +366,7 @@
       const input=node?.querySelector('.aam-compose-input');if(input){input.value=drafts.get(id)||'';resizeComposer(input);scheduleLayout();}
       signatures.delete(id);
     }
-    return {setSnapshot,reveal,visibility,messageResult,expanded:()=>[...expanded],destroy:()=>{resize.disconnect();settings.destroy();}};
+    return {setSnapshot,reveal,visibility,messageResult,expanded:()=>[...expanded],destroy:()=>{destroyed=true;resize.disconnect();settings.destroy();}};
   }
   window.AAMMonitor = {mount};
 })();

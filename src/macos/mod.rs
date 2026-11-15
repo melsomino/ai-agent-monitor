@@ -27,3 +27,5 @@ mod work_caption;
 mod visual;
 
 mod web_settings;
+
+mod remote_tunnel_settings;

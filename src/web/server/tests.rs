@@ -419,6 +419,40 @@ async fn real_browser_pairs_and_submits_over_http() {
         }),
     );
     published.send_replace(Arc::new(next));
+    let command = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap();
+    assert!(matches!(command,Some(Command::Submit{response:Answer::Action(id),..})if id=="allow"));
+    let mut next = (**published.borrow()).clone();
+    next.revision += 1;
+    next.sessions[0].activity = Activity::Idle;
+    next.sessions[0].set_approval(None);
+    next.sessions[0].set_interaction(Interaction::default());
+    published.send_replace(Arc::new(next));
+    for sent in [false, true] {
+        let command = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap();
+        let Some(Command::SendMessage { id, session, text }) = command else {
+            panic!("expected real browser message delivery");
+        };
+        assert_eq!(session, "codex:web-test");
+        assert_eq!(text, "Please continue.\nInclude all checks.");
+        let mut next = (**published.borrow()).clone();
+        next.revision += 1;
+        next.message_sends.insert(
+            id,
+            monitor::MessageSend {
+                session,
+                status: if sent {
+                    monitor::MessageStatus::Sent
+                } else {
+                    monitor::MessageStatus::Failed("Test delivery failure".into())
+                },
+            },
+        );
+        published.send_replace(Arc::new(next));
+    }
     let output = browser.await.unwrap();
     assert!(
         output.status.success(),
@@ -427,7 +461,8 @@ async fn real_browser_pairs_and_submits_over_http() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        matches!(rx.try_recv(),Ok(Command::Submit{response:Answer::Action(id),..})if id=="allow")
+        rx.try_recv().is_err(),
+        "message sends must not be duplicated"
     );
     controller.control(Control::Stop).await.unwrap();
 }
@@ -638,6 +673,18 @@ async fn static_http_assets_negotiate_gzip() {
 
 #[tokio::test]
 async fn tunnel_ingress_requires_exact_https_origin_and_separates_device_authority() {
+    for (hostname, provider) in [
+        ("fixture.trycloudflare.com", "cloudflare"),
+        ("fixture.ngrok-free.app", "ngrok"),
+        ("fixture.a.2na.am", "tuna"),
+        ("fixture.a.tuna.free", "tuna"),
+        ("fixture.ru.tuna.am", "tuna"),
+    ] {
+        verify_tunnel_ingress(hostname, provider).await;
+    }
+}
+
+async fn verify_tunnel_ingress(hostname: &str, provider: &'static str) {
     let (controller, local, local_cookie, _token, _rx, _published) = setup().await;
     let context = controller
         .server
@@ -647,9 +694,9 @@ async fn tunnel_ingress_requires_exact_https_origin_and_separates_device_authori
         .unwrap()
         .context
         .clone();
-    let hostname = "fixture.trycloudflare.com";
     let origin = format!("https://{hostname}");
-    *context.tunnel.lock().unwrap() = tunnel::Status {
+    *context.tunnel_status(provider).lock().unwrap() = tunnel::Status {
+        provider,
         generation: 9,
         phase: "connected",
         origin: Some(origin.clone()),
@@ -657,7 +704,16 @@ async fn tunnel_ingress_requires_exact_https_origin_and_separates_device_authori
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let app = ingress_router(context.clone(), Ingress::Tunnel);
+    let app = ingress_router(
+        context.clone(),
+        if provider == "ngrok" {
+            Ingress::Ngrok
+        } else if provider == "tuna" {
+            Ingress::Tuna
+        } else {
+            Ingress::Tunnel
+        },
+    );
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -900,4 +956,140 @@ async fn websocket_history_uses_the_device_cursor_and_replies_without_advancing_
     );
     assert!(rx.try_recv().is_err());
     controller.control(Control::Stop).await.unwrap();
+}
+
+#[tokio::test]
+async fn simultaneous_tunnels_have_separate_authority_and_provider_restart_preserves_other_devices()
+{
+    let (controller, _local, local_cookie, _, _rx, _published) = setup().await;
+    let context = controller
+        .server
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .context
+        .clone();
+    for provider in ["cloudflare", "ngrok", "tuna"] {
+        *context.tunnel_status(provider).lock().unwrap() = tunnel::Status {
+            provider,
+            generation: 99,
+            phase: "connected",
+            origin: Some(format!(
+                "https://fixture.{}",
+                if provider == "ngrok" {
+                    "ngrok-free.app"
+                } else if provider == "tuna" {
+                    "ru.tuna.am"
+                } else {
+                    "trycloudflare.com"
+                }
+            )),
+            error: None,
+        };
+    }
+    let report = controller.control(Control::Status).await.unwrap();
+    let urls = report["urls"].as_array().unwrap();
+    assert!(
+        urls.iter()
+            .any(|url| url == "https://fixture.trycloudflare.com/")
+    );
+    assert!(
+        urls.iter()
+            .any(|url| url == "https://fixture.ngrok-free.app/")
+    );
+    assert!(
+        urls.iter()
+            .any(|url| url.as_str().unwrap().starts_with("http://"))
+    );
+    assert!(urls.iter().any(|url| url == "https://fixture.ru.tuna.am/"));
+    let (cloudflare_cookie, ngrok_cookie, tuna_cookie) = {
+        let mut auth = context.auth.lock().unwrap();
+        let token = auth.pair_token();
+        let (cf, _) = auth
+            .pair(&token, "cloudflare phone", Ingress::Tunnel)
+            .unwrap();
+        let token = auth.pair_token();
+        let (ng, _) = auth.pair(&token, "ngrok phone", Ingress::Ngrok).unwrap();
+        let token = auth.pair_token();
+        let (tuna, _) = auth.pair(&token, "Tuna phone", Ingress::Tuna).unwrap();
+        (cf, ng, tuna)
+    };
+    let headers = |cookie: &str| {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("aam_session={cookie}")).unwrap(),
+        );
+        h
+    };
+    assert!(device(&context, &headers(&cloudflare_cookie), Ingress::Tunnel).is_some());
+    assert!(device(&context, &headers(&cloudflare_cookie), Ingress::Ngrok).is_none());
+    assert!(device(&context, &headers(&ngrok_cookie), Ingress::Ngrok).is_some());
+    assert!(device(&context, &headers(&ngrok_cookie), Ingress::Tunnel).is_none());
+    assert!(device(&context, &headers(&tuna_cookie), Ingress::Tuna).is_some());
+    assert!(device(&context, &headers(&tuna_cookie), Ingress::Ngrok).is_none());
+    assert!(device(&context, &headers(&ngrok_cookie), Ingress::Tuna).is_none());
+    context.retire_remote(
+        Some(98),
+        tunnel::Status {
+            provider: "tuna",
+            phase: "failed",
+            ..Default::default()
+        },
+    );
+    assert_eq!(context.tuna.lock().unwrap().phase, "connected");
+    context.close_provider("tuna");
+    assert!(device(&context, &headers(&tuna_cookie), Ingress::Tuna).is_none());
+    assert!(device(&context, &headers(&ngrok_cookie), Ingress::Ngrok).is_some());
+    assert!(device(&context, &headers(&cloudflare_cookie), Ingress::Tunnel).is_some());
+    context.close_provider("ngrok");
+    assert!(device(&context, &headers(&ngrok_cookie), Ingress::Ngrok).is_none());
+    assert!(device(&context, &headers(&cloudflare_cookie), Ingress::Tunnel).is_some());
+    assert!(
+        device(
+            &context,
+            &headers(local_cookie.strip_prefix("aam_session=").unwrap()),
+            Ingress::Local
+        )
+        .is_some()
+    );
+    assert_eq!(context.tunnel.lock().unwrap().phase, "connected");
+    context.close_provider("cloudflare");
+    assert!(device(&context, &headers(&cloudflare_cookie), Ingress::Tunnel).is_none());
+    assert!(
+        device(
+            &context,
+            &headers(local_cookie.strip_prefix("aam_session=").unwrap()),
+            Ingress::Local
+        )
+        .is_some()
+    );
+    controller.control(Control::Stop).await.unwrap();
+}
+
+#[tokio::test]
+async fn unconfigured_ngrok_discovery_does_not_rotate_an_existing_local_pairing_link() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let (_published, state) = tokio::sync::watch::channel(Arc::new(monitor::State::default()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (context, server) = start_server(listener, monitor::Handle { tx, state });
+    let token = context.auth.lock().unwrap().pair_token();
+    context.retire_remote(
+        None,
+        tunnel::Status {
+            provider: "ngrok",
+            phase: "not_configured",
+            ..Default::default()
+        },
+    );
+    assert!(
+        context
+            .auth
+            .lock()
+            .unwrap()
+            .pair(&token, "phone", Ingress::Local)
+            .is_ok()
+    );
+    server.abort();
 }

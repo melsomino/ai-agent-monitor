@@ -185,7 +185,7 @@ fn open(
     // SAFETY: geteuid has no preconditions and scopes discovery to this user.
     let uid = unsafe { libc::geteuid() }.to_string();
     let mut command = Command::new(crate::app::core::lsof());
-    command.args(["-nP", "-a", "-u", &uid, "-c", "codex", "-F", "pcafn"]);
+    command.args(["-nP", "-a", "-u", &uid, "-c", "codex", "-F", "pcRafn"]);
     let (status, output, errors) = output_with_timeout(&mut command, Duration::from_secs(3))?;
     anyhow::ensure!(
         status == Some(0) || (status == Some(1) && errors.trim().is_empty()),
@@ -218,11 +218,16 @@ fn open(
         .map(|session| session.id.clone())
         .collect();
     let storage = crate::app::core::vscode_home().join("User/workspaceStorage");
-    if let Some(mut live) =
-        vscode::live_sessions_cached(&vscode_ids, &storage, &mut vscode_cache.borrow_mut())
-    {
+    if let Some(mut live) = vscode::live_sessions_with_writers(
+        &vscode_ids,
+        &storage,
+        &mut vscode_cache.borrow_mut(),
+        &output,
+        home,
+    ) {
         // A shared backend can keep writing a rollout after its IDE window closed.
-        // Only a live extension host's current stream membership proves it is open.
+        // Require live extension-host membership or its own retained writer
+        // when rotation has erased the membership event.
         sessions.retain(|session| {
             session.client != Client::VSCode || live.active.contains(&session.id)
         });

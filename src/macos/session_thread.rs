@@ -2,7 +2,7 @@
 //! their joints share the same coordinates during resizing and disclosure.
 use super::session_layout;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained};
-use objc2_app_kit::{NSBezierPath, NSColor, NSGraphicsContext, NSView};
+use objc2_app_kit::{NSBezierPath, NSGraphicsContext, NSView};
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
 
 #[derive(Debug)]
@@ -50,7 +50,7 @@ define_class!(
             if let Some(center) = request {
                 super::visual::request_color().setFill();
                 NSBezierPath::bezierPathWithOvalInRect(rect(x - 7.5, center - 7.5, 15.0, 15.0)).fill();
-                let ink = NSColor::colorWithSRGBRed_green_blue_alpha(0.2, 0.125, 0.0, 1.0);
+                let ink = super::visual::request_ink_color();
                 ink.setStroke();
                 ink.setFill();
                 let stem = NSBezierPath::bezierPath();

@@ -965,6 +965,37 @@ impl Panel {
         }
     }
 
+    pub fn resized(&self, width: f64) -> Retained<Self> {
+        if (self.view().frame().size.width - width).abs() < 0.5 {
+            return Retained::from(self);
+        }
+        let panel = Self::create(
+            self.ivars().session.clone(),
+            self.ivars().monitor.clone(),
+            width,
+            &super::menu::detail_text_color(true),
+        );
+        for (old, new) in self
+            .ivars()
+            .inputs
+            .borrow()
+            .iter()
+            .zip(panel.ivars().inputs.borrow().iter())
+        {
+            new.selected.set(old.selected.get());
+            if let (Some(old), Some(new)) = (&old.field, &new.field) {
+                new.setStringValue(&old.stringValue());
+                if let Some((field, selection)) = self.ivars().editing.borrow().as_ref()
+                    && std::ptr::eq(&**field, &**old)
+                {
+                    *panel.ivars().editing.borrow_mut() = Some((new.clone(), *selection));
+                }
+            }
+        }
+        panel.sync();
+        panel
+    }
+
     pub fn matches_request(&self, session: &Session) -> bool {
         let original = &self.ivars().session;
         original.key() == session.key()

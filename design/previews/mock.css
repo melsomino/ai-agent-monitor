@@ -9,3 +9,7 @@ html,body{margin:0;min-height:100%;font-family:-apple-system,BlinkMacSystemFont,
 body[data-theme=light] .preview-theme{background:#e7e0ef;color:#554767}
 body[data-theme=light] .preview-theme button[aria-pressed=true]{background:#9c81c83b;color:#30213f}
 @media(max-width:660px){.preview-theme{position:static;width:max-content;flex-direction:row;margin:8px auto}}
+
+body[data-theme=light] .preview-bar .request,body[data-theme=light] .preview-bar .finished { color:white; }
+body[data-theme=light] .preview-bar .request { background:#cb770c; }
+body[data-theme=light] .preview-bar .finished { background:#3e6db9; }
