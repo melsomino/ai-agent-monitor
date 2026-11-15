@@ -32,6 +32,7 @@ pub(super) struct Shell {
     document: Retained<SettingsDocument>,
     content: Retained<SettingsDocument>,
     pub back: Retained<NSButton>,
+    release: Retained<super::release_link::ReleaseLink>,
     back_surface: Retained<NSBox>,
     pub tabs: Vec<Retained<NSButton>>,
     surfaces: Vec<Retained<NSBox>>,
@@ -84,13 +85,9 @@ impl Shell {
         title.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
         title.setTextColor(Some(&super::visual::primary_text_color()));
         content.addSubview(&title);
-        let version =
-            NSTextField::labelWithString(&NSString::from_str(crate::app::core::VERSION), mtm);
-        version.setFrame(rect(322.0, 26.0, 114.0, 18.0));
-        version.setAlignment(NSTextAlignment::Right);
-        version.setFont(Some(&NSFont::systemFontOfSize(10.0)));
-        version.setTextColor(Some(&super::visual::tertiary_text_color()));
-        content.addSubview(&version);
+        let release = super::release_link::ReleaseLink::new(mtm, rect(322.0, 27.0, 114.0, 14.0));
+        release.setAlignment(NSTextAlignment::Right);
+        content.addSubview(&release);
         let mut tabs = Vec::new();
         let mut surfaces = Vec::new();
         let mut labels = Vec::new();
@@ -165,6 +162,7 @@ impl Shell {
             document,
             content,
             back,
+            release,
             back_surface,
             tabs,
             surfaces,
@@ -346,6 +344,9 @@ impl Shell {
             button.setContentTintColor(Some(&color));
             self.labels[index].setTextColor(Some(&color));
         }
+    }
+    pub fn sync_versions(&self, versions: &crate::domain::versions::Versions) {
+        self.release.sync(versions);
     }
     pub fn controls(&self) -> Vec<Retained<NSControl>> {
         fn collect(view: &NSView, out: &mut Vec<Retained<NSControl>>) {

@@ -1349,7 +1349,7 @@ impl Worker {
                 vec!["Select a session in Sessions first.".into()]
             }
             BotCommand::Status => vec![format!("AI Agent Monitor {}\nNotifications: {}\nPending questions: {}",
-                core::VERSION, if self.config.enabled {"enabled"} else {"paused"}, self.pending.len())],
+                self.monitor.snapshot().versions.current, if self.config.enabled {"enabled"} else {"paused"}, self.pending.len())],
             BotCommand::Help => vec!["/sessions — List all open sessions, including idle sessions\n/web_access — Get browser connection links\n/status — Monitor and notification status\n/info — Selected session folder and Git branch\n/help — Show these commands\n\nOpen a session and type in chat to send a message to that agent. Previous message loads an earlier agent message. Use answer buttons on question messages, or reply to one to enter a custom answer.\nCommands require your computer and monitor to be running.".into()],
         };
         anyhow::ensure!(

@@ -29,3 +29,5 @@ mod visual;
 mod web_settings;
 
 mod remote_tunnel_settings;
+
+mod release_link;

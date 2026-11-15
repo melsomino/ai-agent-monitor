@@ -19,6 +19,12 @@ final class Check:NSObject,WKNavigationDelegate {
    const snapshot={version:'preview',theme:'dark',sessions:[],applications:[{id:'vscode',name:'VS Code',icon:''},{id:'terminal',name:'Terminal',icon:''}],usage:[]};
    window.aam.setSnapshot(snapshot);
    document.querySelector('[data-command="github"]').click();assert(events.at(-1)?.type==='link'&&events.at(-1).url==='https://github.com/melsomino/ai-agent-monitor','GitHub action opens the fixed project URL');
+   window.aam.setSnapshot({...snapshot,versions:{current:'v0.3.0',available:{version:'v0.4.0',url:'https://github.com/melsomino/ai-agent-monitor/releases/tag/v0.4.0'}}});
+   const release=document.querySelector('.aam-update-link'),version=document.querySelector('.aam-version');
+   assert(!release.hidden&&version.hidden&&release.textContent==='v0.4.0 available','Only new release shown');
+   release.click();assert(events.at(-1).url.endsWith('/releases/tag/v0.4.0'),'Release opens through host');
+   window.aam.setSnapshot({...snapshot,versions:{current:'v0.3.0',available:{version:'v0.4.0',url:'https://untrusted.example/'}}});assert(release.hidden&&!release.hasAttribute('href')&&!version.hidden,'Untrusted release destinations have no link');
+   window.aam.setSnapshot({...snapshot,versions:{current:'v0.3.0',available:null,checked_at:100}});assert(release.hidden&&version.textContent==='v0.3.0 ✓','Current version is a single checked line');window.aam.setSnapshot(snapshot);assert(version.title==='Not checked yet'&&!version.textContent.includes('✓'),'Unknown state never claims up to date');
    document.querySelector('[data-command="settings"]').click();await pause(30);
    assert(document.querySelectorAll('[role="tab"]').length===5,'Five settings tabs');
    assert(document.activeElement.classList.contains('aam-settings-screen'),'No automatic Back keyboard focus');

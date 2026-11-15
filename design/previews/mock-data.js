@@ -14,7 +14,10 @@ const sessions = [
     {id:'cargo', app:'Codex', title:'Set up the local Cargo.lock', status:'idle', message:'Dependencies are pinned. The build is reproducible with the local Cargo.lock.', directory:'~/dev/ai-agent-monitor', branch:'main'}
   ];
  const frame=document.getElementById('monitor');
- let theme='dark',version='v0.3.0 · preview',context=1;
+ // Synthetic update fixture; this is not a claim that v0.4.0 has been published.
+ const versions={current:'v0.3.0 · preview',available:{version:'v0.4.0',url:'https://github.com/melsomino/ai-agent-monitor/releases/tag/v0.4.0'},checked_at:Math.floor(Date.now()/1000)};
+ const newerRelease=versions.available;
+ let theme='dark',context=1;
  let preferences={login:false,animate:true,shortcut:'',applications:{}};
  const state=sessions.map(s=>({...s,appId:s.app,icon:applicationIcons[s.app],html:s.message,
    fullDirectory:s.directory,completion:s.status==='finished'?1:null,
@@ -43,7 +46,7 @@ const sessions = [
    if(s.request)s.activities.push(activity('request',{request:s.request,status:'pending'}));
    delete s.html;delete s.message;delete s.progress;delete s.request;
  }
- function snapshot(){return {version,theme,animate:preferences.animate,preferences:structuredClone(preferences),applications:[...new Map(state.map(s=>[s.appId,{id:s.appId,name:s.app,icon:s.icon}])).values()],sessions:state.filter(s=>preferences.applications[s.appId]!==false),usage:[{label:'Weekly',remaining:85,reset:'Nov 11'}]};}
+ function snapshot(){return {version:versions.current,versions,theme,animate:preferences.animate,preferences:structuredClone(preferences),applications:[...new Map(state.map(s=>[s.appId,{id:s.appId,name:s.app,icon:s.icon}])).values()],sessions:state.filter(s=>preferences.applications[s.appId]!==false),usage:[{label:'Weekly',remaining:85,reset:'Nov 11'}]};}
  function publish(){
    const current=snapshot();
    for(const [selector,status] of [['request','request'],['finished','finished'],['working','working']]) {
@@ -62,10 +65,11 @@ const sessions = [
   if(m.type==='seen'&&s?.status==='finished'){s.status='idle';publish();}
   if(m.type==='copy')navigator.clipboard?.writeText(m.text).catch(()=>{});
   if(m.type==='preferences'){preferences=m.preferences;publish();}
-  if(m.type==='open'&&s){version=s.app+' · '+s.title;publish();}
+  if(m.type==='open'&&s)publish();
   if(m.type==='link'&&/^(https?:|mailto:)/i.test(m.url))window.open(m.url,'_blank','noopener');
   if(m.type==='quit'||m.type==='close'){frame.contentWindow.postMessage({channel:'aam-host',visibility:false},'*');}
  });
- document.querySelectorAll('.preview-theme button').forEach(button=>button.addEventListener('click',()=>{theme=button.dataset.theme;document.body.dataset.theme=theme;document.querySelectorAll('.preview-theme button').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));publish();}));
- document.getElementById('show-monitor').addEventListener('click',()=>frame.contentWindow.postMessage({channel:'aam-host',visibility:true},'*'));
+ document.querySelectorAll('.preview-theme button[data-theme]').forEach(button=>button.addEventListener('click',()=>{theme=button.dataset.theme;document.body.dataset.theme=theme;document.querySelectorAll('.preview-theme button[data-theme]').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));publish();}));
+ document.getElementById('preview-update').addEventListener('click',event=>{const button=event.currentTarget,enabled=button.getAttribute('aria-checked')!=='true';button.setAttribute('aria-checked',String(enabled));versions.available=enabled?newerRelease:null;versions.checked_at=Math.floor(Date.now()/1000);publish();});
+ document.getElementById('show-monitor').addEventListener('click',()=>{frame.contentWindow.postMessage({channel:'aam-host',visibility:true},'*');});
 })();

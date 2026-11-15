@@ -433,7 +433,7 @@ button:disabled { cursor: default; opacity: .45; }
   #aam-ui-preview .aam-session-groups { padding: 7px 11px 14px; }
   #aam-ui-preview .aam-brand { align-items: center; z-index: 3; }
   #aam-ui-preview .aam-brand-copy { flex: 1; min-width: 0; }
-  #aam-ui-preview .aam-brand-title { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  #aam-ui-preview .aam-brand-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   #aam-ui-preview .aam-brand-title .aam-version { font-size: 9px; white-space: nowrap; }
   #aam-ui-preview .aam-brand .aam-tools { flex: 0 0 auto; gap: 5px; align-self: flex-start; margin-top: 2px; }
   #aam-ui-preview .aam-brand .aam-tools .aam-icon-button { color: var(--aam-tertiary); }
@@ -524,7 +524,7 @@ button:disabled { cursor: default; opacity: .45; }
 #aam-ui-preview { --aam-session-body:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMiIgaGVpZ2h0PSIxNiIgdmlld0JveD0iLTAuOCAwIDIyIDE2Ij4KICA8IS0tIFNpbmdsZSBmcm9udCByb2JvdCwgdXNpbmcgdGhlIG1lbnUgYmFyIGFzc2V0J3MgaGVhZCwgZWFycyBhbmQgZXllIGdlb21ldHJ5LiAtLT4KICA8cGF0aCBmaWxsPSJibGFjayIgZmlsbC1ydWxlPSJldmVub2RkIiBkPSJNNi4yIC40aDcuNmE0LjggNC44IDAgMCAxIDQuOCA0Ljh2NS42YTQuOCA0LjggMCAwIDEtNC44IDQuOEg2LjJhNC44IDQuOCAwIDAgMS00LjgtNC44VjUuMkE0LjggNC44IDAgMCAxIDYuMiAuNFptMCAzYTMuMiAzLjIgMCAwIDAtMy4yIDMuMnYyLjhhMy4yIDMuMiAwIDAgMCAzLjIgMy4yaDcuNkEzLjIgMy4yIDAgMCAwIDE3IDkuNFY2LjZhMy4yIDMuMiAwIDAgMC0zLjItMy4yWiIvPgogIDxnIGZpbGw9ImJsYWNrIj4KICAgIDxyZWN0IHg9IjAiIHk9IjQuOSIgd2lkdGg9IjMuMiIgaGVpZ2h0PSI2LjIiIHJ4PSIxLjMiLz4KICAgIDxyZWN0IHg9IjE3LjIiIHk9IjQuOSIgd2lkdGg9IjMuMiIgaGVpZ2h0PSI2LjIiIHJ4PSIxLjMiLz4KICA8L2c+Cjwvc3ZnPgo="); }
 
 /* One glass hover surface for every enabled interactive control. */
-#aam-ui-preview .aam-product :is(button:not(.aam-open):enabled, a[href]:not(.aam-web-link-url)):hover,
+#aam-ui-preview .aam-product :is(button:not(.aam-open):enabled, a[href]:not(.aam-web-link-url,.aam-update-link,[data-setting-action="open-release"])):hover,
 #aam-ui-preview .aam-answer:has(input:enabled):hover .aam-answer-text {
   background: var(--aam-hover-surface);
   box-shadow: var(--aam-hover-shadow);
@@ -820,3 +820,17 @@ button:disabled { cursor: default; opacity: .45; }
 #aam-ui-preview .aam-web-footer {margin-top:8px;}
 #aam-ui-preview .aam-web-footer .aam-settings-help {margin:0 0 4px;line-height:1.35;}
 #aam-ui-preview .aam-web-footer small {display:block;line-height:1.35;}
+
+/* Release metadata is supplied by the monitor state (synthetic in the preview). */
+#aam-ui-preview .aam-release-meta {display:inline-flex;flex-direction:row;align-items:flex-start;gap:0;min-width:0;line-height:1.1;}
+#aam-ui-preview .aam-product a.aam-update-link {font-size:9px;line-height:1.1;color:var(--aam-key-focus);text-decoration:underline;text-underline-offset:2px;white-space:nowrap;background:transparent;box-shadow:none;}
+#aam-ui-preview .aam-update-link:focus-visible {outline:2px solid var(--aam-key-focus);outline-offset:2px;border-radius:3px;}
+
+#aam-ui-preview .aam-product a.aam-update-link:not([href]) {color:var(--aam-secondary);text-decoration:none;cursor:default;}
+
+#aam-ui-preview .aam-settings-version {display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:0;font-size:9px;line-height:1.1;}
+#aam-ui-preview .aam-product .aam-settings-version a {color:var(--aam-key-focus);text-decoration:underline;background:transparent;box-shadow:none;}
+
+/* Available releases stand out from the muted installed-version caption. */
+#aam-ui-preview .aam-product :is(a.aam-update-link[href],.aam-settings-version a) {color:light-dark(#6940bd,#d4acff);font-weight:650;text-decoration-thickness:1px;}
+#aam-ui-preview .aam-product :is(a.aam-update-link[href],.aam-settings-version a)::before {content:"";display:inline-block;width:12px;height:12px;margin-right:4px;vertical-align:-2px;background:currentColor;mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='black' fill-rule='evenodd' d='M13 1c1 5-3 6-3 10-2-1-3-3-3-5-3 4-4 7-3 11a8 8 0 0 0 16-2c0-5-3-10-7-14Z'/%3E%3C/svg%3E") center/contain no-repeat;}

@@ -12,6 +12,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 
 pub use state::*;
+mod releases;
 mod state;
 pub use handle::Handle;
 mod handle;
@@ -26,15 +27,30 @@ pub(crate) async fn run(
     ui: crate::platform::Sender,
 ) {
     let mut state = State::default();
+    let mut releases = releases::Checker::new().await;
+    state.versions = releases.state();
+    if state.versions != published.borrow().versions {
+        state.revision += 1;
+    }
+    published.send_replace(Arc::new(state.clone()));
     let mut preferences_loaded = false;
     let mut stopped = HashSet::new();
     let mut discovered = Vec::new();
     let mut sources = HashMap::<&'static str, Vec<Session>>::new();
     let mut resolved = HashMap::<String, Approval>::new();
-    while let Some(command) = rx.recv().await {
+    loop {
+        let command = tokio::select! {
+            command=rx.recv()=>match command {Some(command)=>command,None=>break},
+            versions=releases.next()=>{
+                state.versions=versions;state.revision+=1;
+                published.send_replace(Arc::new(state.clone()));continue;
+            }
+        };
         let previous_sessions = state.sessions.clone();
         match command {
-            Command::ForgetHistory { client } => {state.history.retain(|key,_|key.client!=client);}
+            Command::ForgetHistory { client } => {
+                state.history.retain(|key, _| key.client != client);
+            }
             Command::FinishedSeen { completions } => {
                 for (key, generation) in completions {
                     if state.unseen_finished.get(&key) == Some(&generation)

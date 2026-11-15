@@ -101,11 +101,26 @@ pub fn snapshot(state: &monitor::State, device: u64) -> Value {
         .map(|s| session(s, state, device))
         .collect();
     let usage=state.usage.as_ref().map(|u|u.windows.iter().map(|w|json!({"label":w.label(),"remaining":w.remaining(monitor::now() as i64),"reset":w.resets_at.and_then(|t|chrono::DateTime::from_timestamp(t,0)).map(|t|t.format("%b %d").to_string()).unwrap_or_default()})).collect::<Vec<_>>()).unwrap_or_default();
-    json!({"version":crate::app::core::VERSION,"revision":state.revision,"sessions":sessions,"usage":usage,"animate":state.preferences.animation,"error":state.discovery_error,"remote":true})
+    json!({"version":state.versions.current,"versions":state.versions,"revision":state.revision,"sessions":sessions,"usage":usage,"animate":state.preferences.animation,"error":state.discovery_error,"remote":true})
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn release_metadata_is_projected_from_monitor_state() {
+        let state = monitor::State {
+            versions: crate::domain::versions::Versions {
+                current: "1.2.3+7".into(),
+                available: crate::domain::versions::Release::stable("v1.3.0"),
+                checked_at: Some(100),
+            },
+            ..Default::default()
+        };
+        let json = snapshot(&state, 1);
+        assert_eq!(json["version"], "1.2.3+7");
+        assert_eq!(json["versions"]["available"]["version"], "v1.3.0");
+        assert_eq!(json["versions"]["checked_at"], 100);
+    }
     #[test]
     fn messages_escape_raw_html_and_do_not_include_local_paths_for_images() {
         let rendered = html("<script>alert(1)</script>\n\n**Hello**", &[], "s");

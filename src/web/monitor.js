@@ -137,7 +137,15 @@
         const action = activities.findLast(a => a.type === 'action' && a.current);
         return {...session, activities, html:message?.html || (message?.text ? `<p>${esc(message.text)}</p>` : ''), request:request?.request || null, progress:action?.text || null};
       };
-      snapshot = {...value,sessions:value.sessions.map(project)}; product.querySelector('.aam-version').textContent = snapshot.version || '';
+      snapshot = {...value,sessions:value.sessions.map(project)}; product.querySelector('.aam-version').textContent = snapshot.versions?.current || snapshot.version || '';
+      const update=product.querySelector('.aam-update-link');
+      const release=value.versions?.available;
+      const releaseUrl=typeof release?.url==='string'&&/^https:\/\/github\.com\/melsomino\/ai-agent-monitor\/releases\/tag\/[^/?#]+$/.test(release.url);
+      const currentVersion=product.querySelector('.aam-version');
+      currentVersion.hidden=!!releaseUrl;
+      update.hidden=!releaseUrl;
+      if(releaseUrl){update.textContent=`${release.version} available`;update.href=release.url;update.setAttribute('aria-label',`Update available: ${release.version}. Open release on GitHub`);}
+      else{const checked=!release&&value.versions?.checked_at!=null;currentVersion.textContent=`${snapshot.versions?.current||snapshot.version||''}${checked?' ✓':''}`;currentVersion.title=checked?'Up to date':'Not checked yet';update.textContent='';update.removeAttribute('href');update.removeAttribute('aria-label');}
       settings.update(value);
       root.style.colorScheme = snapshot.theme || 'dark'; root.dataset.theme = snapshot.theme || 'dark';
       product.classList.toggle('reduce-motion',snapshot.animate === false);

@@ -45,3 +45,5 @@
 .answer:hover { background: transparent; }
 .answer:hover label { background: alpha(@theme_fg_color,.06); border-radius: 9px; }
 .answer:focus label { background: @theme_selected_bg_color; color: @theme_selected_fg_color; border-radius: 9px; }
+
+.release-link,.release-link:link,.release-link:visited {color:@release;font-weight:600;font-size:10px;background:transparent;border:0;padding:0;}

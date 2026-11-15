@@ -1567,6 +1567,87 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
                 .origin,
             old_scroll
         );
+        let original = monitor.snapshot();
+        let mut available = (*original).clone();
+        available.revision += 1;
+        available.versions.available = crate::domain::versions::Release::stable("v99.0.0");
+        _published.send_replace(std::sync::Arc::new(available));
+        controller.receive_sessions();
+        let release = controller.ivars().release.get().unwrap();
+        assert!(!release.isHidden());
+        assert_eq!(release.title().to_string(), "v99.0.0 available");
+        assert!(
+            release.image().is_some(),
+            "Available update has the filled flame"
+        );
+        assert!(
+            (release.frame().origin.y + release.frame().size.height / 2.0 - 60.5).abs() < 0.01,
+            "Single version line centered on title"
+        );
+        assert_eq!(release.frame().size.height, 14.0);
+        let toolbar = controller.ivars().toolbar.get().unwrap();
+        let heading = (0..toolbar.subviews().count())
+            .map(|index| toolbar.subviews().objectAtIndex(index))
+            .find(|view| {
+                view.identifier()
+                    .is_some_and(|id| id.to_string() == "brand-title")
+            })
+            .unwrap();
+        for width in [680.0, 460.0] {
+            controller.change_width(width);
+            assert!(
+                (release.frame().origin.x
+                    - heading.frame().origin.x
+                    - heading.frame().size.width
+                    - 8.0)
+                    .abs()
+                    < 0.01,
+                "Version stays 8pt after the title at every popup width"
+            );
+        }
+
+        let overview = controller.ivars().overview.get().unwrap();
+        assert!(
+            overview.frame().origin.y + overview.frame().size.height <= release.frame().origin.y
+        );
+        controller
+            .ivars()
+            .scroll
+            .get()
+            .unwrap()
+            .contentView()
+            .scrollToPoint(NSPoint::new(0.0, 0.0));
+        export(&bitmap(root), &format!("{name}-release-available"));
+        let mut restored = (*original).clone();
+        restored.versions.checked_at = None;
+        restored.revision += 2;
+        _published.send_replace(std::sync::Arc::new(restored));
+        controller.receive_sessions();
+        assert!(!release.isHidden());
+        assert!(!release.isEnabled());
+        assert_eq!(
+            release.title().to_string(),
+            format!("v{}", monitor.snapshot().versions.current)
+        );
+        assert!(release.image().is_none());
+        assert!(
+            release
+                .toolTip()
+                .unwrap()
+                .to_string()
+                .contains("Not checked yet")
+        );
+        let mut checked = (*monitor.snapshot()).clone();
+        checked.revision += 1;
+        checked.versions.checked_at = Some(100);
+        _published.send_replace(std::sync::Arc::new(checked));
+        controller.receive_sessions();
+        assert_eq!(
+            release.title().to_string(),
+            format!("v{} ✓", monitor.snapshot().versions.current)
+        );
+        assert!(!release.isEnabled());
+        export(&bitmap(root), &format!("{name}-release-current"));
         window.setContentView(None);
     }
     println!(

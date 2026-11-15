@@ -219,6 +219,7 @@ pub struct State {
     root: OnceCell<Retained<PanelView>>,
     backdrop: OnceCell<Retained<visual::MeshView>>,
     toolbar: OnceCell<Retained<NSView>>,
+    release: OnceCell<Retained<super::release_link::ReleaseLink>>,
     footer: OnceCell<Retained<NSView>>,
     footer_height: Cell<f64>,
     footer_extension: OnceCell<Retained<visual::MeshView>>,
@@ -2213,6 +2214,7 @@ impl MenuController {
         else {
             return;
         };
+        shell.sync_versions(&self.monitor().snapshot().versions);
         let index = state.settings_selected.get();
         if tabs.selectedTabViewItemIndex() != index as isize {
             tabs.setSelectedTabViewItemIndex(index as isize);
@@ -3155,24 +3157,27 @@ impl MenuController {
         let title = self.label(
             &toolbar,
             "AI Agent Monitor",
-            rect(61.0, 48.0, 178.0, 25.0),
+            rect(61.0, 48.0, 158.0, 25.0),
             18.0,
             0.35,
             false,
         );
         title.setTextColor(Some(&primary_text_color()));
-        let version = self.label(
-            &toolbar,
-            &format!("v{}", core::VERSION),
-            rect(244.0, 52.0, 80.0, 15.0),
-            9.0,
-            0.0,
-            true,
+        title.setIdentifier(Some(ns_string!("brand-title")));
+        let title_width = title
+            .cell()
+            .map(|cell| cell.cellSize().width.ceil())
+            .unwrap_or(158.0);
+        title.setFrameSize(NSSize::new(title_width, 25.0));
+        let version_x = title.frame().origin.x + title_width + 8.0;
+        let versions = self.monitor().snapshot().versions.clone();
+        let release = super::release_link::ReleaseLink::new(
+            mtm,
+            rect(version_x, 53.5, 332.0 - version_x, 14.0),
         );
-        version.setToolTip(Some(&NSString::from_str(&format!(
-            "AI Agent Monitor {}",
-            core::VERSION
-        ))));
+        release.sync(&versions);
+        toolbar.addSubview(&release);
+        self.ivars().release.set(release).unwrap();
         let overview = self.label(
             &toolbar,
             "",
@@ -6482,6 +6487,17 @@ impl MenuController {
         let snapshot = self.monitor().snapshot();
         if state.revision.replace(snapshot.revision) == snapshot.revision {
             return;
+        }
+        if let Some(release) = state.release.get() {
+            release.sync(&snapshot.versions);
+        }
+        if let Some(overview) = state.overview.get() {
+            let mut frame = overview.frame();
+            frame.origin.y = 28.0;
+            overview.setFrame(frame);
+        }
+        if let Some(shell) = state.settings_shell.get() {
+            shell.sync_versions(&snapshot.versions);
         }
         *state.usage.borrow_mut() = snapshot.usage.clone();
         self.render_footer();

@@ -38,6 +38,8 @@ pub struct Desktop {
     groups: RefCell<Vec<gtk::Box>>,
     footer: gtk::Box,
     usage: gtk::Box,
+    version: gtk::Label,
+    release: gtk::LinkButton,
     filter_label: gtk::Label,
     empty: gtk::Label,
     error: gtk::Label,
@@ -158,12 +160,40 @@ impl Desktop {
         let usage = gtk::Box::new(gtk::Orientation::Vertical, 4);
         footer.pack_start(&usage, false, false, 0);
         let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        bottom.pack_start(
-            &widgets::label(&format!("v{}", crate::app::core::VERSION), "version", false),
-            true,
-            true,
-            0,
+        let versions = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let version = widgets::label("", "version", false);
+        version.set_no_show_all(true);
+        versions.pack_start(&version, false, false, 0);
+        let release = gtk::LinkButton::with_label(
+            "https://github.com/melsomino/ai-agent-monitor/releases",
+            "",
         );
+        style::class(&release, "release-link");
+        let flame = gtk::DrawingArea::new();
+        flame.set_size_request(12, 12);
+        flame.connect_draw(|widget, context| {
+            let color = widget.style_context().color(gtk::StateFlags::NORMAL);
+            let _ = context.save();
+            context.scale(0.5, 0.5);
+            context.set_source_rgba(color.red(), color.green(), color.blue(), color.alpha());
+            context.move_to(13.0, 1.0);
+            context.curve_to(14.0, 6.0, 10.0, 7.0, 10.0, 11.0);
+            context.curve_to(8.0, 10.0, 7.0, 8.0, 7.0, 6.0);
+            context.curve_to(4.0, 10.0, 3.0, 13.0, 4.0, 17.0);
+            context.curve_to(6.0, 27.0, 22.0, 25.0, 20.0, 15.0);
+            context.curve_to(20.0, 10.0, 17.0, 5.0, 13.0, 1.0);
+            context.close_path();
+            let _ = context.fill();
+            let _ = context.restore();
+            glib::Propagation::Proceed
+        });
+        flame.show();
+        release.set_image(Some(&flame));
+        release.set_always_show_image(true);
+        release.set_no_show_all(true);
+        release.set_halign(gtk::Align::Start);
+        versions.pack_start(&release, false, false, 0);
+        bottom.pack_start(&versions, true, true, 0);
         let gear = widgets::icon_button("emblem-system-symbolic", "Settings");
         let quit = widgets::icon_button("system-shutdown-symbolic", "Quit AI Agent Monitor");
         gear.set_can_focus(false);
@@ -193,6 +223,8 @@ impl Desktop {
             groups: RefCell::new(Vec::new()),
             footer,
             usage,
+            version,
+            release,
             filter_label,
             empty,
             error,
@@ -461,6 +493,31 @@ impl Desktop {
         if state.stopping {
             gtk::main_quit();
             return;
+        }
+        self.version.set_text(&format!(
+            "v{}{}",
+            state.versions.current,
+            if state.versions.available.is_none() && state.versions.checked_at.is_some() {
+                " ✓"
+            } else {
+                ""
+            }
+        ));
+        self.version
+            .set_tooltip_text(Some(if state.versions.checked_at.is_some() {
+                "Up to date"
+            } else {
+                "Not checked yet"
+            }));
+        if let Some(release) = &state.versions.available {
+            self.version.hide();
+            self.release
+                .set_label(&format!("{} available", release.version));
+            self.release.set_uri(&release.url);
+            self.release.show();
+        } else {
+            self.release.hide();
+            self.version.show();
         }
         self.notifications.borrow_mut().update(&state);
         self.panel.publish(&state, self.window.is_visible());

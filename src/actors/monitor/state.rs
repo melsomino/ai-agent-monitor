@@ -63,6 +63,7 @@ pub struct Notice {
 #[derive(Clone, Default)]
 pub struct State {
     pub revision: u64,
+    pub versions: crate::domain::versions::Versions,
     pub sessions: Vec<Session>,
     /// Session key -> completion generation. A stale window acknowledgement
     /// must never clear a later completion of the same session.
