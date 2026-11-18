@@ -939,3 +939,29 @@ button:disabled { cursor: default; opacity: .45; }
 #aam-ui-preview .aam-preview-unpin .aam-icon{width:14px;height:14px;transform:rotate(-35deg)}
 #aam-ui-preview .aam-preview-unpin:hover{background:var(--aam-hover-surface);color:var(--aam-text)}
 #aam-ui-preview.aam-preview-detached .aam-preview-unpin{display:none}
+
+/* Standalone command disclosure shares the compact Allow similar pill. */
+#aam-ui-preview .aam-command-heading {margin:10px 0 4px;}
+#aam-ui-preview .aam-command-disclosure {display:inline-flex;align-items:center;gap:0;min-height:32px;padding:0;border:1px solid #bba7f529;border-radius:999px;background:linear-gradient(135deg,light-dark(#e6ddef,#66587777),light-dark(#ded2ee,#56426c70));box-shadow:none;}
+#aam-ui-preview .aam-command-disclosure:hover {background:var(--aam-hover-surface);box-shadow:none;}
+#aam-ui-preview .aam-command-disclosure .aam-command-label {padding:6px 10px;}
+#aam-ui-preview .aam-command-disclosure .aam-command-chevron {position:relative;display:grid;place-items:center;align-self:stretch;flex:0 0 28px;min-height:30px;}
+#aam-ui-preview .aam-command-disclosure .aam-command-chevron::before {content:"";position:absolute;left:0;top:7px;bottom:7px;width:1px;background:light-dark(#80679955,#cbb5f04a);}
+
+/* Main command and scope disclosures share a trailing split segment. */
+#aam-ui-preview .aam-product .aam-command-split {display:inline-flex;align-items:center;gap:0;min-height:32px;padding:0;border-radius:999px;}
+#aam-ui-preview .aam-product .aam-command-split > .aam-action[data-response] {min-height:30px;padding:6px 10px;border:0;border-radius:999px 0 0 999px;background:transparent!important;box-shadow:none;}
+#aam-ui-preview .aam-product .aam-command-split.aam-primary > button {color:#fff;}
+#aam-ui-preview .aam-product .aam-command-split > .aam-action[data-response]:enabled:hover {background:#ffffff14!important;}
+#aam-ui-preview .aam-command-split > :is(.aam-command-expand,.aam-scope-toggle) {position:relative;display:grid;place-items:center;align-self:stretch;flex:0 0 28px;width:28px;min-height:30px;padding:0;border:0;border-radius:0 999px 999px 0;background:transparent;color:inherit;cursor:pointer;}
+#aam-ui-preview .aam-command-split > :is(.aam-command-expand,.aam-scope-toggle)::before {content:"";position:absolute;left:0;top:7px;bottom:7px;width:1px;background:currentColor;opacity:.3;}
+#aam-ui-preview .aam-command-split > :is(.aam-command-expand,.aam-scope-toggle):hover {background:#ffffff14;}
+#aam-ui-preview .aam-command-split:has([data-response]:disabled) {opacity:.55;}
+#aam-ui-preview .aam-actions > .aam-action-detail > .aam-command-wrap {order:1;flex:0 0 100%;width:100%;min-width:0;}
+#aam-ui-preview .aam-action-detail > .aam-command-wrap > .aam-command {margin:4px 0 0;}
+
+@media (pointer:coarse) {
+  #aam-ui-preview .aam-product .aam-command-split {min-height:44px;}
+  #aam-ui-preview .aam-product .aam-command-split > .aam-action[data-response],
+  #aam-ui-preview .aam-command-split > :is(.aam-command-expand,.aam-scope-toggle) {min-height:42px;}
+}

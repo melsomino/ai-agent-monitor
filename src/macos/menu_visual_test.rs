@@ -2,6 +2,24 @@
 use super::*;
 use crate::domain::interaction::{Choice, Interaction, Question};
 
+fn button_with_identifier(view: &NSView, id: &str) -> Option<Retained<NSButton>> {
+    if let Some(button) = view.downcast_ref::<NSButton>()
+        && button
+            .identifier()
+            .is_some_and(|value| value.to_string() == id)
+    {
+        return Some(Retained::from(button));
+    }
+    let children = view.subviews();
+    for index in 0..children.count() {
+        let child = children.objectAtIndex(index);
+        if let Some(button) = button_with_identifier(&child, id) {
+            return Some(button);
+        }
+    }
+    None
+}
+
 fn fixture(id: &str, activity: Activity) -> Session {
     {
         let mut __session = Session {
@@ -923,19 +941,48 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
         );
         export(&scrolled, &format!("{name}-scrolled"));
         list.scrollPoint(NSPoint::new(0.0, 0.0));
-        let disclosure = controller
+        let key = format!("context:{}:0", request.approval_key().unwrap());
+        let disclosure =
+            button_with_identifier(root, &key).expect("command disclosure inside Allow once");
+        let command = request.interaction().command.unwrap();
+        assert!(
+            text_label(root, &command).is_none(),
+            "main command starts fully folded"
+        );
+        assert!(
+            text_label(root, "Command").is_none(),
+            "no separate Command heading above approval actions"
+        );
+        let allow = controller
             .ivars()
             .buttons
             .borrow()
             .iter()
-            .find(|button| {
-                button.button.identifier().is_some_and(|id| {
-                    id.to_string().starts_with("context:") && id.to_string().ends_with(":0")
+            .find(|item| {
+                item.button.identifier().is_some_and(|id| {
+                    controller
+                        .ivars()
+                        .request_controls
+                        .borrow()
+                        .get(&id.to_string())
+                        .is_some_and(|control| {
+                            control.label == "Allow once" && control.session.key() == request.key()
+                        })
                 })
             })
             .unwrap()
             .button
             .clone();
+        assert_eq!(
+            disclosure.frame().origin.x + disclosure.frame().size.width,
+            allow.frame().origin.x + allow.frame().size.width
+        );
+        assert_eq!(disclosure.frame().origin.y, allow.frame().origin.y);
+        assert_eq!(disclosure.frame().size.height, allow.frame().size.height);
+        assert!(
+            disclosure.frame().origin.x > allow.frame().origin.x,
+            "arrow is a distinct trailing segment"
+        );
         let disclosure_id = disclosure.identifier().unwrap().to_string();
         assert!(
             !controller
@@ -943,14 +990,22 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
                 .contains(&disclosure_id)
         );
         let height = list.frame().size.height;
-        // SAFETY: The real controller implements this selector; the button is retained.
+        assert!(disclosure.refusesFirstResponder());
+        while commands.try_recv().is_ok() {}
+        // SAFETY: Exercise the real trailing button's native target/action.
         unsafe {
-            let _: () = msg_send![&*controller,respondToRequest:&*disclosure];
+            disclosure.performClick(None);
         }
+        assert!(
+            commands.try_recv().is_err(),
+            "command disclosure must never submit an approval"
+        );
         assert!(
             controller.ivars().list.get().unwrap().frame().size.height > height,
             "long command must expand its actual native row"
         );
+        let command_text = text_label(root, &command).expect("disclosure reveals the full command");
+        assert_eq!(command_text.maximumNumberOfLines(), 0);
         export(&bitmap(root), &format!("{name}-command-expanded"));
         // SAFETY: The real controller implements this selector; the button is retained.
         unsafe {
@@ -964,29 +1019,64 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             text_label(root, "cargo test").is_none(),
             "scope starts hidden"
         );
-        let scope = controller
+        let scope_id = controller
+            .ivars()
+            .request_controls
+            .borrow()
+            .iter()
+            .find_map(|(id, control)| {
+                (id.starts_with("context:")
+                    && !id.ends_with(":0")
+                    && control.session.key() == request.key())
+                .then(|| id.clone())
+            })
+            .unwrap();
+        let scope =
+            button_with_identifier(root, &scope_id).expect("scope disclosure inside Allow similar");
+        let similar = controller
             .ivars()
             .buttons
             .borrow()
             .iter()
             .find(|item| {
                 item.button.identifier().is_some_and(|id| {
-                    id.to_string().starts_with("context:") && !id.to_string().ends_with(":0")
+                    controller
+                        .ivars()
+                        .request_controls
+                        .borrow()
+                        .get(&id.to_string())
+                        .is_some_and(|control| {
+                            control.label == "Allow similar"
+                                && control.session.key() == request.key()
+                        })
                 })
             })
-            .expect("scope disclosure beside its approval button")
+            .unwrap()
             .button
             .clone();
+        assert_eq!(
+            scope.frame().origin.x + scope.frame().size.width,
+            similar.frame().origin.x + similar.frame().size.width
+        );
+        assert_eq!(scope.frame().origin.y, similar.frame().origin.y);
+        assert_eq!(scope.frame().size.height, similar.frame().size.height);
+        assert!(scope.frame().origin.x > similar.frame().origin.x);
+        assert!(scope.refusesFirstResponder());
         let scope_id = scope.identifier().unwrap().to_string();
         assert!(
             !controller
                 .keyboard_targets(&controller.ivars().layout.borrow())
                 .contains(&scope_id)
         );
-        // SAFETY: Exercise the actual disclosure handler without submitting an approval.
+        while commands.try_recv().is_ok() {}
+        // SAFETY: Exercise the actual scope segment without submitting an approval.
         unsafe {
-            let _: () = msg_send![&*controller,respondToRequest:&*scope];
+            scope.performClick(None);
         }
+        assert!(
+            commands.try_recv().is_err(),
+            "scope disclosure must not submit an approval"
+        );
         assert!(
             text_label(root, "cargo test").is_some(),
             "disclosure reveals the literal scope"

@@ -115,6 +115,8 @@ Codex connects automatically. For Claude Code or Cline, open **Settings → Agen
 
 Click the robot icon in the macOS menu bar or GNOME top panel to see your sessions.
 
+On macOS, the pin in the popup's upper-left corner detaches the monitor into a regular window with a Dock and Cmd+Tab entry. Pin it back from the native title bar. Popup width and detached window position and size are saved independently.
+
 The counters use three colors: **green** for working sessions, **orange** for pending requests, and **blue** for unseen completions. Sessions with unseen completions have a blue checkmark.
 
 Completion indicators clear when you interact with that session. See the [completion rules](docs/design/state-models.md#state-activity) for details.
@@ -122,6 +124,8 @@ Completion indicators clear when you interact with that session. See the [comple
 Select a session to see its latest messages, working directory, Git branch, and any pending requests. Earlier messages can be loaded from the session history.
 
 When an agent requests permission or asks a question, the available responses appear in the session panel.
+
+On macOS and in browser access, the arrow inside **Allow once** reveals the full command; the arrow inside **Allow similar** reveals its scope. These arrows only show details. Click the action text to send the decision.
 
 Responses are checked against the current request before being sent. Requests already resolved in the agent's own interface are removed from the monitor.
 

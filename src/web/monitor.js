@@ -156,10 +156,11 @@
       if (session.status === 'finished') art = '<circle cx="12" cy="12" r="10"/><path class="aam-cutout" d="m6 12 2-2 3 3 6-6 2 2-8 8Z"/>';
       return `<${session.status === 'finished' ? 'button type="button" data-command="seen"' : 'span'} class="aam-state" data-status="${esc(session.status)}" aria-label="${label}" title="${session.status === 'finished' ? 'Mark as seen' : label}"><span class="aam-icon"><svg viewBox="0 0 24 24">${art}</svg></span></${session.status === 'finished' ? 'button' : 'span'}>`;
     }
-    function commandBlock(text, key, caption, copy) {
+    function commandBlock(text, key, caption) {
       if (!text) return '';
       const id = `aam-code-${++counter}`, isExpanded = contexts.has(key);
-      return `<p class="aam-command-caption">${icon(copy ? 'terminal' : 'sparkles')}${esc(caption)}<button type="button" class="aam-command-expand" data-context="${esc(key)}" tabindex="-1" aria-controls="${id}" aria-expanded="${isExpanded}" aria-label="${isExpanded ? 'Collapse' : 'Show full'} command" hidden>${icon('chevron-down')}</button></p><div class="aam-command-wrap"><pre id="${id}" class="aam-command ${isExpanded ? 'is-expanded' : ''}"><code>${esc(text)}</code></pre></div>`;
+      const label = isExpanded ? 'Hide command' : 'Show command';
+      return `<div class="aam-command-heading"><button type="button" class="aam-action aam-command-expand aam-command-disclosure" data-context="${esc(key)}" tabindex="-1" aria-controls="${id}" aria-expanded="${isExpanded}" aria-label="${label}"><span class="aam-command-label">${esc(caption)}</span><span class="aam-command-chevron">${icon('chevron-down')}</span></button></div><div class="aam-command-wrap" ${isExpanded ? '' : 'hidden'}><pre id="${id}" class="aam-command ${isExpanded ? 'is-expanded' : ''}"><code>${esc(text)}</code></pre></div>`;
     }
     function requestMarkup(session) {
       const request = session.request; if (!request) return '';
@@ -179,15 +180,20 @@
           return `<fieldset data-question="${esc(q.id)}"><legend class="aam-question-title">${esc(q.title)}</legend>${choices}${q.freeform ? `<div class="${single ? 'aam-single-own' : ''}"><label class="aam-answer"><input type="radio" name="q-${index}-${esc(session.id)}" value="custom" data-own="true" tabindex="-1" data-focus="own:${index}" ${single ? 'hidden' : ''} ${off}>${own}</label>${single ? `<button type="submit" class="aam-action aam-primary" data-focus="submit" ${off}>Send answer</button>` : ''}</div>` : ''}</fieldset>`;
         }).join('')}${single ? '' : `<button type="submit" class="aam-action aam-primary aam-send" data-focus="submit" ${off}>Send answer</button>`}</form>`;
       } else controls += `<p class="aam-question-title">${esc(request.body)}</p>`;
-      controls += commandBlock(request.command, `${session.id}:${request.context}:command`, 'Command', true);
+      const commandAction = request.command ? (request.actions || []).find(action => !action.detail && (action.primary || /^allow once$/i.test(action.label))) : null;
+      if(!commandAction) controls += commandBlock(request.command, `${session.id}:${request.context}:command`, 'Command');
       const immediate = (request.actions || []).filter(action => !action.detail), scoped = (request.actions || []).filter(action => action.detail);
       const button = action => `<button type="button" class="aam-action ${action.primary ? 'aam-primary' : ''}" data-response="${esc(action.id)}" data-focus="action:${esc(action.id)}" ${off}>${action.label === 'Allow similar' ? '' : icon(action.id === 'deny' || /deny|decline/i.test(action.label) ? 'x' : 'check')}${esc(action.label)}</button>`;
       const scopedButton = action => {
         const key=`${session.id}:${request.context}:${action.id}:scope`, open=contexts.has(key), id=`aam-scope-${++counter}`;
-        return `<div class="aam-action-detail"><div class="aam-scope-row">${button(action)}<button type="button" class="aam-scope-toggle" data-scope="${esc(key)}" tabindex="-1" aria-controls="${id}" aria-expanded="${open}" aria-label="${open?'Hide':'Show'} command scope">${icon('chevron-down')}</button></div><pre id="${id}" class="aam-command is-expanded" ${open?'':'hidden'}><code>${esc(action.detail)}</code></pre></div>`;
+        return `<div class="aam-action-detail"><div class="aam-scope-row aam-action ${action.primary?'aam-primary':''} aam-command-split">${button({...action,primary:false})}<button type="button" class="aam-scope-toggle" data-scope="${esc(key)}" tabindex="-1" aria-controls="${id}" aria-expanded="${open}" aria-label="${open?'Hide':'Show'} command scope">${icon('chevron-down')}</button></div><pre id="${id}" class="aam-command is-expanded" ${open?'':'hidden'}><code>${esc(action.detail)}</code></pre></div>`;
+      };
+      const commandButton = action => {
+        const key=`${session.id}:${request.context}:command`, open=contexts.has(key), id=`aam-code-${++counter}`;
+        return `<div class="aam-action-detail"><div class="aam-scope-row aam-action ${action.primary?'aam-primary':''} aam-command-split">${button({...action,primary:false})}<button type="button" class="aam-command-expand" data-context="${esc(key)}" tabindex="-1" aria-controls="${id}" aria-expanded="${open}" aria-label="${open?'Hide':'Show'} command">${icon('chevron-down')}</button></div><div class="aam-command-wrap" ${open?'':'hidden'}><pre id="${id}" class="aam-command ${open?'is-expanded':''}"><code>${esc(request.command)}</code></pre></div></div>`;
       };
       const ordered=root.classList.contains('aam-preview-compact-hovers')?(request.actions||[]):[...immediate,...scoped];
-      controls += `<div class="aam-actions">${ordered.map(action=>action.detail?scopedButton(action):button(action)).join('')}</div>`;
+      controls += `<div class="aam-actions">${ordered.map(action=>action===commandAction?commandButton(action):action.detail?scopedButton(action):button(action)).join('')}</div>`;
       if (!request.actions?.length && !request.questions?.length) controls += '<button type="button" class="aam-action" data-command="open">Answer in editor…</button>';
       const note = busy ? (request.phase === 'sending' ? 'Sending…' : 'Checking delivery…') : request.error || (!request.enabled ? 'Waiting for a live connection to the agent.' : '');
       return `<div class="aam-question ${request.questions?.length ? '' : 'aam-approval'}" data-render-key="request:${esc(request.context)}"><span class="aam-request-mark" aria-hidden="true">${icon('circle-alert')}</span>${controls}${note ? `<p class="aam-status-note" role="status">${esc(note)}</p>` : ''}</div>`;
@@ -386,11 +392,7 @@
 
       }
       for(const input of product.querySelectorAll('.aam-compose-input')) {if(input.getClientRects().length)resizeComposer(input);}
-      for(const button of product.querySelectorAll('.aam-command-expand')) {
-        const command=document.getElementById(button.getAttribute('aria-controls'));if(!command.getClientRects().length)continue;
-        const code=command.querySelector('code'),style=getComputedStyle(command);
-        button.hidden=code.scrollHeight<=parseFloat(style.lineHeight)*2+1;
-      }
+      for(const button of product.querySelectorAll('.aam-command-expand')) button.hidden=false;
       const backdrop=product.querySelector('.aam-backdrop'),footer=product.querySelector('.aam-footer');
       product.style.setProperty('--aam-footer-height',footer.offsetHeight+'px');
       const height=list.scrollHeight;backdrop.style.height=height+'px';
@@ -458,7 +460,7 @@
 
       if(event.target.closest('[data-command="settings"]')){settings.open();return;}
       const scope=event.target.closest('.aam-scope-toggle');if(scope){const key=scope.dataset.scope,open=!contexts.has(key);if(open)contexts.add(key);else contexts.delete(key);document.getElementById(scope.getAttribute('aria-controls')).hidden=!open;scope.setAttribute('aria-expanded',open);scope.setAttribute('aria-label',open?'Hide command scope':'Show command scope');scheduleLayout();return;}
-      const expander=event.target.closest('.aam-command-expand');if(expander){const key=expander.dataset.context,expand=!contexts.has(key);if(expand)contexts.add(key);else contexts.delete(key);document.getElementById(expander.getAttribute('aria-controls')).classList.toggle('is-expanded',expand);expander.setAttribute('aria-expanded',expand);expander.setAttribute('aria-label',expand?'Collapse command':'Show full command');scheduleLayout();return;}
+      const expander=event.target.closest('.aam-command-expand');if(expander){const key=expander.dataset.context,expand=!contexts.has(key);if(expand)contexts.add(key);else contexts.delete(key);const command=document.getElementById(expander.getAttribute('aria-controls'));command.classList.toggle('is-expanded',expand);command.closest('.aam-command-wrap').hidden=!expand;expander.setAttribute('aria-expanded',expand);expander.setAttribute('aria-label',expand?'Hide command':'Show command');scheduleLayout();return;}
       const link=event.target.closest('a');if(link){event.preventDefault();if(/^(https?:|mailto:)/i.test(link.href))emit({type:'link',url:link.href});return;}
       const button=event.target.closest('button');if(!button||button.disabled)return;
       const session=sessionFor(button), command=button.dataset.command;

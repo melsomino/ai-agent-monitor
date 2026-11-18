@@ -1463,8 +1463,9 @@ fn request_action_layout(
 ) -> (Vec<NSRect>, f64) {
     let mut frames = Vec::new();
     let (mut x, mut y, mut row_height) = (0.0, 0.0, 0.0_f64);
-    for (size, context) in sizes.iter().zip(contexts) {
-        let block_width = size.width + if context.is_some() { 36.0 } else { 0.0 };
+    for size in sizes {
+        // Width already includes the embedded trailing disclosure segment.
+        let block_width = size.width;
         if x > 0.0 && x + block_width > width {
             x = 0.0;
             y += row_height + 10.0;
@@ -1517,6 +1518,12 @@ fn request_glyph(control: &RequestControl) -> Option<visual::DecisionGlyph> {
         "Deny" => Some(visual::DecisionGlyph::Cross),
         _ => None,
     }
+}
+
+fn command_action(control: &RequestControl) -> bool {
+    control.detail.trim().is_empty()
+        && matches!(control.label.as_str(), "Allow once" | "Allow")
+        && matches!(control.kind, ControlKind::Reply(Response::Action(_)))
 }
 
 // AppKit may re-enter callbacks while a window is shown or reconciled.
@@ -5530,20 +5537,38 @@ impl MenuController {
     ) -> Option<(Retained<SessionListView>, f64)> {
         let scoped = action.is_some();
         let sections = if let Some((index, action)) = action {
-            if action.detail.trim().is_empty()
-                || !matches!(action.kind, ControlKind::Reply(Response::Action(_)))
-            {
-                return None;
+            if command_action(action) {
+                let key = format!(
+                    "context:{}:0",
+                    session.approval_key().unwrap_or_else(|| session.key())
+                );
+                if !self.ivars().expanded_contexts.borrow().contains(&key) {
+                    return None;
+                }
+                vec![(
+                    0,
+                    "Command".to_owned(),
+                    session
+                        .interaction()
+                        .command
+                        .filter(|text| !text.trim().is_empty())?,
+                )]
+            } else {
+                if action.detail.trim().is_empty()
+                    || !matches!(action.kind, ControlKind::Reply(Response::Action(_)))
+                {
+                    return None;
+                }
+                let key = format!(
+                    "context:{}:{}",
+                    session.approval_key().unwrap_or_else(|| session.key()),
+                    index + 1
+                );
+                if !self.ivars().expanded_contexts.borrow().contains(&key) {
+                    return None;
+                }
+                vec![(index + 1, action.label.clone(), action.detail.clone())]
             }
-            let key = format!(
-                "context:{}:{}",
-                session.approval_key().unwrap_or_else(|| session.key()),
-                index + 1
-            );
-            if !self.ivars().expanded_contexts.borrow().contains(&key) {
-                return None;
-            }
-            vec![(index + 1, action.label.clone(), action.detail.clone())]
         } else {
             session
                 .interaction()
@@ -5695,6 +5720,89 @@ impl MenuController {
         }
         view.setFrameSize(NSSize::new(width, y));
         Some((view, y))
+    }
+
+    fn action_disclosure(
+        &self,
+        view: &NSView,
+        session: &Session,
+        frame: NSRect,
+        section: usize,
+        primary: bool,
+    ) {
+        let key = format!(
+            "context:{}:{section}",
+            session.approval_key().unwrap_or_else(|| session.key())
+        );
+        let expanded = self.ivars().expanded_contexts.borrow().contains(&key);
+        let arrow_frame = rect(
+            frame.origin.x + frame.size.width - 28.0,
+            frame.origin.y,
+            28.0,
+            frame.size.height,
+        );
+        // This trailing segment is above the transparent approval hit target.
+        // Its parent approval surface supplies the continuous fill and hover.
+        let arrow: Retained<ActionButton> =
+            unsafe { msg_send![ActionButton::alloc(self.mtm()), initWithFrame: arrow_frame] };
+        arrow.setBordered(false);
+        arrow.setButtonType(NSButtonType::MomentaryPushIn);
+        arrow.setTitle(ns_string!(""));
+        arrow.setIdentifier(Some(&NSString::from_str(&key)));
+        arrow.setRefusesFirstResponder(true);
+        let description = match (section == 0, expanded) {
+            (true, false) => ns_string!("Show command"),
+            (true, true) => ns_string!("Hide command"),
+            (false, false) => ns_string!("Show command scope"),
+            (false, true) => ns_string!("Hide command scope"),
+        };
+        arrow.setToolTip(Some(description));
+        arrow.setImage(
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                if expanded {
+                    ns_string!("chevron.up")
+                } else {
+                    ns_string!("chevron.down")
+                },
+                Some(description),
+            )
+            .as_deref(),
+        );
+        arrow.setImagePosition(NSCellImagePosition::ImageOnly);
+        let tint = if primary {
+            NSColor::whiteColor()
+        } else {
+            primary_text_color()
+        };
+        arrow.setContentTintColor(Some(&tint));
+        unsafe {
+            arrow.setTarget(Some(self));
+            arrow.setAction(Some(sel!(respondToRequest:)));
+            let _: () = msg_send![&*arrow, setAccessibilityLabel: description];
+        }
+        let decoration: Retained<StatusContentView> = unsafe {
+            msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: arrow.bounds()]
+        };
+        let divider = NSBox::initWithFrame(
+            NSBox::alloc(self.mtm()),
+            rect(0.0, 7.0, 1.0, (frame.size.height - 14.0).max(1.0)),
+        );
+        divider.setBoxType(NSBoxType::Custom);
+        divider.setTitlePosition(NSTitlePosition::NoTitle);
+        divider.setBorderWidth(0.0);
+        divider.setFillColor(&tint.colorWithAlphaComponent(0.3));
+        decoration.addSubview(&divider);
+        arrow.addSubview(&decoration);
+        view.addSubview(&arrow);
+        self.ivars().request_controls.borrow_mut().insert(
+            key.clone(),
+            RequestControl {
+                session: session.clone(),
+                label: String::new(),
+                detail: String::new(),
+                kind: ControlKind::ContextToggle(key),
+            },
+        );
     }
 
     fn session_metadata(&self, session: &Session) -> (Retained<SessionListView>, f64) {
@@ -5890,7 +5998,13 @@ impl MenuController {
                 0.0
             };
             let control_width = content_width - 2.0 * control_inset;
-            let context = if is_question && inline.is_none() {
+            let command_control = session
+                .interaction()
+                .command
+                .as_ref()
+                .filter(|text| !text.trim().is_empty())
+                .and_then(|_| controls.iter().position(command_action));
+            let context = if is_question && inline.is_none() && command_control.is_none() {
                 self.request_context(session, content_width, None)
             } else {
                 None
@@ -5901,7 +6015,14 @@ impl MenuController {
                 .unwrap_or(0.0);
             let control_sizes: Vec<_> = controls
                 .iter()
-                .map(|control| {
+                .enumerate()
+                .map(|(index, control)| {
+                    let disclosure_width =
+                        if command_control == Some(index) || !control.detail.trim().is_empty() {
+                            28.0
+                        } else {
+                            0.0
+                        };
                     let natural = NSTextField::wrappingLabelWithString(
                         &NSString::from_str(&control.label),
                         self.mtm(),
@@ -5916,16 +6037,9 @@ impl MenuController {
                     let width = (natural.frame().size.width.ceil()
                         + 4.0
                         + 2.0 * BUTTON_HORIZONTAL_INSET
-                        + icon_width)
-                        .clamp(
-                            52.0,
-                            control_width
-                                - if control.detail.trim().is_empty() {
-                                    0.0
-                                } else {
-                                    36.0
-                                },
-                        );
+                        + icon_width
+                        + disclosure_width)
+                        .clamp(52.0, control_width);
                     let measure = NSTextField::wrappingLabelWithString(
                         &NSString::from_str(&control.label),
                         self.mtm(),
@@ -5937,7 +6051,10 @@ impl MenuController {
                             cell.cellSizeForBounds(rect(
                                 0.0,
                                 0.0,
-                                width - 2.0 * BUTTON_HORIZONTAL_INSET - icon_width,
+                                width
+                                    - 2.0 * BUTTON_HORIZONTAL_INSET
+                                    - icon_width
+                                    - disclosure_width,
                                 100000.0,
                             ))
                             .height
@@ -5959,8 +6076,9 @@ impl MenuController {
             let context_heights: Vec<_> = action_contexts
                 .iter()
                 .zip(&controls)
-                .map(|(context, control)| {
-                    if control.detail.trim().is_empty() {
+                .enumerate()
+                .map(|(index, (context, control))| {
+                    if control.detail.trim().is_empty() && command_control != Some(index) {
                         None
                     } else {
                         Some(context.as_ref().map_or(0.0, |(_, height)| *height))
@@ -6601,61 +6719,6 @@ impl MenuController {
                             ));
                             document.addSubview(context);
                         }
-                        if !control.detail.trim().is_empty() {
-                            let toggle_key = format!("context:{key}:{}", index + 1);
-                            let expanded = self
-                                .ivars()
-                                .expanded_contexts
-                                .borrow()
-                                .contains(&toggle_key);
-                            let toggle = self.action_button(
-                                &document,
-                                "",
-                                sel!(respondToRequest:),
-                                &toggle_key,
-                                rect(
-                                    content_x
-                                        + control_inset
-                                        + control_frames[index].origin.x
-                                        + control_frames[index].size.width
-                                        + 4.0,
-                                    message_end
-                                        + 8.0
-                                        + control_inset
-                                        + control_frames[index].origin.y
-                                        + (control_frames[index].size.height - 28.0) / 2.0,
-                                    28.0,
-                                    28.0,
-                                ),
-                                false,
-                            );
-                            toggle.setRefusesFirstResponder(true);
-                            toggle.setImage(
-                                NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                                    if expanded {
-                                        ns_string!("chevron.up")
-                                    } else {
-                                        ns_string!("chevron.down")
-                                    },
-                                    Some(ns_string!("Show or hide command scope")),
-                                )
-                                .as_deref(),
-                            );
-                            toggle.setToolTip(Some(if expanded {
-                                ns_string!("Hide command scope")
-                            } else {
-                                ns_string!("Show command scope")
-                            }));
-                            self.ivars().request_controls.borrow_mut().insert(
-                                toggle_key.clone(),
-                                RequestControl {
-                                    session: session.clone(),
-                                    label: String::new(),
-                                    detail: String::new(),
-                                    kind: ControlKind::ContextToggle(toggle_key),
-                                },
-                            );
-                        }
                         let id = format!("response:{key}:{index}");
                         let button = self.action_button(
                             &document,
@@ -6696,10 +6759,19 @@ impl MenuController {
                         caption.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.23)));
                         caption.setAlignment(NSTextAlignment::Center);
                         let frame = button.frame();
+                        let disclosure_width = if command_control == Some(index)
+                            || !control.detail.trim().is_empty()
+                        {
+                            28.0
+                        } else {
+                            0.0
+                        };
                         let glyph = request_glyph(&control);
                         let icon_width = if glyph.is_some() { 21.0 } else { 0.0 };
-                        let available =
-                            frame.size.width - 2.0 * BUTTON_HORIZONTAL_INSET - icon_width;
+                        let available = frame.size.width
+                            - 2.0 * BUTTON_HORIZONTAL_INSET
+                            - icon_width
+                            - disclosure_width;
                         let caption_width = caption
                             .cell()
                             .map(|cell| cell.cellSize().width.ceil())
@@ -6714,8 +6786,9 @@ impl MenuController {
                                     .ceil()
                             })
                             .unwrap_or(16.0);
-                        let group_x =
-                            frame.origin.x + (frame.size.width - caption_width - icon_width) / 2.0;
+                        let group_x = frame.origin.x
+                            + (frame.size.width - disclosure_width - caption_width - icon_width)
+                                / 2.0;
                         caption.setFrame(rect(
                             group_x + icon_width,
                             frame.origin.y + (frame.size.height - caption_height) / 2.0,
@@ -6772,6 +6845,16 @@ impl MenuController {
                                 ));
                                 surface.setCornerRadius(12.0);
                             }
+                        }
+                        if command_control == Some(index) || !control.detail.trim().is_empty() {
+                            let section = if command_control == Some(index) {
+                                0
+                            } else {
+                                index + 1
+                            };
+                            let primary = index == 0
+                                && matches!(control.label.as_str(), "Allow once" | "Allow");
+                            self.action_disclosure(&document, session, frame, section, primary);
                         }
                         button.setToolTip(Some(&NSString::from_str(
                             &if control.detail.is_empty() {
@@ -8380,18 +8463,21 @@ mod close_tests {
             ]
         );
         assert_eq!(height, 32.0);
+        let joined = [Some(0.0), None, Some(0.0)];
+        assert_eq!(
+            request_action_layout(&sizes, &joined, 420.0).0,
+            frames,
+            "an embedded disclosure must not reserve a second outside button"
+        );
         let (expanded, height) = request_action_layout(&sizes, &open, 420.0);
         assert_eq!(expanded, frames);
         assert_eq!(request_scope_y(&frames, &open, 2), 36.0);
         assert_eq!(height, 96.0);
-        let (wrapped, height) = request_action_layout(&sizes, &closed, 362.0);
+        let (wrapped, height) = request_action_layout(&sizes, &closed, 340.0);
         assert_eq!(wrapped[2], rect(0.0, 42.0, 140.0, 32.0));
         assert_eq!(height, 74.0);
-        for (frame, context) in wrapped.iter().zip(closed) {
-            assert!(
-                frame.origin.x + frame.size.width + if context.is_some() { 36.0 } else { 0.0 }
-                    <= 362.0
-            );
+        for frame in &wrapped {
+            assert!(frame.origin.x + frame.size.width <= 340.0);
         }
         assert_eq!(request_action_layout(&[], &[], 362.0), (vec![], 0.0));
     }

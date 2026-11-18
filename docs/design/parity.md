@@ -74,7 +74,7 @@ The [glass revision](components/glass-surfaces.md) supersedes the neutral H/M pa
 | PR-02 |Agent action mapping |Allow/deny simulated |Offered IDs |Offered IDs |C/M |
 | PR-03 |Action layout |Partial flex wrap |All-fit row else column |All-fit row else column |D,[D-07](discrepancies.md#d-07) |
 | PR-04 |Action-specific context |All context before buttons |Immediately before action |Immediately before action |D |
-| PR-05 |Command two-line expander |Absent |Measured2lines,pointer-only |Measured2lines,pointer-only |M |
+| PR-05 |Main command disclosure |Allow once split pill, fully folded/full text |Same; legacy two-line fallback without Allow |Measured two-line expander |P/M, [RQ-02](components/requests.md) |
 | PR-06 |Command dark bg |Hover token |Opaque darker token |Same |D |
 | PR-07 |Single-question presets |No single branch |Direct submit |Direct submit |M |
 | PR-08 |Multiple independent radios |Yes |Yes |Yes |C |
