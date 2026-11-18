@@ -367,7 +367,7 @@ impl Pending {
                         text.plain(&format!("\n\n{}:\n", action.label));
                         text.code_block(
                             &short(&action.detail, 300),
-                            (action.label == "Allow similar commands").then_some("bash"),
+                            (action.label == "Allow similar").then_some("bash"),
                         );
                     }
                 }

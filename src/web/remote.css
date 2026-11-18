@@ -13,3 +13,14 @@ html,body {height:100%;background:#101019;color:#efedf7;color-scheme:light dark;
 #aam-remote-gate button {border:1px solid #c6adfa55;border-radius:12px;padding:10px 24px;background:#4d3d68;color:#fff;}
 #aam-remote-gate[hidden],#aam-remote-notice[hidden] {display:none;}
 @media(max-width:380px){#aam-ui-preview .aam-version {display:none;}#aam-ui-preview .aam-brand-robot {width:32px;flex-basis:32px;}}
+
+/* Opt-in, local browser diagnostics: ?diagnostics=1. Keep controls outside the monitor. */
+#aam-diagnostics{position:fixed;inset:0 0 auto;z-index:105;padding:8px 12px;background:#241e33;color:#eee8fa;border-bottom:1px solid #a68bc34d;font-size:11px;line-height:1.4;}
+#aam-diagnostics label{display:inline-flex;align-items:center;gap:6px;}
+#aam-diagnostics :is(select,button){font:inherit;color:inherit;background:#40364f;border:1px solid #a68bc34d;border-radius:7px;padding:4px 8px;}
+#aam-diagnostics button{margin-left:8px;}
+#aam-diagnostics p{margin:4px 0 0;overflow-wrap:anywhere;}
+#aam-diagnostics-stats{font-variant-numeric:tabular-nums;}
+#aam-diagnostics-error{color:#ffc18a;}
+.aam-diagnostics-enabled #aam-ui-preview{padding-top:var(--aam-diagnostics-height,110px);}
+.aam-diagnostics-enabled #aam-ui-preview .aam-menu{height:calc(100dvh - var(--aam-diagnostics-height,110px));max-height:calc(100dvh - var(--aam-diagnostics-height,110px));}

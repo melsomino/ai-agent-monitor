@@ -14,17 +14,56 @@ const sessions = [
     {id:'cargo', app:'Codex', title:'Set up the local Cargo.lock', status:'idle', message:'Dependencies are pinned. The build is reproducible with the local Cargo.lock.', directory:'~/dev/ai-agent-monitor', branch:'main'}
   ];
  const frame=document.getElementById('monitor');
+ const previewWindow=document.getElementById('preview-window');
+ const windowChrome=document.getElementById('preview-window-chrome');
+ const pin=document.getElementById('preview-pin');
+ let detached=false,windowDrag=null,zoomed=false;
+ function placeWindow(left,top){
+   const width=previewWindow.offsetWidth,height=previewWindow.offsetHeight;
+   previewWindow.style.left=`${Math.max(8,Math.min(left,innerWidth-width-8))}px`;
+   previewWindow.style.top=`${Math.max(34,Math.min(top,innerHeight-height-8))}px`;
+ }
+ function showWindow(){previewWindow.hidden=false;frame.contentWindow.postMessage({channel:'aam-host',visibility:true},'*');}
+ pin.addEventListener('click',()=>{
+   const bounds=previewWindow.getBoundingClientRect();detached=!detached;zoomed=false;
+   previewWindow.classList.toggle('is-detached',detached);
+   frame.contentWindow.postMessage({channel:'aam-host',detached},'*');
+   pin.setAttribute('aria-pressed',String(detached));
+   const label=detached?'Attach window to menu bar':'Detach window from menu bar';pin.title=label;pin.setAttribute('aria-label',label);
+   previewWindow.setAttribute('aria-label',detached?'AI Agent Monitor detached window':'AI Agent Monitor menu window');
+   previewWindow.querySelector('.preview-traffic-lights').hidden=!detached;
+   previewWindow.querySelector('.preview-window-title').hidden=!detached;
+   previewWindow.style.width='';previewWindow.style.height='';
+   if(detached)placeWindow(bounds.left+32,54);else{previewWindow.style.left='';previewWindow.style.top='';}
+ });
+ windowChrome.addEventListener('pointerdown',event=>{
+   if(!detached||event.button!==0||event.target.closest('button'))return;
+   const bounds=previewWindow.getBoundingClientRect();windowDrag={id:event.pointerId,x:event.clientX-bounds.left,y:event.clientY-bounds.top};
+   windowChrome.setPointerCapture(event.pointerId);previewWindow.classList.add('is-dragging');event.preventDefault();
+ });
+ windowChrome.addEventListener('pointermove',event=>{if(windowDrag?.id===event.pointerId)placeWindow(event.clientX-windowDrag.x,event.clientY-windowDrag.y);});
+ function stopWindowDrag(){windowDrag=null;previewWindow.classList.remove('is-dragging');}
+ windowChrome.addEventListener('pointerup',stopWindowDrag);windowChrome.addEventListener('pointercancel',stopWindowDrag);windowChrome.addEventListener('lostpointercapture',stopWindowDrag);
+ previewWindow.querySelectorAll('[data-window]').forEach(button=>button.addEventListener('click',()=>{
+   if(button.dataset.window==='zoom'){
+     zoomed=!zoomed;previewWindow.style.width=zoomed?'min(660px,calc(100vw - 16px))':'';previewWindow.style.height=zoomed?'calc(100dvh - 62px)':'';
+     const bounds=previewWindow.getBoundingClientRect();placeWindow(bounds.left,bounds.top);
+   }else{previewWindow.hidden=true;frame.contentWindow.postMessage({channel:'aam-host',visibility:false},'*');}
+ }));
+ window.addEventListener('resize',()=>{if(detached){const bounds=previewWindow.getBoundingClientRect();placeWindow(bounds.left,bounds.top);}});
+
  // Synthetic update fixture; this is not a claim that v0.4.0 has been published.
  const versions={current:'v0.3.0 · preview',available:{version:'v0.4.0',url:'https://github.com/melsomino/ai-agent-monitor/releases/tag/v0.4.0'},checked_at:Math.floor(Date.now()/1000)};
  const newerRelease=versions.available;
- let theme='dark',context=1;
+ let theme='dark',context=1,updateTick=0,updateTimer=null;
+ let remaining=85;
  let preferences={login:false,animate:true,shortcut:'',applications:{}};
  const state=sessions.map(s=>({...s,appId:s.app,icon:applicationIcons[s.app],html:s.message,
    fullDirectory:s.directory,completion:s.status==='finished'?1:null,
    expanded:s.id==='delivery', history:{messages:[],loading:false,exhausted:false}}));
  const questionList=[{id:'checks',title:'Which checks should run?',choices:[{label:'Only changed modules',description:''},{label:'The full test suite',description:''}],freeform:true,secret:false},{id:'destination',title:'Where should the results be sent?',choices:[{label:'This chat',description:''},{label:'A pull request',description:''}],freeform:true,secret:false}];
  for(const s of state) {
-  if(s.request==='approval')s.request={context:String(context++),body:'Allow running the full test suite before publishing the changes?',command:'cargo test --locked --workspace --all-targets --all-features --no-fail-fast -- --test-threads=1 --nocapture',enabled:true,questions:[],actions:[{id:'allow',label:'Allow once',detail:'',primary:true},{id:'deny',label:'Deny',detail:'',primary:false},{id:'similar',label:'Allow similar commands',detail:'cargo test',primary:false}]};
+  if(s.request==='approval')s.request={context:String(context++),body:'Allow running the full test suite before publishing the changes?',command:'cargo test --locked --workspace --all-targets --all-features --no-fail-fast -- --test-threads=1 --nocapture',enabled:true,questions:[],actions:[{id:'allow',label:'Allow once',detail:'',primary:true},{id:'similar',label:'Allow similar',detail:'cargo test',primary:false},{id:'deny',label:'Deny',detail:'',primary:false}]};
   else if(s.request==='questions')s.request={context:String(context++),body:'',enabled:true,questions:questionList,actions:[]};
   else s.request=null;
  }
@@ -46,7 +85,10 @@ const sessions = [
    if(s.request)s.activities.push(activity('request',{request:s.request,status:'pending'}));
    delete s.html;delete s.message;delete s.progress;delete s.request;
  }
- function snapshot(){return {version:versions.current,versions,theme,animate:preferences.animate,preferences:structuredClone(preferences),applications:[...new Map(state.map(s=>[s.appId,{id:s.appId,name:s.app,icon:s.icon}])).values()],sessions:state.filter(s=>preferences.applications[s.appId]!==false),usage:[{label:'Weekly',remaining:85,reset:'Nov 11'}]};}
+ let resetCreditTimer=null,resetCreditRequest=0;
+ const resetCreditRows=[{title:'Full reset',expiresAt:Date.parse('2026-11-30T19:47:00Z')/1000},{title:'Full reset',expiresAt:Date.parse('2026-12-02T22:22:00Z')/1000},{title:'Full reset',expiresAt:Date.parse('2026-12-13T18:17:00Z')/1000}];
+ let usageResets={generation:0,phase:'idle',availableCount:null,credits:null};
+ function snapshot(){return {version:versions.current,versions,theme,animate:preferences.animate,preferences:structuredClone(preferences),applications:[...new Map(state.map(s=>[s.appId,{id:s.appId,name:s.app,icon:s.icon}])).values()],sessions:state.filter(s=>preferences.applications[s.appId]!==false),usage:[{label:'Weekly',remaining,reset:'Nov 11'}],usageResets};}
  function publish(){
    const current=snapshot();
    for(const [selector,status] of [['request','request'],['finished','finished'],['working','working']]) {
@@ -59,6 +101,13 @@ const sessions = [
   if(event.source!==frame.contentWindow||event.data?.channel!=='aam-monitor')return;
   const m=event.data.message,s=state.find(s=>s.id===m.session);
   if(m.type==='ready'){publish();frame.contentWindow.postMessage({channel:'aam-host',visibility:true},'*');}
+  if(m.type==='preview-pin')pin.click();
+  if(m.type==='reset-credits'){
+    const request=++resetCreditRequest;clearTimeout(resetCreditTimer);
+    usageResets={generation:request,phase:'loading',availableCount:null,credits:null};publish();
+    resetCreditTimer=setTimeout(()=>{if(request!==resetCreditRequest)return;usageResets={generation:request,phase:'ready',availableCount:resetCreditRows.length,credits:resetCreditRows};publish();},2600);
+  }
+
   if(m.type==='submit'&&s&&m.context===pending(s)?.request.context){pending(s).status='answered';s.status=m.action==='deny'?'idle':'working';addMessage(s,m.action==='deny'?'<p>Run canceled. Waiting for the next command.</p>':'<p>Response sent. Continuing work.</p>');publish();}
   if(m.type==='history'&&s){s.history.messages=[{html:'<p>Separated response delivery from state updates. Each request now retains its own identity and offered choices.</p>'}];s.history.exhausted=true;publish();}
   if(m.type==='message'&&s&&!pending(s)&&['idle','finished'].includes(s.status)) {s.status='working';addMessage(s,'<p>Message received. Continuing with the next phase.</p>');publish();}
@@ -67,9 +116,46 @@ const sessions = [
   if(m.type==='preferences'){preferences=m.preferences;publish();}
   if(m.type==='open'&&s)publish();
   if(m.type==='link'&&/^(https?:|mailto:)/i.test(m.url))window.open(m.url,'_blank','noopener');
-  if(m.type==='quit'||m.type==='close'){frame.contentWindow.postMessage({channel:'aam-host',visibility:false},'*');}
+  if(m.type==='quit'||m.type==='close'){previewWindow.hidden=true;frame.contentWindow.postMessage({channel:'aam-host',visibility:false},'*');}
  });
+ // Exercise the real renderer with changing content and stable activity/request IDs.
+ const quota=document.getElementById('preview-quota');
+ const quotaValue=document.getElementById('preview-quota-value');
+ quota.addEventListener('input',()=>{
+   remaining=Number(quota.value);
+   quotaValue.value=`${remaining}%`;
+   quota.setAttribute('aria-valuetext',`${remaining}% remaining`);
+   publish();
+ });
+ const updates=document.getElementById('preview-live-updates');
+ function simulateUpdate(){
+   updateTick++;
+   const session=state.find(s=>s.status==='working'&&!pending(s)&&preferences.applications[s.appId]!==false);
+   if(session){
+     const action=session.activities.findLast(a=>a.type==='action'&&a.current);
+     if(action){action.text=`Running checks · ${updateTick} completed`;action.updatedAt=new Date().toISOString();}
+     const message=session.activities.findLast(a=>a.type==='message'&&a.role==='agent');
+     if(message){message.html=`<p>Live preview: checking updates, disclosure animation and editor stability. Update ${updateTick}.</p>`;message.updatedAt=new Date().toISOString();}
+   }
+
+   if(updateTick%12===0){
+     const idle=state.find(s=>s.id==='snapshot');
+     if(idle&&!pending(idle)&&['idle','finished'].includes(idle.status)){
+       idle.status=idle.status==='idle'?'finished':'idle';
+       idle.completion=idle.status==='finished'?updateTick:null;
+     }
+   }
+   publish();
+ }
+ function syncUpdates(){
+   clearInterval(updateTimer);updateTimer=null;
+   if(updates.checked&&!document.hidden)updateTimer=setInterval(simulateUpdate,250);
+ }
+ updates.addEventListener('change',syncUpdates);
+ document.addEventListener('visibilitychange',syncUpdates);
+ window.addEventListener('pagehide',()=>{clearInterval(updateTimer);updateTimer=null;clearTimeout(resetCreditTimer);});
+ window.addEventListener('pageshow',syncUpdates);
  document.querySelectorAll('.preview-theme button[data-theme]').forEach(button=>button.addEventListener('click',()=>{theme=button.dataset.theme;document.body.dataset.theme=theme;document.querySelectorAll('.preview-theme button[data-theme]').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));publish();}));
- document.getElementById('preview-update').addEventListener('click',event=>{const button=event.currentTarget,enabled=button.getAttribute('aria-checked')!=='true';button.setAttribute('aria-checked',String(enabled));versions.available=enabled?newerRelease:null;versions.checked_at=Math.floor(Date.now()/1000);publish();});
- document.getElementById('show-monitor').addEventListener('click',()=>{frame.contentWindow.postMessage({channel:'aam-host',visibility:true},'*');});
+ document.getElementById('preview-update').addEventListener('change',event=>{versions.available=event.currentTarget.checked?newerRelease:null;versions.checked_at=Math.floor(Date.now()/1000);publish();});
+ document.getElementById('show-monitor').addEventListener('click',showWindow);
 })();

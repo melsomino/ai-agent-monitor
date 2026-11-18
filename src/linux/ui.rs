@@ -35,7 +35,6 @@ pub struct Desktop {
     panel: panel::Panel,
     list: gtk::Box,
     scroll: gtk::ScrolledWindow,
-    groups: RefCell<Vec<gtk::Box>>,
     footer: gtk::Box,
     usage: gtk::Box,
     version: gtk::Label,
@@ -220,7 +219,6 @@ impl Desktop {
             panel,
             list,
             scroll,
-            groups: RefCell::new(Vec::new()),
             footer,
             usage,
             version,
@@ -558,52 +556,17 @@ impl Desktop {
             }
         }
         if keys != old_order {
-            for group in self.groups.borrow_mut().drain(..) {
-                for child in group.children() {
-                    group.remove(&child);
-                }
-                self.list.remove(&group);
+            for child in self.list.children() {
+                self.list.remove(&child);
             }
-            let mut group: Option<(String, gtk::Box)> = None;
             for s in &sessions {
-                let id = s.client.application_id();
-                if group.as_ref().is_none_or(|(last, _)| last != &id) {
-                    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                    if group.is_some() {
-                        style::class(&container, "following-group");
-                    }
-                    self.list.pack_start(&container, false, false, 0);
-                    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                    heading.set_height_request(24);
-                    heading.set_margin_bottom((layout::GROUP_HEADER_HEIGHT - 24.0) as i32);
-                    heading.set_margin_start(7);
-                    heading.set_margin_end(8);
-                    style::class(&heading, "application-heading");
-                    heading.pack_start(&widgets::application_icon(s.client), false, false, 0);
-                    heading.pack_start(
-                        &widgets::label(s.client.label(), "secondary", false),
-                        false,
-                        false,
-                        0,
-                    );
-                    let line = gtk::Separator::new(gtk::Orientation::Horizontal);
-                    line.set_valign(gtk::Align::Center);
-                    heading.pack_start(&line, true, true, 2);
-                    container.pack_start(&heading, false, false, 0);
-                    self.groups.borrow_mut().push(container.clone());
-                    group = Some((id, container));
-                }
                 let row = self
                     .rows
                     .borrow_mut()
                     .entry(s.key())
                     .or_insert_with(|| Row::new(self, s))
                     .clone();
-                group
-                    .as_ref()
-                    .unwrap()
-                    .1
-                    .pack_start(&row.root, false, false, 0);
+                self.list.pack_start(&row.root, false, false, 0);
             }
             self.order.replace(keys);
         }
@@ -848,18 +811,22 @@ impl Desktop {
                     true,
                     0,
                 );
-                row.pack_start(
-                    &widgets::label(
-                        &w.remaining(monitor::now() as i64)
-                            .map(|p| format!("{p}%"))
-                            .unwrap_or_else(|| "—".into()),
-                        "usage",
-                        false,
-                    ),
+                let remaining = w.remaining(monitor::now() as i64);
+                let percent = widgets::label(
+                    &remaining
+                        .map(|p| format!("{p}%"))
+                        .unwrap_or_else(|| "—".into()),
+                    "usage",
                     false,
-                    false,
-                    0,
                 );
+                if let Some(value) = remaining.filter(|value| *value <= 50) {
+                    let [r, g, b] = layout::quota_rgb(f64::from(value));
+                    percent.set_markup(&format!(
+                        "<span foreground=\"#{r:02x}{g:02x}{b:02x}\" weight=\"{}\">{value}%</span>",
+                        if value <= 40 { "bold" } else { "normal" }
+                    ));
+                }
+                row.pack_start(&percent, false, false, 0);
                 let date = w
                     .resets_at
                     .and_then(|t| glib::DateTime::from_unix_local(t).ok())

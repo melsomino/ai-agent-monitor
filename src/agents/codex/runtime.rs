@@ -1277,6 +1277,16 @@ mod tests {
                     assert_eq!(request["method"], "thread-follower-steer-turn");
                     assert_eq!(request["version"], 1);
                     assert_eq!(request["params"]["input"][0]["text"], "Hello from Telegram");
+                    // Installed owner code dereferences this draft context
+                    // before reaching its turn/steer request.
+                    assert_eq!(
+                        request["params"]["restoreMessage"]["context"]["prompt"],
+                        "Hello from Telegram"
+                    );
+                    assert_eq!(
+                        request["params"]["restoreMessage"]["id"],
+                        request["params"]["clientUserMessageId"]
+                    );
                 }
                 if outcome != "disconnect" {
                     write(

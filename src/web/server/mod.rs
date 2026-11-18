@@ -63,7 +63,7 @@ pub enum Control {
     /// Save a personal authtoken and connect through the built-in SDK (local IPC only).
     #[command(skip)]
     NgrokConfigure { token: String },
-    /// Stop all public tunnels and revoke remote browser sessions.
+    /// Stop all public tunnels and disconnect remote browsers.
     TunnelStop,
     /// Print the current listening address and paired devices.
     Status,
@@ -71,7 +71,7 @@ pub enum Control {
     Pair,
     /// Revoke a paired device by its ID.
     Revoke { id: u64 },
-    /// Stop web access and invalidate all device sessions.
+    /// Stop web access and disconnect devices, retaining their authorization.
     Stop,
 }
 impl std::fmt::Debug for Control {
@@ -148,6 +148,25 @@ impl ContextState {
         self.close_provider("ngrok");
         self.close_provider("tuna");
     }
+    fn ingress_available(&self, ingress: Ingress) -> bool {
+        ingress.provider().is_none_or(|provider| {
+            self.tunnel_status(provider)
+                .lock()
+                .unwrap()
+                .origin
+                .is_some()
+        })
+    }
+    fn authorized_device(&self, token: &str, ingress: Ingress) -> Option<Device> {
+        if !self.ingress_available(ingress) {
+            return None;
+        }
+        self.auth
+            .lock()
+            .unwrap()
+            .device(token)
+            .filter(|d| d.ingress == ingress)
+    }
     fn retire_remote(&self, generation: Option<u64>, status: tunnel::Status) {
         let provider = status.provider;
         let mut current = self.tunnel_status(provider).lock().unwrap();
@@ -157,19 +176,17 @@ impl ContextState {
         let had_origin = current.origin.is_some();
         *current = status;
         let mut auth = self.auth.lock().unwrap();
-        let removed: Vec<_> = auth
+        let disconnected: Vec<_> = auth
             .devices
             .values()
             .filter(|d| d.ingress.provider() == Some(provider))
             .map(|d| d.id)
             .collect();
-        auth.devices
-            .retain(|_, d| d.ingress.provider() != Some(provider));
-        if had_origin || !removed.is_empty() {
+        if had_origin || !disconnected.is_empty() {
             auth.pair_token();
         }
         drop(auth);
-        for id in removed {
+        for id in disconnected {
             let _ = self.monitor.send(Command::ForgetHistory {
                 client: HistoryClient::Web(id),
             });
@@ -196,11 +213,21 @@ impl Controller {
             if server.is_some() {
                 bail!("Web access is already running. Stop it before changing the address.");
             }
+            #[cfg(not(test))]
+            let saved_auth = tokio::task::spawn_blocking(|| {
+                Auth::load(crate::app::core::state_home().join("web-devices.json"))
+            })
+            .await
+            .context("Cannot load browser authorization")??;
             let listener = TcpListener::bind(listen)
                 .await
                 .context("Cannot bind web listener")?;
             let listen = listener.local_addr()?;
             let (context, task) = start_server(listener, self.monitor.clone());
+            #[cfg(not(test))]
+            {
+                *context.auth.lock().unwrap() = saved_auth;
+            }
             *server = Some(Server {
                 context,
                 task,
@@ -310,7 +337,7 @@ impl Controller {
         let tuna = server.context.tuna.lock().unwrap().clone();
         let mut auth = server.context.auth.lock().unwrap();
         if let Control::Revoke { id } = action {
-            auth.devices.retain(|_, d| d.id != id);
+            auth.revoke(id)?;
             server.context.revoked.send_replace(());
             let _ = self.monitor.send(Command::ForgetHistory {
                 client: HistoryClient::Web(id),
@@ -448,7 +475,7 @@ fn authorities(listen: SocketAddr) -> Vec<String> {
     }
     values
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum Ingress {
     Local,
     Tunnel,
@@ -514,12 +541,7 @@ fn cookie(headers: &HeaderMap) -> Option<&str> {
         .find_map(|p| p.strip_prefix("aam_session="))
 }
 fn device(context: &ContextState, headers: &HeaderMap, ingress: Ingress) -> Option<Device> {
-    context
-        .auth
-        .lock()
-        .unwrap()
-        .device(cookie(headers)?)
-        .filter(|d| d.ingress == ingress)
+    context.authorized_device(cookie(headers)?, ingress)
 }
 async fn guard(State(guard): State<Guard>, request: Request, next: Next) -> Response {
     let context = &guard.context;
@@ -731,9 +753,17 @@ async fn pair(
     Ok(response)
 }
 async fn logout(State(context): State<Arc<ContextState>>, headers: HeaderMap) -> Response {
+    let mut auth = context.auth.lock().unwrap();
     if let Some(token) = cookie(&headers)
-        && let Some(device) = context.auth.lock().unwrap().devices.remove(token)
+        && let Some(device) = auth.device(token)
     {
+        if auth.revoke(device.id).is_err() {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not revoke browser authorization. Try again.",
+            )
+            .into_response();
+        }
         let _ = context.monitor.send(Command::ForgetHistory {
             client: HistoryClient::Web(device.id),
         });
@@ -811,16 +841,7 @@ async fn stream(
     let mut baseline = updates::Stream::default();
     let mut last_resync: Option<tokio::time::Instant> = None;
     let mut history_replies = std::collections::VecDeque::<(String, String, Value)>::new();
-    loop {
-        let Some(device) = context
-            .auth
-            .lock()
-            .unwrap()
-            .device(&token)
-            .filter(|d| d.ingress == ingress)
-        else {
-            break;
-        };
+    while let Some(device) = context.authorized_device(&token, ingress) {
         if update {
             let state = published.borrow_and_update().clone();
             if state.stopping {
@@ -855,7 +876,7 @@ async fn stream(
                         },
                         Ok(StreamInput::History { protocol, id, session }) if protocol==updates::PROTOCOL && valid_operation_id(&id) && session.len()<=512=>{
                             // Revalidate immediately before dispatch, not only before waiting for input.
-                            let current=context.auth.lock().unwrap().device(&token).filter(|d|d.ingress==ingress);
+                            let current=context.authorized_device(&token, ingress);
                             let Some(current)=current else {break;};
                             let result=if let Some((_,original,reply))=history_replies.iter().find(|(key,_,_)|key==&id) {
                                 if original==&session {reply.clone()}else{json!({"error":"Request ID was already used for another session."})}
@@ -904,6 +925,8 @@ fn valid_operation_id(id: &str) -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Input {
+    #[serde(rename = "reset-credits")]
+    UsageResets,
     Submit {
         session: String,
         context: String,
@@ -951,6 +974,7 @@ async fn command(
 async fn dispatch(context: &ContextState, device: &Device, input: Input) -> Result<Value> {
     let state = context.monitor.snapshot();
     let command = match input {
+        Input::UsageResets => Command::ReadUsageResets,
         Input::Submit {
             session,
             context: ticket,
@@ -963,7 +987,7 @@ async fn dispatch(context: &ContextState, device: &Device, input: Input) -> Resu
                     && session.authoritative()
                     && session
                         .approval()
-                        .is_some_and(|a| a.can_allow && a.expires > monitor::now()),
+                        .is_some_and(|a| a.expires > monitor::now()),
                 "This request is stale or unavailable."
             );
             anyhow::ensure!(

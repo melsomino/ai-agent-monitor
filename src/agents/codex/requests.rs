@@ -53,9 +53,7 @@ fn decision_label(value: &Value, request: &Value) -> Option<String> {
             }
             .into(),
         ),
-        _ if value.get("acceptWithExecpolicyAmendment").is_some() => {
-            Some("Allow similar commands".into())
-        }
+        _ if value.get("acceptWithExecpolicyAmendment").is_some() => Some("Allow similar".into()),
         _ if value.get("applyNetworkPolicyAmendment").is_some() => {
             let amendment = &value["applyNetworkPolicyAmendment"]["network_policy_amendment"];
             Some(
@@ -291,7 +289,7 @@ mod tests {
         let decision = json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","commit","-m","Remove Codex approval hook"]}});
         let request = json!({"method":"item/commandExecution/requestApproval","params":{"availableDecisions":["accept",decision,"decline"]}});
         let actions = interaction(&request).actions;
-        assert_eq!(actions[1].label, "Allow similar commands");
+        assert_eq!(actions[1].label, "Allow similar");
         assert_eq!(
             actions[1].detail,
             "git commit -m 'Remove Codex approval hook'"
@@ -366,7 +364,7 @@ mod tests {
                     .iter()
                     .map(|action| action.label.as_str())
                     .collect::<Vec<_>>(),
-                ["Allow once", "Allow similar commands", "Deny"]
+                ["Allow once", "Allow similar", "Deny"]
             );
             assert_eq!(
                 follower_response(&request, "chat", &Response::Action("decision:2".into()))

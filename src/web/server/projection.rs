@@ -65,7 +65,7 @@ fn session(s: &Session, state: &monitor::State, device: u64) -> Value {
         Some(Submission::Failed(e)) => ("failed", Some(e)),
         None => ("ready", None),
     };
-    let request=s.pending_request().map(|r|json!({"context":context,"body":r.approval.body,"command":r.interaction.command,"actions":r.interaction.actions,"questions":r.interaction.questions,"enabled":s.authoritative()&&r.approval.can_allow&&r.approval.expires>monitor::now(),"phase":phase,"error":error}));
+    let request=s.pending_request().map(|r|json!({"context":context,"body":r.approval.body,"command":r.interaction.command,"actions":r.interaction.actions,"questions":r.interaction.questions,"enabled":s.authoritative()&&(!r.interaction.actions.is_empty()||!r.interaction.questions.is_empty())&&r.approval.expires>monitor::now(),"phase":phase,"error":error}));
     let activities:Vec<_>=s.activities.iter().map(|a| {
         let mut value=match a {
             SessionActivity::Message(m)=>json!({"type":"message","role":if m.role==MessageRole::Agent {"agent"}else{"user"},"html":html(&m.text,&m.images,&key)}),
@@ -94,18 +94,84 @@ fn session(s: &Session, state: &monitor::State, device: u64) -> Value {
     json!({"id":key,"title":s.title,"app":s.client.label(),"appId":s.client.application_id(),"icon":icon(s.client),"status":status,"completion":state.unseen_finished.get(&s.key()),"activities":activities,"history":history,"directory":short,"fullDirectory":directory,"branch":s.git_branch,"model":s.model_label(),"authoritative":s.authoritative()&&s.can_send_message(),"expanded":status=="working"||status=="request"})
 }
 pub fn snapshot(state: &monitor::State, device: u64) -> Value {
-    let sessions: Vec<_> = state
+    let mut ordered: Vec<_> = state
         .sessions
         .iter()
         .filter(|s| state.preferences.applications.enabled(s.client))
+        .collect();
+    ordered.sort_by(|a, b| crate::platform::session_order(a, b));
+    let sessions: Vec<_> = ordered
+        .into_iter()
         .map(|s| session(s, state, device))
         .collect();
     let usage=state.usage.as_ref().map(|u|u.windows.iter().map(|w|json!({"label":w.label(),"remaining":w.remaining(monitor::now() as i64),"reset":w.resets_at.and_then(|t|chrono::DateTime::from_timestamp(t,0)).map(|t|t.format("%b %d").to_string()).unwrap_or_default()})).collect::<Vec<_>>()).unwrap_or_default();
-    json!({"version":state.versions.current,"versions":state.versions,"revision":state.revision,"sessions":sessions,"usage":usage,"animate":state.preferences.animation,"error":state.discovery_error,"remote":true})
+    json!({"version":state.versions.current,"versions":state.versions,"revision":state.revision,"sessions":sessions,"usage":usage,"usageResets":state.usage_resets,"animate":state.preferences.animation,"error":state.discovery_error,"remote":true})
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn web_uses_desktop_group_natural_title_and_stable_identity_order() {
+        use crate::domain::session::{Client, ConnectionState};
+        let make = |id: &str, title: &str, client| Session {
+            agent: "codex",
+            id: id.into(),
+            title: title.into(),
+            cwd: "/demo".into(),
+            workspace: None,
+            git_branch: None,
+            model: None,
+            model_display_name: None,
+            reasoning_effort: None,
+            updated_at: 0,
+            client,
+            activity: Activity::Idle,
+            target: None,
+            connection: ConnectionState::Disconnected,
+            activities: Default::default(),
+        };
+        let mut state = monitor::State {
+            sessions: vec![
+                make("terminal", "A", Client::Terminal),
+                make("ten", "Task 10", Client::VSCode),
+                make("z", "Task 2", Client::VSCode),
+                make("other", "A", Client::Unknown),
+                make("a", "Task 2", Client::VSCode),
+            ],
+            ..Default::default()
+        };
+        let ids = |state: &monitor::State| {
+            snapshot(state, 1)["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&state),
+            [
+                "codex:a",
+                "codex:z",
+                "codex:ten",
+                "codex:terminal",
+                "codex:other"
+            ]
+        );
+        state
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == "ten")
+            .unwrap()
+            .title = "Task 1".into();
+        assert_eq!(ids(&state)[0], "codex:ten");
+        state.preferences.applications.observe([Client::Terminal]);
+        state
+            .preferences
+            .applications
+            .set_enabled(&Client::Terminal.application_id(), false);
+        assert!(!ids(&state).contains(&"codex:terminal".into()));
+    }
     #[test]
     fn release_metadata_is_projected_from_monitor_state() {
         let state = monitor::State {

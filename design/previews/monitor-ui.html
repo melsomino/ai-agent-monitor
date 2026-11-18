@@ -1,8 +1,15 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI Agent Monitor preview</title>
-<link rel="stylesheet" href="mock.css?v=20261115-update-flame"></head><body data-theme="dark">
-<div class="preview-theme" role="group" aria-label="Preview controls"><button data-theme="light" aria-pressed="false">Light</button><button data-theme="dark" aria-pressed="true">Dark</button><button id="preview-update" type="button" role="switch" aria-checked="true">New version</button></div>
+<link rel="stylesheet" href="mock.css?v=20261118-scrolling-pin"></head><body data-theme="dark">
+<div class="preview-theme" role="group" aria-label="Preview controls"><button data-theme="light" aria-pressed="false">Light</button><button data-theme="dark" aria-pressed="true">Dark</button><label class="preview-new-version"><input id="preview-update" type="checkbox" checked> New version</label><label class="preview-live-updates"><input id="preview-live-updates" type="checkbox"> Updates <small>4/s</small></label><label class="preview-quota" for="preview-quota"><span>Remaining <output id="preview-quota-value" for="preview-quota">85%</output></span><input id="preview-quota" type="range" min="0" max="100" step="1" value="85" aria-label="Quota remaining percent"></label></div>
 <div class="preview-bar"><button id="show-monitor" title="Open monitor" aria-label="Open AI Agent Monitor"><span class="preview-menubar-robot" aria-hidden="true"></span><span class="request" hidden></span> <span class="finished" hidden></span> <span class="working" hidden></span></button><span>Sat 10:42</span></div>
-<iframe id="monitor" src="../../src/web/index.html?v=20261115-update-flame" title="AI Agent Monitor shared web UI"></iframe>
+<section class="preview-window" id="preview-window" aria-label="AI Agent Monitor menu window">
+<div class="preview-window-chrome" id="preview-window-chrome">
+<div class="preview-traffic-lights" hidden><button type="button" data-window="close" aria-label="Close window"></button><button type="button" data-window="minimize" aria-label="Minimize window"></button><button type="button" data-window="zoom" aria-label="Zoom window"></button></div>
+<button type="button" class="preview-pin" id="preview-pin" aria-label="Detach window from menu bar" title="Detach window from menu bar" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 9V4l1-1H7l1 1v5l-3 3v2h6v7m2-7h6v-2l-3-3Z"/></svg></button>
+<span class="preview-window-title" hidden>AI Agent Monitor</span>
+</div>
+<iframe id="monitor" src="../../src/web/index.html?v=20261118-scrolling-pin&amp;hovers=compact&amp;quota=light&amp;pin=true" title="AI Agent Monitor shared web UI"></iframe>
+</section>
 
-<script src="mock-data.js?v=20261115-update-flame"></script></body></html>
+<script src="mock-data.js?v=20261118-scrolling-pin"></script></body></html>

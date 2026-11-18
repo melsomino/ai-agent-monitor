@@ -11,6 +11,7 @@ pub(super) struct Reader {
 struct Call {
     id: String,
     started: ActivityTime,
+    updated: ActivityTime,
     questions: Vec<(String, String, bool)>,
     superseded: bool,
 }
@@ -58,6 +59,7 @@ impl Reader {
                 self.calls.push(Call {
                     id: id.into(),
                     started: time,
+                    updated: time,
                     questions,
                     superseded: false,
                 });
@@ -76,13 +78,20 @@ impl Reader {
                 };
                 for call in &mut self.calls {
                     for (id, _, answered) in &mut call.questions {
+                        let was_answered = *answered;
                         *answered |= rows
                             .iter()
                             .any(|r| r["questionItemId"] == *id && r.get("answer").is_some());
+                        if *answered != was_answered {
+                            call.updated = time;
+                        }
                     }
                 }
             } else if !text.trim().is_empty() {
                 for call in &mut self.calls {
+                    if !call.superseded {
+                        call.updated = time;
+                    }
                     call.superseded = true;
                 }
             }
@@ -99,11 +108,12 @@ impl Reader {
                 && output["accepted"] == false
             {
                 call.superseded = true;
+                call.updated = time;
             }
         }
     }
-    pub fn activities(self) -> impl Iterator<Item = SessionActivity> {
-        self.calls.into_iter().map(|call| {
+    pub fn activities(&self) -> impl Iterator<Item = SessionActivity> + '_ {
+        self.calls.iter().map(|call| {
             let status = if call.superseded {
                 RequestStatus::Superseded
             } else if call.questions.iter().all(|(_, _, answered)| *answered) {
@@ -122,11 +132,7 @@ impl Reader {
             SessionActivity::Request(SessionRequest {
                 id: id.clone(),
                 started_at: call.started,
-                updated_at: if status == RequestStatus::Pending {
-                    call.started
-                } else {
-                    now()
-                },
+                updated_at: call.updated,
                 approval: Approval {
                     id: format!("transcript:{id}"),
                     body,

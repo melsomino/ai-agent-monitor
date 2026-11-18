@@ -240,7 +240,12 @@ pub fn reply_envelope(
         "active" => Some((
             "thread-follower-steer-turn",
             1,
-            json!({"conversationId":session,"input":input,"clientUserMessageId":client_id}),
+            // The existing owner reads restoreMessage.cwd/context before it
+            // admits a steer. An omitted draft throws even with valid input.
+            // Only retain this message's text/identity; the owner supplies its
+            // existing cwd, collaboration mode and other thread settings.
+            json!({"conversationId":session,"input":input,"clientUserMessageId":client_id,
+                "restoreMessage":{"id":client_id,"context":{"prompt":text}}}),
         )),
         _ => None,
     }
@@ -394,6 +399,16 @@ mod tests {
         let (method, version, params) = reply_envelope(&state, "reply", "client-id").unwrap();
         assert_eq!((method, version), ("thread-follower-steer-turn", 1));
         assert_eq!(params["input"][0]["text"], "reply");
+        assert_eq!(
+            params["restoreMessage"],
+            json!({"id":"client-id","context":{"prompt":"reply"}})
+        );
+        assert!(params["restoreMessage"].get("cwd").is_none());
+        assert!(
+            params["restoreMessage"]["context"]
+                .get("collaborationMode")
+                .is_none()
+        );
         assert!(params.get("turnStart").is_none());
         state["threadRuntimeStatus"]["type"] = json!("systemError");
         assert!(reply_envelope(&state, "reply", "client-id").is_none());

@@ -93,6 +93,9 @@ struct Input {
     field: Option<Retained<NSTextField>>,
 }
 
+/// Selection and text only; never retains a field or its editor.
+pub(super) struct Draft(Vec<(usize, String)>);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ButtonKind {
     Radio,
@@ -388,6 +391,39 @@ define_class!(
 );
 
 impl Panel {
+    pub(super) fn draft(&self) -> Draft {
+        Draft(
+            self.ivars()
+                .inputs
+                .borrow()
+                .iter()
+                .map(|input| {
+                    let text = input
+                        .field
+                        .as_ref()
+                        .map(|field| {
+                            field
+                                .currentEditor()
+                                .map(|editor| editor.string().to_string())
+                                .unwrap_or_else(|| field.stringValue().to_string())
+                        })
+                        .unwrap_or_default();
+                    (input.selected.get(), text)
+                })
+                .collect(),
+        )
+    }
+    pub(super) fn restore_draft(&self, draft: Draft) {
+        for (input, (selected, text)) in self.ivars().inputs.borrow().iter().zip(draft.0) {
+            input
+                .selected
+                .set(selected.min(input.radios.len().saturating_sub(1)));
+            if let Some(field) = &input.field {
+                field.setStringValue(&NSString::from_str(&text));
+            }
+        }
+        self.sync();
+    }
     pub fn create(
         session: Session,
         monitor: crate::actors::monitor::Handle,

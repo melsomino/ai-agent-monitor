@@ -33,6 +33,8 @@ pub(crate) async fn run(
         state.revision += 1;
     }
     published.send_replace(Arc::new(state.clone()));
+    let mut usage_resets: tokio::task::JoinSet<anyhow::Result<crate::domain::usage::Resets>> =
+        tokio::task::JoinSet::new();
     let mut preferences_loaded = false;
     let mut stopped = HashSet::new();
     let mut discovered = Vec::new();
@@ -41,6 +43,16 @@ pub(crate) async fn run(
     loop {
         let command = tokio::select! {
             command=rx.recv()=>match command {Some(command)=>command,None=>break},
+            Some(result)=usage_resets.join_next(), if !usage_resets.is_empty()=>{
+                let generation=state.usage_resets.generation;
+                state.usage_resets=match result {
+                    Ok(Ok(value))=>value,
+                    Ok(Err(error))=>crate::domain::usage::Resets{phase:crate::domain::usage::ResetPhase::Error,error:Some(error.to_string()),..Default::default()},
+                    Err(_)=>crate::domain::usage::Resets{phase:crate::domain::usage::ResetPhase::Error,error:Some("Codex usage limit resets request failed. Try again.".into()),..Default::default()},
+                };
+                state.usage_resets.generation=generation;
+                state.revision+=1;published.send_replace(Arc::new(state.clone()));continue;
+            },
             versions=releases.next()=>{
                 state.versions=versions;state.revision+=1;
                 published.send_replace(Arc::new(state.clone()));continue;
@@ -48,6 +60,17 @@ pub(crate) async fn run(
         };
         let previous_sessions = state.sessions.clone();
         match command {
+            Command::ReadUsageResets => {
+                if !usage_resets.is_empty() {
+                    continue;
+                }
+                state.usage_resets = crate::domain::usage::Resets {
+                    generation: state.usage_resets.generation.saturating_add(1),
+                    phase: crate::domain::usage::ResetPhase::Loading,
+                    ..Default::default()
+                };
+                usage_resets.spawn(crate::agents::codex::usage_resets::read());
+            }
             Command::ForgetHistory { client } => {
                 state.history.retain(|key, _| key.client != client);
             }

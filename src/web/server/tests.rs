@@ -141,6 +141,168 @@ async fn setup() -> (
     (controller, address, cookie, token, rx, published)
 }
 #[tokio::test]
+async fn reset_inventory_read_is_explicit_authenticated_and_snapshot_driven() {
+    let (controller, address, cookie, _, mut rx, published) = setup().await;
+    let origin = format!("http://{address}");
+    assert_eq!(
+        http(
+            address,
+            "GET",
+            "/api/snapshot",
+            Some(&cookie),
+            None,
+            None,
+            None
+        )
+        .await
+        .status,
+        200
+    );
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/api/command",
+            None,
+            Some(&origin),
+            None,
+            Some(json!({"type":"reset-credits"}))
+        )
+        .await
+        .status,
+        401
+    );
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/api/command",
+            Some(&cookie),
+            Some(&origin),
+            None,
+            Some(json!({"type":"reset-credits"}))
+        )
+        .await
+        .status,
+        200
+    );
+    assert!(matches!(rx.try_recv(), Ok(Command::ReadUsageResets)));
+    let mut next = (**published.borrow()).clone();
+    next.revision += 1;
+    next.usage_resets = crate::domain::usage::Resets {
+        generation: 1,
+        phase: crate::domain::usage::ResetPhase::Ready,
+        available_count: Some(3),
+        credits: Some(vec![crate::domain::usage::ResetCredit {
+            title: "Full reset".into(),
+            expires_at: Some(2000),
+        }]),
+        error: None,
+    };
+    published.send_replace(Arc::new(next));
+    let response = http(
+        address,
+        "GET",
+        "/api/snapshot",
+        Some(&cookie),
+        None,
+        None,
+        None,
+    )
+    .await;
+    let value: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(value["usageResets"]["availableCount"], 3);
+    assert_eq!(value["usageResets"]["credits"][0]["expiresAt"], 2000);
+    assert!(rx.try_recv().is_err());
+    controller.control(Control::Stop).await.unwrap();
+}
+#[tokio::test]
+async fn saved_browser_cookie_authenticates_after_server_restart_and_logout_stays_revoked() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("devices.json");
+    let (controller, address, _, _, _rx, _published) = setup().await;
+    let monitor = {
+        let server = controller.server.lock().await;
+        let context = &server.as_ref().unwrap().context;
+        *context.auth.lock().unwrap() = Auth::load(path.clone()).unwrap();
+        context.monitor.clone()
+    };
+    let report = controller.control(Control::Pair).await.unwrap();
+    let link = report["pairingLinks"][0].as_str().unwrap();
+    let token = link.split("#pair=").nth(1).unwrap();
+    let response = http(
+        address,
+        "POST",
+        "/api/pair",
+        None,
+        Some(&format!("http://{address}")),
+        None,
+        Some(json!({"token":token,"name":"Restart fixture"})),
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    let cookie = response
+        .headers
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .starts_with("set-cookie: ")
+                .then(|| line[12..].split(';').next().unwrap().to_owned())
+        })
+        .unwrap();
+    controller.control(Control::Stop).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (context, task) = start_server(listener, monitor);
+    *context.auth.lock().unwrap() = Auth::load(path.clone()).unwrap();
+    assert_eq!(
+        http(
+            address,
+            "GET",
+            "/api/snapshot",
+            Some(&cookie),
+            None,
+            None,
+            None
+        )
+        .await
+        .status,
+        200
+    );
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/api/logout",
+            Some(&cookie),
+            Some(&format!("http://{address}")),
+            None,
+            Some(json!({}))
+        )
+        .await
+        .status,
+        200
+    );
+    *context.auth.lock().unwrap() = Auth::load(path).unwrap();
+    assert_eq!(
+        http(
+            address,
+            "GET",
+            "/api/snapshot",
+            Some(&cookie),
+            None,
+            None,
+            None
+        )
+        .await
+        .status,
+        401
+    );
+    task.abort();
+}
+#[tokio::test]
 async fn http_pairing_is_required_one_use_and_revocable() {
     let (controller, address, cookie, token, _rx, _published) = setup().await;
     let origin = format!("http://{address}");
@@ -239,6 +401,76 @@ async fn http_pairing_is_required_one_use_and_revocable() {
     );
     controller.control(Control::Stop).await.unwrap();
 }
+#[tokio::test]
+async fn questions_without_allow_action_are_enabled_and_submit_only_valid_answers() {
+    use crate::domain::interaction::{Choice, Question};
+    let (controller, address, cookie, _token, mut rx, published) = setup().await;
+    let mut next = (**published.borrow()).clone();
+    let session = &mut next.sessions[0];
+    session.approval_mut().unwrap().can_allow = false;
+    session.set_interaction(Interaction {
+        questions: vec![Question {
+            id: "question-one".into(),
+            title: "Choose checks".into(),
+            choices: vec![Choice {
+                label: "Changed".into(),
+                description: String::new(),
+            }],
+            freeform: false,
+            secret: false,
+        }],
+        ..Default::default()
+    });
+    let key = session.key();
+    let ticket = projection::request_context(session).unwrap();
+    let projected = projection::snapshot(&next, 1);
+    let enabled = projected["sessions"][0]["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["type"] == "request")
+        .unwrap()["request"]["enabled"]
+        .clone();
+    published.send_replace(Arc::new(next));
+    let origin = format!("http://{address}");
+    for (answer, expected) in [("Invented", 409), ("Changed", 200)] {
+        let response = http(address,"POST","/api/command",Some(&cookie),Some(&origin),None,
+            Some(json!({"type":"submit","session":key,"context":ticket,"answers":{"question-one":[answer]}}))).await;
+        assert_eq!(response.status, expected);
+        if expected == 409 {
+            assert!(rx.try_recv().is_err());
+        }
+    }
+    assert!(
+        matches!(rx.recv().await,Some(Command::Submit { response:Answer::Answers(a),.. }) if a["question-one"] == ["Changed"])
+    );
+    assert_eq!(enabled, true);
+    for unavailable in ["disconnected", "expired", "no controls"] {
+        let mut state = (**published.borrow()).clone();
+        let session = &mut state.sessions[0];
+        match unavailable {
+            "disconnected" => session.set_authoritative(false),
+            "expired" => session.approval_mut().unwrap().expires = 0,
+            _ => session.set_interaction(Interaction::default()),
+        }
+        let ticket = projection::request_context(session).unwrap();
+        let snapshot = projection::snapshot(&state, 1);
+        let request = snapshot["sessions"][0]["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["type"] == "request")
+            .unwrap();
+        assert_eq!(request["request"]["enabled"], false, "{unavailable}");
+        published.send_replace(Arc::new(state));
+        let response = http(address,"POST","/api/command",Some(&cookie),Some(&origin),None,
+            Some(json!({"type":"submit","session":key,"context":ticket,"answers":{"question-one":["Changed"]}}))).await;
+        assert_eq!(response.status, 409, "{unavailable}");
+        assert!(rx.try_recv().is_err());
+    }
+    controller.control(Control::Stop).await.unwrap();
+}
+
 #[tokio::test]
 async fn stale_and_invalid_approvals_never_reach_monitor() {
     let (controller, address, cookie, _token, mut rx, _published) = setup().await;
@@ -366,7 +598,7 @@ async fn real_browser_pairs_and_submits_over_http() {
         .actions
         .push(crate::domain::interaction::Action {
             id: "similar".into(),
-            label: "Allow similar commands".into(),
+            label: "Allow similar".into(),
             detail: "cargo test".into(),
         });
     published.send_replace(Arc::new(initial));
@@ -379,6 +611,7 @@ async fn real_browser_pairs_and_submits_over_http() {
                 "/scripts/check-web-frontend.swift"
             ))
             .env("AAM_WEB_TEST_URL", link)
+            .env("AAM_WEB_TEST_DIAGNOSTICS", "1")
             .output()
             .unwrap()
     });
@@ -390,6 +623,40 @@ async fn real_browser_pairs_and_submits_over_http() {
     next.revision += 1;
     next.sessions[0].title = "Updated over diff".into();
     published.send_replace(Arc::new(next));
+    for reset_generation in 1..=2 {
+        let command = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap();
+        assert!(matches!(command, Some(Command::ReadUsageResets)));
+        if reset_generation == 2 {
+            let mut stale = (**published.borrow()).clone();
+            stale.revision += 1;
+            published.send_replace(Arc::new(stale));
+            tokio::time::sleep(Duration::from_millis(450)).await;
+        }
+        let mut next = (**published.borrow()).clone();
+        next.revision += 1;
+        next.usage_resets = crate::domain::usage::Resets {
+            generation: reset_generation,
+            phase: crate::domain::usage::ResetPhase::Loading,
+            ..Default::default()
+        };
+        published.send_replace(Arc::new(next));
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let mut next = (**published.borrow()).clone();
+        next.revision += 1;
+        next.usage_resets = crate::domain::usage::Resets {
+            generation: reset_generation,
+            phase: crate::domain::usage::ResetPhase::Ready,
+            available_count: Some(3),
+            credits: Some(vec![crate::domain::usage::ResetCredit {
+                title: "Full reset".into(),
+                expires_at: Some(2_000_000_000),
+            }]),
+            error: None,
+        };
+        published.send_replace(Arc::new(next));
+    }
     let command = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .unwrap();
@@ -865,7 +1132,7 @@ async fn verify_tunnel_ingress(hostname: &str, provider: &'static str) {
         200
     );
     assert!(
-        !context
+        context
             .auth
             .lock()
             .unwrap()
@@ -873,6 +1140,7 @@ async fn verify_tunnel_ingress(hostname: &str, provider: &'static str) {
             .values()
             .any(|d| d.remote)
     );
+    assert!(device(&context, &HeaderMap::new(), Ingress::Tunnel).is_none());
     task.abort();
     controller.control(Control::Stop).await.unwrap();
 }
@@ -1040,6 +1308,8 @@ async fn simultaneous_tunnels_have_separate_authority_and_provider_restart_prese
     );
     assert_eq!(context.tuna.lock().unwrap().phase, "connected");
     context.close_provider("tuna");
+    // Disconnecting a provider hides its ingress but retains trusted devices.
+    assert!(context.auth.lock().unwrap().device(&tuna_cookie).is_some());
     assert!(device(&context, &headers(&tuna_cookie), Ingress::Tuna).is_none());
     assert!(device(&context, &headers(&ngrok_cookie), Ingress::Ngrok).is_some());
     assert!(device(&context, &headers(&cloudflare_cookie), Ingress::Tunnel).is_some());

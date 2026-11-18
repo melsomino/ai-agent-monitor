@@ -6,9 +6,11 @@ mod models;
 mod progress;
 mod projection;
 pub(crate) mod requests;
+mod rollout_cache;
 mod rollout_questions;
 pub(crate) mod runtime;
 pub(crate) mod usage;
+pub(crate) mod usage_resets;
 pub(crate) mod vscode;
 
 use crate::{
@@ -21,10 +23,9 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{BufReader, Read, Seek, SeekFrom},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 /// Codex database, transcript, direct client and VS Code integration.
@@ -32,9 +33,9 @@ pub struct Codex {
     runtime: runtime::Runtime,
     app_server: app_server::Runtime,
     updates: std::sync::Arc<tokio::sync::Notify>,
-    activity: std::cell::RefCell<HashMap<PathBuf, ActivityCheckpoint>>,
     images: std::cell::RefCell<images::Cache>,
     vscode: std::cell::RefCell<vscode::LogCache>,
+    rollouts: std::cell::RefCell<rollout_cache::Cache>,
 }
 
 impl Default for Codex {
@@ -47,9 +48,9 @@ impl Default for Codex {
                 updates.clone(),
             ),
             updates,
-            activity: Default::default(),
             images: Default::default(),
             vscode: Default::default(),
+            rollouts: Default::default(),
         }
     }
 }
@@ -58,6 +59,27 @@ const DESKTOP: Client = Client::Desktop {
     name: "Codex",
     app_path: "/Applications/ChatGPT.app",
 };
+
+fn rollout_client(value: &serde_json::Value) -> Client {
+    let meta = &value["payload"];
+    if meta["originator"]
+        .as_str()
+        .is_some_and(|s| s.contains("Desktop"))
+    {
+        DESKTOP
+    } else if matches!(
+        meta["originator"].as_str(),
+        Some("codex-tui" | "ai_agent_monitor")
+    ) {
+        Client::Terminal
+    } else {
+        match meta["source"].as_str() {
+            Some("vscode") => Client::VSCode,
+            Some("cli") => Client::Terminal,
+            _ => Client::Unknown,
+        }
+    }
+}
 
 impl SessionProvider for Codex {
     fn id(&self) -> &'static str {
@@ -68,9 +90,9 @@ impl SessionProvider for Codex {
         let mut sessions = open(
             &crate::app::core::codex_home(),
             &self.runtime,
-            &self.activity,
             &self.vscode,
             &self.images,
+            &self.rollouts,
         )?;
         self.app_server.observe(&mut sessions);
         Ok(sessions)
@@ -178,9 +200,9 @@ impl SessionProvider for Codex {
 fn open(
     home: &Path,
     runtime: &runtime::Runtime,
-    cache: &std::cell::RefCell<HashMap<PathBuf, ActivityCheckpoint>>,
     vscode_cache: &std::cell::RefCell<vscode::LogCache>,
     image_cache: &std::cell::RefCell<images::Cache>,
+    rollouts: &std::cell::RefCell<rollout_cache::Cache>,
 ) -> Result<Vec<Session>> {
     // SAFETY: geteuid has no preconditions and scopes discovery to this user.
     let uid = unsafe { libc::geteuid() }.to_string();
@@ -196,9 +218,10 @@ fn open(
     let ids = files.keys().cloned().collect();
     let mut sessions = read_open(home, &ids)?;
     image_cache.borrow_mut().retain(files.values().cloned());
+    rollouts.borrow_mut().retain(files.values());
     for session in &mut sessions {
         if let Some(path) = files.get(&session.id) {
-            enrich_cached(session, path, &mut cache.borrow_mut());
+            let _ = rollouts.borrow_mut().enrich(session, path);
             session.set_images(image_cache.borrow_mut().latest(path));
         }
     }
@@ -487,177 +510,9 @@ fn read(path: &Path, ids: &HashSet<String>) -> Result<Vec<Session>> {
 
 #[cfg(test)]
 fn enrich(session: &mut Session, path: &Path) {
-    enrich_cached(session, path, &mut HashMap::new());
-}
-fn enrich_cached(
-    session: &mut Session,
-    path: &Path,
-    cache: &mut HashMap<PathBuf, ActivityCheckpoint>,
-) {
-    let Ok(mut file) = fs::File::open(path) else {
-        return;
-    };
-    let mut head = Vec::new();
-    if (&mut file).take(131072).read_to_end(&mut head).is_ok()
-        && let Some(line) = head.split(|byte| *byte == b'\n').next()
-        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(line)
-    {
-        let meta = &value["payload"];
-        session.client = if meta["originator"]
-            .as_str()
-            .is_some_and(|s| s.contains("Desktop"))
-        {
-            DESKTOP
-        } else if matches!(
-            meta["originator"].as_str(),
-            Some("codex-tui" | "ai_agent_monitor")
-        ) {
-            // The shared daemon can record source=vscode for terminal threads.
-            // After our observer joins, new threads can also carry our client
-            // name as originator. We only use App Server for terminal sessions;
-            // macOS still requires a matching foreground TTY client below.
-            Client::Terminal
-        } else {
-            match meta["source"].as_str() {
-                Some("vscode") => Client::VSCode,
-                Some("cli") => Client::Terminal,
-                _ => Client::Unknown,
-            }
-        };
-    }
-    let Ok(metadata) = file.metadata() else {
-        return;
-    };
-    let length = metadata.len();
-    let start = length.saturating_sub(4 * 1024 * 1024);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return;
-    }
-    let mut tail = String::new();
-    // Read bytes so a seek into a multibyte character does not invalidate the tail.
-    let mut bytes = Vec::new();
-    if (&mut file)
-        .take(length - start)
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.len() as u64 != length - start
-    {
-        return;
-    }
-    let skip = if start > 0 {
-        bytes
-            .iter()
-            .position(|b| *b == b'\n')
-            .map_or(bytes.len(), |i| i + 1)
-    } else {
-        0
-    };
-    tail.push_str(&String::from_utf8_lossy(&bytes[skip..]));
-    session.activity = Activity::Unknown;
-    parse_events_at(session, &tail, start + skip as u64);
-    session.activity = recover_activity(
-        &mut file,
-        path,
-        &metadata,
-        start,
-        &bytes,
-        session.activity,
-        cache,
-    );
-}
-
-#[derive(Clone, Copy)]
-struct ActivityCheckpoint {
-    device: u64,
-    inode: u64,
-    length: u64,
-    modified: Option<SystemTime>,
-    complete_end: u64,
-    anchor_end: u64,
-    anchor: [u8; 128],
-    activity: Activity,
-}
-
-fn recover_activity(
-    file: &mut fs::File,
-    path: &Path,
-    metadata: &fs::Metadata,
-    tail_start: u64,
-    tail: &[u8],
-    activity: Activity,
-    cache: &mut HashMap<PathBuf, ActivityCheckpoint>,
-) -> Activity {
-    let previous = cache.get(path).copied().filter(|checkpoint| {
-        checkpoint.device == metadata.dev()
-            && checkpoint.inode == metadata.ino()
-            && (metadata.len() > checkpoint.length
-                || (metadata.len() == checkpoint.length
-                    && metadata.modified().ok() == checkpoint.modified))
-            && activity_anchor(file, checkpoint.anchor_end)
-                .is_ok_and(|bytes| bytes == checkpoint.anchor)
-    });
-    let lower = previous
-        .map(|checkpoint| checkpoint.complete_end)
-        .unwrap_or(0);
-    let complete_end = tail
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map(|index| tail_start + index as u64 + 1)
-        .unwrap_or(lower);
-    let activity = if activity != Activity::Unknown {
-        activity
-    } else {
-        // Include the record crossing the 4 MiB boundary: it may itself be a
-        // large completion event. New data outside the tail must also be checked
-        // before using a checkpoint; a single tool output can exceed 4 MiB.
-        let search_end = tail
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|index| tail_start + index as u64 + 1)
-            .unwrap_or(metadata.len());
-        let found = if search_end > lower {
-            match last_activity_before(file, search_end, lower) {
-                Ok(activity) => activity,
-                Err(_) => return Activity::Unknown,
-            }
-        } else {
-            None
-        };
-        found
-            .or(previous.map(|checkpoint| checkpoint.activity))
-            .unwrap_or(Activity::Unknown)
-    };
-    let anchor_end = if complete_end > 0 {
-        complete_end
-    } else {
-        metadata.len().min(128)
-    };
-    let Ok(anchor) = activity_anchor(file, anchor_end) else {
-        return activity;
-    };
-    let checkpoint = ActivityCheckpoint {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        length: metadata.len(),
-        modified: metadata.modified().ok(),
-        complete_end,
-        anchor_end,
-        anchor,
-        activity,
-    };
-    if cache.len() >= 512 && !cache.contains_key(path) {
-        cache.clear();
-    }
-    cache.insert(path.to_owned(), checkpoint);
-    activity
-}
-
-fn activity_anchor(file: &mut fs::File, end: u64) -> std::io::Result<[u8; 128]> {
-    let start = end.saturating_sub(128);
-    let mut bytes = [0; 128];
-    file.seek(SeekFrom::Start(start))?;
-    file.read_exact(&mut bytes[..(end - start) as usize])?;
-    Ok(bytes)
+    rollout_cache::Cache::default()
+        .enrich(session, path)
+        .unwrap();
 }
 
 #[derive(serde::Deserialize)]
@@ -727,49 +582,78 @@ fn last_activity_before(
 fn parse_events(session: &mut Session, tail: &str) {
     parse_events_at(session, tail, 0);
 }
-fn parse_events_at(session: &mut Session, tail: &str, mut offset: u64) {
-    use crate::domain::session_activity::*;
-    // response_item is the canonical transcript. event_msg mirrors its assistant
-    // message; only use the legacy representation when no canonical one exists.
-    let canonical = tail
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .any(|v| {
-            v["type"] == "response_item"
-                && v["payload"]["type"] == "message"
-                && v["payload"]["role"] == "assistant"
-        });
-    let mut questions = rollout_questions::Reader::default();
-    let mut reported_model = None;
-    let mut reported_effort = None;
-    for line in tail.split_inclusive('\n') {
-        let source_offset = offset;
-        offset += line.len() as u64;
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
+#[derive(Default)]
+struct RolloutReader {
+    questions: rollout_questions::Reader,
+    canonical: bool,
+    legacy: HashSet<String>,
+    reported_model: Option<String>,
+    reported_effort: Option<String>,
+    activity: Activity,
+}
+impl RolloutReader {
+    fn make_canonical(&mut self, session: &mut Session) {
+        if !self.canonical {
+            self.canonical = true;
+            session
+                .activities
+                .retain(|activity| !self.legacy.contains(activity.id()));
+            self.legacy.clear();
+        }
+    }
+    fn parse(&mut self, session: &mut Session, tail: &[u8], mut offset: u64) {
+        if tail
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .any(|value| {
+                value["type"] == "response_item"
+                    && value["payload"]["type"] == "message"
+                    && value["payload"]["role"] == "assistant"
+            })
+        {
+            self.make_canonical(session);
+        }
+        for line in tail.split_inclusive(|byte| *byte == b'\n') {
+            let source_offset = offset;
+            offset += line.len() as u64;
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
+                self.consume(session, &value, source_offset);
+            }
+        }
+        self.finish(session);
+    }
+    fn consume(&mut self, session: &mut Session, value: &serde_json::Value, source_offset: u64) {
+        use crate::domain::session_activity::*;
+        if value["type"] == "response_item"
+            && value["payload"]["type"] == "message"
+            && value["payload"]["role"] == "assistant"
+        {
+            self.make_canonical(session);
+        }
+        session.activity = self.activity;
         let payload = &value["payload"];
         if matches!(payload["type"].as_str(), Some("message" | "agent_message"))
             && (payload["channel"] == "analysis" || payload["phase"] == "analysis")
         {
-            continue;
+            return;
         }
         let time = timestamp(&value["timestamp"]).unwrap_or_else(|| seconds(session.updated_at));
-        questions.consume(&value, time);
+        self.questions.consume(value, time);
         let source_id = payload["id"]
             .as_str()
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("offset:{source_offset}"));
         match value["type"].as_str() {
+            Some("session_meta") => session.client = rollout_client(value),
             Some("turn_context") => {
                 if let Some(model) = payload["model"]
                     .as_str()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    reported_model = Some(model.to_owned());
-                    reported_effort = payload["effort"]
+                    self.reported_model = Some(model.to_owned());
+                    self.reported_effort = payload["effort"]
                         .as_str()
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
@@ -781,8 +665,9 @@ fn parse_events_at(session: &mut Session, tail: &str, mut offset: u64) {
                 Some("task_complete" | "turn_complete" | "turn_aborted") => {
                     session.activity = Activity::Idle
                 }
-                Some("agent_message") if !canonical => {
+                Some("agent_message") if !self.canonical => {
                     if let Some(text) = payload["message"].as_str().filter(|s| !s.is_empty()) {
+                        self.legacy.insert(format!("rollout-message:{source_id}"));
                         session.upsert_activity(SessionActivity::Message(SessionMessage {
                             id: format!("rollout-message:{source_id}"),
                             started_at: time,
@@ -877,21 +762,40 @@ fn parse_events_at(session: &mut Session, tail: &str, mut offset: u64) {
             }
             _ => {}
         }
+        self.activity = session.activity;
     }
-    for activity in questions.activities() {
-        session.upsert_activity(activity);
-    }
-    if session.approval().is_some() {
-        session.activity = Activity::Confirmation;
-    }
-    if session.model.is_none() {
-        session.model = reported_model;
-        if session.reasoning_effort.is_none() {
-            session.reasoning_effort = reported_effort;
+    fn finish(&mut self, session: &mut Session) {
+        session.activity = self.activity;
+        for activity in self.questions.activities() {
+            session.upsert_activity(activity);
         }
-    } else if session.reasoning_effort.is_none() && session.model == reported_model {
-        session.reasoning_effort = reported_effort;
+        if session.approval().is_some() {
+            session.activity = Activity::Confirmation;
+        }
+        if session.model.is_none() {
+            session.model = self.reported_model.clone();
+            if session.reasoning_effort.is_none() {
+                session.reasoning_effort = self.reported_effort.clone();
+            }
+        } else if session.reasoning_effort.is_none() && session.model == self.reported_model {
+            session.reasoning_effort = self.reported_effort.clone();
+        }
+
+        self.legacy.retain(|id| {
+            session
+                .activities
+                .iter()
+                .any(|activity| activity.id() == id)
+        });
     }
+}
+#[cfg(test)]
+fn parse_events_at(session: &mut Session, tail: &str, offset: u64) {
+    let mut reader = RolloutReader {
+        activity: session.activity,
+        ..Default::default()
+    };
+    reader.parse(session, tail.as_bytes(), offset);
 }
 
 #[cfg(test)]

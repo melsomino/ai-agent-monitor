@@ -46,6 +46,12 @@ define_class!(
     }
 );
 
+/// Plain data retained across disposable popup lifetimes; contains no UI.
+pub(super) struct Draft {
+    text: String,
+    pending: Option<String>,
+}
+
 pub(super) struct State {
     monitor: monitor::Handle,
     session: String,
@@ -55,6 +61,7 @@ pub(super) struct State {
     view: Retained<NSView>,
     button: Retained<NSButton>,
     caption: Retained<NSTextField>,
+    symbol: Retained<super::visual::DecisionIcon>,
     background: Retained<NSBox>,
     feedback: Retained<NSTextField>,
     pending: RefCell<Option<String>>,
@@ -85,6 +92,18 @@ define_class!(
 );
 
 impl Composer {
+    pub(super) fn draft(&self) -> Draft {
+        Draft {
+            text: self.text(),
+            pending: self.ivars().pending.borrow().clone(),
+        }
+    }
+    pub(super) fn restore_draft(&self, draft: Draft) {
+        self.ivars()
+            .field
+            .setStringValue(&NSString::from_str(&draft.text));
+        *self.ivars().pending.borrow_mut() = draft.pending;
+    }
     fn clear_editor_background(&self) {
         if let Some(editor) = self.field().currentEditor() {
             editor.setBackgroundColor(Some(&NSColor::clearColor()));
@@ -108,7 +127,7 @@ impl Composer {
         let view = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, width, 56.0));
         let field = NSTextField::initWithFrame(
             NSTextField::alloc(mtm),
-            rect(11.0, 11.0, width - 90.0, 18.0),
+            rect(14.0, 11.0, width - 28.0, 18.0),
         );
         field.setFont(Some(&NSFont::systemFontOfSize(12.0)));
         field.setTextColor(Some(&super::visual::primary_text_color()));
@@ -132,28 +151,28 @@ impl Composer {
         }
         // SAFETY: Initialize a retained native input surface with its field.
         let surface: Retained<Surface> = unsafe {
-            msg_send![super(Surface::alloc(mtm).set_ivars(SurfaceState {field:field.clone()})),initWithFrame:rect(0.0,16.0,width-66.0,40.0)]
+            msg_send![super(Surface::alloc(mtm).set_ivars(SurfaceState {field:field.clone()})),initWithFrame:rect(0.0,0.0,width,40.0)]
         };
         surface.addSubview(&field);
         let focus_ring = super::inline_questions::FieldFocusRing::for_field(
             mtm,
             &field,
-            rect(-2.0, -2.0, width - 62.0, 44.0),
+            rect(-2.0, -2.0, width + 4.0, 44.0),
         );
         focus_ring.setHidden(true);
         surface.addSubview(&focus_ring);
         view.addSubview(&surface);
-        let frame = rect(width - 60.0, 20.0, 60.0, 32.0);
-        let background = super::visual::glass_box(mtm, frame, 0);
+        let frame = rect(width - 40.0, 12.0, 28.0, 28.0);
+        let background = super::visual::glass_box(mtm, frame, 4);
         background.setBoxType(NSBoxType::Custom);
         background.setTitlePosition(NSTitlePosition::NoTitle);
         background.setBorderWidth(0.0);
-        background.setCornerRadius(12.0);
+        background.setCornerRadius(14.0);
         background.setHidden(true);
         view.addSubview(&background);
         // SAFETY: No target/action until the retained controller is initialized.
         let button =
-            unsafe { NSButton::buttonWithTitle_target_action(ns_string!("Send"), None, None, mtm) };
+            unsafe { NSButton::buttonWithTitle_target_action(ns_string!(""), None, None, mtm) };
         button.setFrame(frame);
         button.setBordered(false);
         button.setTransparent(true);
@@ -164,13 +183,25 @@ impl Composer {
             session.key()
         ))));
         button.setToolTip(Some(ns_string!("Send message (Return)")));
-        let caption = NSTextField::labelWithString(ns_string!("Send"), mtm);
+        let caption = NSTextField::labelWithString(ns_string!(""), mtm);
         caption.setFrame(rect(width - 60.0, 27.0, 60.0, 18.0));
         caption.setFont(Some(&NSFont::systemFontOfSize(12.0)));
         caption.setAlignment(NSTextAlignment::Center);
-        caption.setTextColor(Some(&super::visual::primary_text_color()));
-        view.addSubview(&caption);
+        caption.setTextColor(Some(&NSColor::whiteColor()));
+        let symbol = super::visual::DecisionIcon::new(
+            mtm,
+            rect(frame.origin.x + 6.0, frame.origin.y + 6.0, 16.0, 16.0),
+            caption.clone(),
+            super::visual::DecisionGlyph::Up,
+        );
+        symbol.setHidden(true);
+        button.setHidden(true);
+        view.addSubview(&symbol);
         view.addSubview(&button);
+        // SAFETY: The icon-only submit control retains an explicit accessible name.
+        unsafe {
+            let _: () = msg_send![&*button,setAccessibilityLabel:ns_string!("Send message")];
+        }
         let feedback = NSTextField::labelWithString(ns_string!(""), mtm);
         feedback.setFrame(rect(4.0, 0.0, width - 8.0, 16.0));
         feedback.setFont(Some(&NSFont::systemFontOfSize(10.0)));
@@ -186,6 +217,7 @@ impl Composer {
             view,
             button,
             caption,
+            symbol,
             background,
             feedback,
             pending: RefCell::new(None),
@@ -224,6 +256,9 @@ impl Composer {
     pub(super) fn caption(&self) -> Retained<NSTextField> {
         self.ivars().caption.clone()
     }
+    pub(super) fn symbol(&self) -> Retained<super::visual::DecisionIcon> {
+        self.ivars().symbol.clone()
+    }
     pub(super) fn field(&self) -> &NSTextField {
         &self.ivars().field
     }
@@ -231,66 +266,99 @@ impl Composer {
         let s = self.ivars();
         s.view
             .setFrameSize(NSSize::new(width, s.view.frame().size.height));
-        s.field
-            .setFrameSize(NSSize::new(width - 90.0, s.field.frame().size.height));
-        s.surface
-            .setFrameSize(NSSize::new(width - 66.0, s.surface.frame().size.height));
-        s.focus_ring
-            .setFrameSize(NSSize::new(width - 62.0, s.focus_ring.frame().size.height));
-        for view in [
-            &*s.button as &NSView,
-            &*s.background as &NSView,
-            &*s.caption as &NSView,
-        ] {
-            view.setFrameOrigin(NSPoint::new(width - 60.0, view.frame().origin.y));
-        }
-        s.feedback
-            .setFrameSize(NSSize::new(width - 8.0, s.feedback.frame().size.height));
+        s.feedback.setFrameSize(NSSize::new(width - 8.0, 16.0));
         self.resize_to_fit();
     }
-    /// Measure the current draft at its actual wrapping width, including live edits.
+    /// The empty surface is 32 pt; a fitting line shares 44 pt with Send.
+    /// Wrapped/newline text reserves a separate 44 pt footer for Send.
     pub(super) fn resize_to_fit(&self) -> bool {
         let state = self.ivars();
-        let width = state.field.frame().size.width;
-        let measure =
-            NSTextField::wrappingLabelWithString(&NSString::from_str(&self.text()), self.mtm());
+        let width = state.view.frame().size.width;
+        let text = self.text();
+        let has_text = !text.trim().is_empty();
+        let measure = NSTextField::wrappingLabelWithString(&NSString::from_str(&text), self.mtm());
         measure.setFont(state.field.font().as_deref());
         measure.setMaximumNumberOfLines(0);
+        let natural = measure
+            .cell()
+            .map(|cell| cell.cellSize().width.ceil())
+            .unwrap_or(width);
+        let inline = has_text && !text.contains(['\r', '\n']) && natural <= width - 66.0;
+        let text_width = width - if inline { 66.0 } else { 28.0 };
         let text_height = measure
             .cell()
             .map(|cell| {
-                cell.cellSizeForBounds(rect(0.0, 0.0, width, 100000.0))
+                cell.cellSizeForBounds(rect(0.0, 0.0, text_width, 100000.0))
                     .height
                     .ceil()
             })
             .unwrap_or(18.0)
             .max(18.0);
-        let surface_height = text_height + 22.0;
-        if (state.surface.frame().size.height - surface_height).abs() < 0.5 {
-            return false;
+        let visible_height = if !has_text {
+            32.0_f64.max(text_height + 14.0)
+        } else if inline {
+            44.0
+        } else {
+            text_height + 54.0
+        };
+        let surface_height = visible_height + 8.0;
+        let feedback_height = if state.feedback.stringValue().is_empty() {
+            0.0
+        } else {
+            16.0
+        };
+        let field_y = if !has_text || inline {
+            (surface_height - text_height) / 2.0
+        } else {
+            surface_height - 14.0 - text_height
+        };
+        let field_frame = rect(14.0, field_y, text_width, text_height);
+        let surface_frame = rect(0.0, feedback_height, width, surface_height);
+        let button_frame = rect(
+            width - 40.0,
+            feedback_height
+                + if inline {
+                    (surface_height - 28.0) / 2.0
+                } else {
+                    12.0
+                },
+            28.0,
+            28.0,
+        );
+        let height = surface_height + feedback_height;
+        let changed = state.field.frame() != field_frame
+            || state.surface.frame() != surface_frame
+            || state.button.frame() != button_frame
+            || state.view.frame().size.height != height;
+        if state.field.frame() != field_frame {
+            state.field.setFrame(field_frame);
         }
-        state.field.setFrameSize(NSSize::new(width, text_height));
-        state.surface.setFrameSize(NSSize::new(
-            state.surface.frame().size.width,
-            surface_height,
-        ));
-        state.surface.setNeedsDisplay(true);
-        state.focus_ring.setFrameSize(NSSize::new(
-            state.surface.frame().size.width + 4.0,
-            surface_height + 4.0,
-        ));
-        state.view.setFrameSize(NSSize::new(
-            state.view.frame().size.width,
-            surface_height + 16.0,
-        ));
-        let y = 16.0 + (surface_height - 32.0) / 2.0;
-        for view in [&*state.button as &NSView, &*state.background as &NSView] {
-            view.setFrameOrigin(NSPoint::new(view.frame().origin.x, y));
+        if state.surface.frame() != surface_frame {
+            state.surface.setFrame(surface_frame);
+            state.surface.setNeedsDisplay(true);
         }
         state
-            .caption
-            .setFrameOrigin(NSPoint::new(state.caption.frame().origin.x, y + 7.0));
-        true
+            .focus_ring
+            .setFrameSize(NSSize::new(width + 4.0, surface_height + 4.0));
+        state.view.setFrameSize(NSSize::new(width, height));
+        if state.button.frame() != button_frame {
+            state.button.setFrame(button_frame);
+        }
+        state.background.setFrame(rect(
+            button_frame.origin.x - 4.0,
+            button_frame.origin.y - 4.0,
+            36.0,
+            36.0,
+        ));
+        state.symbol.setFrame(rect(
+            button_frame.origin.x + 6.0,
+            button_frame.origin.y + 6.0,
+            16.0,
+            16.0,
+        ));
+        state.feedback.setHidden(feedback_height == 0.0);
+        self.paint_button();
+        changed
     }
     fn text(&self) -> String {
         self.ivars()
@@ -324,12 +392,23 @@ impl Composer {
         }
     }
     fn paint_button(&self) {
-        let color = if self.ivars().button.isEnabled() {
-            super::visual::primary_text_color()
-        } else {
-            NSColor::disabledControlTextColor()
-        };
-        self.ivars().caption.setTextColor(Some(&color));
+        let state = self.ivars();
+        let hidden = self.text().trim().is_empty();
+        state.button.setHidden(hidden);
+        state.symbol.setHidden(hidden);
+        state.background.setHidden(hidden);
+        state.caption.setTextColor(Some(
+            &NSColor::whiteColor().colorWithAlphaComponent(if state.button.isEnabled() {
+                1.0
+            } else {
+                0.45
+            }),
+        ));
+        if let Some(surface) = state.background.downcast_ref::<super::visual::GlassBox>() {
+            surface.ivars().enabled.set(state.button.isEnabled());
+        }
+        state.symbol.setNeedsDisplay(true);
+        state.background.setNeedsDisplay(true);
     }
     pub(super) fn sync(&self, snapshot: &monitor::State, session: &Session) {
         let state = self.ivars();

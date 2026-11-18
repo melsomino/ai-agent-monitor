@@ -124,8 +124,8 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
         can_allow: true,
     }));
     request.set_interaction(Interaction {
-        command:Some("cargo test --locked --workspace --all-targets --all-features --no-fail-fast -- --test-threads=1 --nocapture".into()),
-        actions:vec![Action{id:"accept".into(),label:"Allow once".into(),detail:String::new()},Action{id:"similar".into(),label:"Allow similar commands".into(),detail:"cargo test".into()},Action{id:"decline".into(),label:"Deny".into(),detail:String::new()}],
+        command:Some("cargo test --locked --workspace --all-targets --all-features --no-fail-fast -- --test-threads=1 --nocapture tests::timer_countdown tests::timer_persistence tests::background_resume tests::request_delivery tests::session_reconnect tests::message_retry".into()),
+        actions:vec![Action{id:"accept".into(),label:"Allow once".into(),detail:String::new()},Action{id:"similar".into(),label:"Allow similar".into(),detail:"cargo test".into()},Action{id:"decline".into(),label:"Deny".into(),detail:String::new()}],
         questions:vec![],
     });
     let mut questions = fixture("Verification", Activity::Confirmation);
@@ -200,6 +200,461 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
     let (tx, mut commands) = tokio::sync::mpsc::channel(128);
     let (_published, state) = tokio::sync::watch::channel(std::sync::Arc::new(snapshot));
     let monitor = crate::actors::monitor::Handle { tx, state };
+    // The resident must not retain popup views or their controller between
+    // openings. Exercise real AppKit ownership, including the settings tree.
+    let allocated = MenuController::alloc(mtm).set_ivars(State::default());
+    let resident: Retained<MenuController> = unsafe { msg_send![super(allocated), init] };
+    resident.ivars().monitor.set(monitor.clone()).ok();
+    let resident_status_host =
+        NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 80.0, 24.0));
+    resident.build_status_artwork(&resident_status_host);
+    let (ui, _ui_events) = tokio::sync::mpsc::channel(128);
+    resident.ivars().ui_sender.set(ui).ok();
+    let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Lifecycle test"));
+    resident.ivars().menu.set(menu.clone()).ok();
+    objc2::rc::autoreleasepool(|_| {
+        let initial = resident.create_popup(&menu);
+        assert_eq!(initial.ivars().revision.get(), u64::MAX);
+        initial.receive_sessions_with_mouse(true);
+        assert_eq!(
+            initial.ivars().revision.get(),
+            monitor.snapshot().revision,
+            "holding the status icon must not delay the initial popup population"
+        );
+        assert_eq!(initial.ivars().all.borrow().len(), sessions.len());
+        initial.ivars().menu_item.get().unwrap().setView(None);
+        initial.shutdown();
+        menu.removeAllItems();
+    });
+    for cycle in 0..3 {
+        let (controller, root, settings) = objc2::rc::autoreleasepool(|_| {
+            assert!(resident.ivars().root.get().is_none());
+            resident
+                .ivars()
+                .expanded
+                .borrow_mut()
+                .insert(sessions[0].key());
+            resident.will_open(sel!(menuWillOpen:), &menu);
+            let popup = resident.ivars().popup.borrow().as_ref().unwrap().clone();
+            // Drive only the popup's update path, as during native tracking.
+            // All resident counters must advance without closing the menu or
+            // needing a separate resident poll timer callback.
+            let baseline = (*monitor.snapshot()).clone();
+            let mut changed = baseline.clone();
+            changed.revision += 1;
+            changed.sessions[0].activity = Activity::Working;
+            changed.sessions[1].set_approval(None);
+            changed.sessions[1].activity = Activity::Idle;
+            changed
+                .unseen_finished
+                .insert(changed.sessions[4].key(), changed.revision);
+            let revision = changed.revision;
+            _published.send_replace(std::sync::Arc::new(changed));
+            popup.receive_sessions();
+            assert_eq!(resident.ivars().revision.get(), revision);
+            assert_eq!(resident.ivars().working_count(), 2);
+            assert_eq!(resident.ivars().finished_count(), 1);
+            assert_eq!(
+                resident
+                    .ivars()
+                    .all
+                    .borrow()
+                    .iter()
+                    .filter(|s| s.approval().is_some())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                resident
+                    .ivars()
+                    .status_working_count
+                    .get()
+                    .unwrap()
+                    .stringValue()
+                    .to_string(),
+                "2"
+            );
+            assert_eq!(
+                resident
+                    .ivars()
+                    .status_finished_count
+                    .get()
+                    .unwrap()
+                    .stringValue()
+                    .to_string(),
+                "1"
+            );
+            assert!(resident.ivars().menu_open.get());
+            assert!(resident.ivars().root.get().is_none());
+            let mut restored = baseline;
+            restored.revision = revision + 1;
+            _published.send_replace(std::sync::Arc::new(restored));
+            popup.receive_sessions();
+            assert_eq!(resident.ivars().working_count(), 1);
+            assert_eq!(resident.ivars().finished_count(), 0);
+            assert!(
+                resident
+                    .ivars()
+                    .status_finished_count
+                    .get()
+                    .unwrap()
+                    .isHidden()
+            );
+            let held_row = popup.ivars().layout.borrow()[0].view.clone();
+            let held_revision = popup.ivars().revision.get();
+            let held_snapshot = (*monitor.snapshot()).clone();
+            for next in 1..=3 {
+                let mut update = held_snapshot.clone();
+                update.revision = held_revision + next;
+                update.sessions[0].model_display_name = Some("Updated model".into());
+                _published.send_replace(std::sync::Arc::new(update));
+                popup.receive_sessions_with_mouse(true);
+                assert_eq!(
+                    popup.ivars().revision.get(),
+                    held_revision,
+                    "a held click must not consume the pending UI revision"
+                );
+                assert!(
+                    std::ptr::eq(&*popup.ivars().layout.borrow()[0].view, &*held_row),
+                    "native mouse tracking must retain the exact pressed row and its controls"
+                );
+                assert_eq!(
+                    resident.ivars().revision.get(),
+                    held_revision + next,
+                    "status counters keep receiving snapshots during a held click"
+                );
+            }
+            popup.receive_sessions_with_mouse(false);
+            assert_eq!(
+                popup.ivars().revision.get(),
+                held_revision + 3,
+                "release applies the newest snapshot without replaying intermediate states"
+            );
+            assert!(!std::ptr::eq(
+                &*popup.ivars().layout.borrow()[0].view,
+                &*held_row
+            ));
+            let mut restored = held_snapshot.clone();
+            restored.revision = held_revision + 4;
+            _published.send_replace(std::sync::Arc::new(restored));
+            popup.receive_sessions_with_mouse(false);
+            let stable_row = popup.ivars().layout.borrow()[0].view.clone();
+            let stable_quota = popup
+                .ivars()
+                .footer
+                .get()
+                .unwrap()
+                .subviews()
+                .objectAtIndex(0);
+            let mut heartbeat = (*monitor.snapshot()).clone();
+            heartbeat.revision += 1;
+            for session in &mut heartbeat.sessions {
+                session.updated_at += 1;
+            }
+            if let Some(usage) = &mut heartbeat.usage {
+                usage.observed_at = "New observation, same limits".into();
+            }
+            _published.send_replace(std::sync::Arc::new(heartbeat));
+            popup.receive_sessions_with_mouse(false);
+            assert!(
+                std::ptr::eq(&*popup.ivars().layout.borrow()[0].view, &*stable_row),
+                "revision and observation timestamps must not recreate unchanged rows"
+            );
+            assert!(
+                std::ptr::eq(
+                    &*popup
+                        .ivars()
+                        .footer
+                        .get()
+                        .unwrap()
+                        .subviews()
+                        .objectAtIndex(0),
+                    &*stable_quota
+                ),
+                "unchanged quota must retain its native view and cursor rectangles"
+            );
+            let window = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    NSWindow::alloc(mtm),
+                    rect(0.0, 0.0, 460.0, 500.0),
+                    NSWindowStyleMask::Borderless,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
+            };
+            unsafe {
+                window.setReleasedWhenClosed(false);
+            }
+            window.setContentView(Some(&**popup.ivars().root.get().unwrap()));
+            assert_eq!(popup.ivars().all.borrow().len(), sessions.len());
+            // Exercise the NSApplication entry point, which retains the
+            // resident, rather than calling the popup's handlers directly.
+            let key = |code| {
+                NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                    NSEventType::KeyDown, NSPoint::new(0.0,0.0), NSEventModifierFlags::empty(), 0.0,
+                    window.windowNumber(), None, ns_string!(""), ns_string!(""), false, code,
+                ).unwrap()
+            };
+            popup.ivars().keyboard_focus.borrow_mut().take();
+            assert!(resident.handle_session_key(&key(125)));
+            let first = popup
+                .ivars()
+                .keyboard_focus
+                .borrow()
+                .clone()
+                .expect("Down must focus a real popup target");
+            assert!(resident.ivars().keyboard_focus.borrow().is_none());
+            assert!(resident.handle_session_key(&key(125)));
+            assert_ne!(popup.ivars().keyboard_focus.borrow().as_ref(), Some(&first));
+            assert!(resident.handle_session_key(&key(126)));
+            assert_eq!(popup.ivars().keyboard_focus.borrow().as_ref(), Some(&first));
+            *popup.ivars().keyboard_focus.borrow_mut() = Some(sessions[0].key());
+            assert!(resident.handle_session_key(&key(123)));
+            assert!(!popup.ivars().expanded.borrow().contains(&sessions[0].key()));
+            assert!(resident.handle_session_key(&key(124)));
+            assert!(popup.ivars().expanded.borrow().contains(&sessions[0].key()));
+            let composer = popup
+                .ivars()
+                .composers
+                .borrow()
+                .get(&sessions[0].key())
+                .unwrap()
+                .clone();
+            if cycle > 0 {
+                assert_eq!(
+                    composer.field().stringValue().to_string(),
+                    "Unsent popup draft"
+                );
+            }
+            composer
+                .field()
+                .setStringValue(ns_string!("Unsent popup draft"));
+            let pin = popup.ivars().pin_button.get().unwrap();
+            let cursor_clip = popup.ivars().scroll.get().unwrap().contentView();
+            let before_cursor_test = cursor_clip.bounds().origin;
+            cursor_clip.scrollToPoint(NSPoint::new(0.0, 0.0));
+            popup.sync_pin_position();
+            let pin_frame = popup.ivars().pin_background.get().unwrap().frame();
+            let brand_bounds = popup.ivars().root.get().unwrap().bounds();
+            assert_eq!(pin_frame.size, NSSize::new(28.0, 28.0));
+            assert_eq!(pin_frame.origin.x, 1.0);
+            assert!(pin_frame.origin.x + pin_frame.size.width <= brand_bounds.size.width - 1.0);
+            assert!(
+                (brand_bounds.size.height - pin_frame.origin.y - pin_frame.size.height - 1.0).abs()
+                    < 0.01,
+                "pin hover is inset from the window content, independently of the list gutter"
+            );
+            let pin_point = pin.convertPoint_toView(NSPoint::new(14.0, 14.0), None);
+            assert!(
+                popup.action_cursor_at(pin_point),
+                "enabled actions use a hand cursor"
+            );
+            pin.setEnabled(false);
+            assert!(
+                !popup.action_cursor_at(pin_point),
+                "disabled actions do not use a hand cursor"
+            );
+            pin.setEnabled(true);
+            cursor_clip.scrollToPoint(NSPoint::new(0.0, 10.0));
+            popup.sync_pin_position();
+            assert_eq!(
+                pin.frame().origin.y,
+                pin_frame.origin.y + 10.0,
+                "pin scrolls with the header"
+            );
+            cursor_clip.scrollToPoint(NSPoint::new(0.0, 40.0));
+            popup.sync_pin_position();
+            assert!(
+                pin.isHidden(),
+                "scrolled-away pin has no visible or clickable overlay"
+            );
+            cursor_clip.scrollToPoint(before_cursor_test);
+            popup.sync_pin_position();
+            let field = composer.field();
+            let field_point = field
+                .convertPoint_toView(NSPoint::new(10.0, field.bounds().size.height / 2.0), None);
+            assert!(
+                !popup.action_cursor_at(field_point),
+                "text input retains its native text cursor"
+            );
+            // Detaching reparents this exact UI instead of constructing another
+            // session tree. Native menu dismissal must not dispose it.
+            let same_root = popup.ivars().root.get().unwrap().clone();
+            let pinned_width = popup.menu_width();
+            let saved_detached = resident.ivars().detached_frame.get();
+            let position = popup
+                .ivars()
+                .scroll
+                .get()
+                .unwrap()
+                .contentView()
+                .bounds()
+                .origin;
+            popup.ivars().detach_pending.set(true);
+            resident.did_close(sel!(menuDidClose:), &menu);
+            let detached = popup.ivars().detached_window.borrow().clone().unwrap();
+            if let Some(frame) = saved_detached {
+                assert_eq!(
+                    detached.frame(),
+                    detached.constrainFrameRect_toScreen(frame, None),
+                    "detached geometry survives disposal of the previous popup"
+                );
+            }
+            assert!(
+                !detached.isVisible(),
+                "lifecycle test must not open a visible window"
+            );
+            assert!(detached.styleMask().contains(NSWindowStyleMask::Titled));
+            assert!(detached.styleMask().contains(NSWindowStyleMask::Resizable));
+            assert_eq!(detached.title().to_string(), "AI Agent Monitor");
+            assert_eq!(same_root.window().as_ref(), Some(&detached));
+            assert!(popup.ivars().menu_item.get().unwrap().view().is_none());
+            assert!(popup.ivars().pin_button.get().unwrap().isHidden());
+            assert!(popup.ivars().menu_open.get());
+            assert!(resident.ivars().popup.borrow().is_some());
+            popup.dismiss_menu();
+            assert!(
+                popup.is_detached(),
+                "opening an agent app must not close a detached monitor"
+            );
+            resident.did_close(sel!(menuDidClose:), &menu);
+            assert!(
+                resident.ivars().popup.borrow().is_some(),
+                "status menu dismissal preserves standalone window"
+            );
+            assert_eq!(
+                composer.field().stringValue().to_string(),
+                "Unsent popup draft"
+            );
+            let restored_position = popup
+                .ivars()
+                .scroll
+                .get()
+                .unwrap()
+                .contentView()
+                .bounds()
+                .origin;
+            assert!(
+                cycle > 0 || (restored_position.y - position.y).abs() <= 0.5,
+                "host change preserves scroll within device-pixel rounding"
+            );
+            detached.setContentSize(NSSize::new(560.0, 520.0));
+            popup.layout_detached();
+            assert_eq!(popup.menu_width(), 560.0);
+            assert_eq!(same_root.frame().size, NSSize::new(560.0, 520.0));
+            detached.setFrameOrigin(NSPoint::new(80.0, 120.0));
+            popup.remember_detached_frame();
+            let detached_frame = detached.frame();
+            popup.reattach_window();
+            assert!(!popup.is_detached());
+            assert_eq!(
+                popup.menu_width(),
+                pinned_width,
+                "standalone resizing does not change pinned width"
+            );
+            assert_eq!(resident.ivars().detached_frame.get(), Some(detached_frame));
+            assert_eq!(
+                popup.ivars().pin_button.get().unwrap().isHidden(),
+                popup
+                    .ivars()
+                    .scroll
+                    .get()
+                    .unwrap()
+                    .contentView()
+                    .bounds()
+                    .origin
+                    .y
+                    >= 29.0
+            );
+            assert_eq!(
+                popup.ivars().menu_item.get().unwrap().view().as_deref(),
+                Some(&**same_root)
+            );
+            resident.will_open(sel!(menuWillOpen:), &menu);
+            assert!(std::ptr::eq(
+                &**resident.ivars().popup.borrow().as_ref().unwrap(),
+                &*popup
+            ));
+            popup.change_width(500.0);
+            popup.ivars().detach_pending.set(true);
+            resident.did_close(sel!(menuDidClose:), &menu);
+            let second = popup.ivars().detached_window.borrow().clone().unwrap();
+            assert_eq!(
+                second.frame(),
+                second.constrainFrameRect_toScreen(detached_frame, None),
+                "pinned resizing does not change standalone position or size"
+            );
+            assert_eq!(popup.menu_width(), 560.0);
+            popup.reattach_window();
+            resident.will_open(sel!(menuWillOpen:), &menu);
+            assert_eq!(popup.menu_width(), 500.0);
+            // Restore the hidden test host for native keyboard and editor checks.
+            window.setContentView(Some(&same_root));
+            popup.show_settings();
+            window.makeFirstResponder(Some(&popup.ivars().settings_shell.get().unwrap().tabs[0]));
+            assert!(resident.handle_session_key(&key(124)));
+            assert_eq!(popup.ivars().settings_selected.get(), 1);
+            assert!(resident.handle_session_key(&key(123)));
+            assert_eq!(popup.ivars().settings_selected.get(), 0);
+            let weak = (
+                objc2::rc::Weak::new(&*popup),
+                objc2::rc::Weak::new(&**popup.ivars().root.get().unwrap()),
+                objc2::rc::Weak::new(&*popup.ivars().settings_shell.get().unwrap().scroll),
+            );
+            resident.did_close(sel!(menuDidClose:), &menu);
+            assert!(
+                popup
+                    .ivars()
+                    .scroll
+                    .get()
+                    .unwrap()
+                    .ivars()
+                    .controller
+                    .borrow()
+                    .is_none()
+            );
+            window.setContentView(None);
+            assert!(popup.ivars().pointer_timer.borrow().is_none());
+            assert!(popup.ivars().keyboard_handler.borrow().is_none());
+            assert!(resident.ivars().popup.borrow().is_none());
+            assert_eq!(menu.numberOfItems(), 1);
+            assert!(menu.itemAtIndex(0).unwrap().view().is_none());
+            weak
+        });
+        assert!(
+            controller.load().is_none(),
+            "closed popup controller leaked"
+        );
+        assert!(root.load().is_none(), "closed popup view tree leaked");
+        assert!(settings.load().is_none(), "closed settings tree leaked");
+        let mut update = (*monitor.snapshot()).clone();
+        update.revision += 1;
+        _published.send_replace(std::sync::Arc::new(update));
+        resident.receive_sessions();
+        assert_eq!(resident.ivars().all.borrow().len(), sessions.len());
+        assert!(resident.ivars().root.get().is_none());
+        assert!(resident.ivars().popup.borrow().is_none());
+    }
+    objc2::rc::autoreleasepool(|_| {
+        resident.will_open(sel!(menuWillOpen:), &menu);
+        let popup = resident.ivars().popup.borrow().as_ref().unwrap().clone();
+        let root = objc2::rc::Weak::new(&**popup.ivars().root.get().unwrap());
+        popup.ivars().detach_pending.set(true);
+        resident.did_close(sel!(menuDidClose:), &menu);
+        let window = popup.ivars().detached_window.borrow().clone().unwrap();
+        // Native close reaches the window delegate, saves drafts and tears down
+        // both tracking timers. A later opening constructs a fresh transient UI.
+        window.close();
+        assert!(!popup.is_detached());
+        assert!(resident.ivars().popup.borrow().is_none());
+        assert!(popup.ivars().pointer_timer.borrow().is_none());
+        assert!(popup.ivars().keyboard_handler.borrow().is_none());
+        assert!(
+            root.load().is_some(),
+            "only this local controller retains the old root"
+        );
+    });
+    while commands.try_recv().is_ok() {}
     for (name, appearance_name) in [
         ("dark", unsafe { NSAppearanceNameDarkAqua }),
         ("light", unsafe { NSAppearanceNameAqua }),
@@ -250,6 +705,82 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
         // SAFETY: Same initializer as the production controller, with test-owned channels.
         let controller: Retained<MenuController> = unsafe { msg_send![super(allocated), init] };
         controller.ivars().monitor.set(monitor.clone()).ok();
+        let status_host = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 80.0, 24.0));
+        status_host.setAppearance(Some(&appearance));
+        controller.build_status_artwork(&status_host);
+        controller
+            .ivars()
+            .status_eye_animation
+            .borrow_mut()
+            .update(true, true);
+        controller.paint_status_eyes();
+        let first = controller
+            .ivars()
+            .status_content
+            .get()
+            .unwrap()
+            .ivars()
+            .images
+            .borrow()
+            .clone()
+            .unwrap();
+        for _ in 0..16 {
+            controller.ivars().status_eye_animation.borrow_mut().tick();
+            controller.paint_status_eyes();
+        }
+        assert_eq!(controller.ivars().status_frames.borrow().len(), 8);
+        let status_content = controller.ivars().status_content.get().unwrap();
+        assert_eq!(
+            status_content.subviews().count(),
+            0,
+            "system status snapshots must contain only the cached artwork"
+        );
+        assert!(
+            std::ptr::eq(
+                &*first[0],
+                &*status_content.ivars().images.borrow().as_ref().unwrap()[0]
+            ),
+            "the animation must reuse its prepared frames"
+        );
+        // Reproduce AppKit's temporary source-appearance switches while it
+        // prepares status-item replicants. Neither switch may rebuild frames
+        // or create a new source invalidation/redraw feedback loop.
+        for _ in 0..6 {
+            for name in unsafe { [NSAppearanceNameAqua, NSAppearanceNameDarkAqua] } {
+                status_content.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
+                let capture = status_content
+                    .bitmapImageRepForCachingDisplayInRect(status_content.bounds())
+                    .unwrap();
+                status_content
+                    .cacheDisplayInRect_toBitmapImageRep(status_content.bounds(), &capture);
+                assert_eq!(
+                    controller.ivars().status_frames.borrow().len(),
+                    8,
+                    "replicant snapshots must not invalidate the animation cache"
+                );
+                let current = status_content.ivars().images.borrow();
+                for (original, selected) in first.iter().zip(current.as_ref().unwrap()) {
+                    assert!(
+                        std::ptr::eq(&**original, &**selected),
+                        "appearance switches must only select prepared images"
+                    );
+                }
+            }
+        }
+        status_content.setAppearance(Some(&appearance));
+        let status_bitmap = status_content
+            .bitmapImageRepForCachingDisplayInRect(status_content.bounds())
+            .unwrap();
+        status_content.cacheDisplayInRect_toBitmapImageRep(status_content.bounds(), &status_bitmap);
+        assert!(
+            (0..status_bitmap.pixelsWide()).any(|x| (0..status_bitmap.pixelsHigh()).any(|y| {
+                status_bitmap
+                    .colorAtX_y(x, y)
+                    .is_some_and(|color| color.alphaComponent() > 0.5)
+            })),
+            "cached status artwork must not be empty"
+        );
+        export(&status_bitmap, &format!("{name}-status-cached"));
         *controller.ivars().all.borrow_mut() = sessions.clone();
         *controller.ivars().usage.borrow_mut() = Some(usage.clone());
         controller
@@ -263,7 +794,18 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             .borrow_mut()
             .insert(request.key(), 1.0);
         controller.build_menu();
+        // Background discovery must retain fresh data without constructing
+        // session controls while the native popup is closed. The first visible
+        // render still consumes the pending update below.
+        let mut refreshed = (*monitor.snapshot()).clone();
+        refreshed.revision += 1;
+        _published.send_replace(std::sync::Arc::new(refreshed));
+        controller.receive_sessions();
+        assert!(controller.ivars().layout.borrow().is_empty());
+        assert!(controller.ivars().filter_dirty.get());
+        assert_eq!(controller.ivars().all.borrow().len(), sessions.len());
         controller.filter();
+        assert!(!controller.ivars().layout.borrow().is_empty());
         assert_eq!(
             overview_counts(&sessions, |session| session.id == sessions[0].id),
             [2, 1, 1, 10, 0]
@@ -312,11 +854,45 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             .find(|item| item.id.as_ref().is_some_and(|id| id == &request.key()))
             .and_then(|item| item.row.clone())
             .expect("request row");
+        let destination = hover_row.ivars().destination.get().unwrap();
+        let destination_icon = hover_row.ivars().destination_icon.get().unwrap();
+        let destination_arrow = hover_row.ivars().destination_arrow.get().unwrap();
+        assert!(!destination.isHidden());
+        assert!(destination_arrow.isHidden());
+        assert_eq!(destination_icon.frame().origin.x, 0.0);
+        let highlight_height = hover_row
+            .ivars()
+            .background
+            .get()
+            .unwrap()
+            .frame()
+            .size
+            .height;
         hover_row.set_highlight(true, false);
+        assert!(!destination_arrow.isHidden());
+        assert_eq!(destination_icon.frame().origin.x, 18.0);
+        assert!(
+            destination.frame().origin.x + destination_icon.frame().origin.x + 16.0
+                < hover_row.ivars().background.get().unwrap().frame().max().x
+        );
+        assert_eq!(
+            hover_row
+                .ivars()
+                .background
+                .get()
+                .unwrap()
+                .frame()
+                .size
+                .height,
+            highlight_height
+        );
         export(&bitmap(root), &format!("{name}-title-hover"));
         hover_row.set_highlight(false, true);
         export(&bitmap(root), &format!("{name}-title-focus"));
         hover_row.set_highlight(false, false);
+        assert!(!destination.isHidden());
+        assert!(destination_arrow.isHidden());
+        assert_eq!(destination_icon.frame().origin.x, 0.0);
         let initial = bitmap(root);
         let before = rgb(&initial, initial.pixelsWide() - 20, 200);
         export(&initial, name);
@@ -665,6 +1241,69 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             110.0,
             "default-width quota group must be centered in the wider host"
         );
+        // Reset inventory is driven only by monitor state, with a retained
+        // native spinner and one capsule that grows above its quota row.
+        let baseline = (*monitor.snapshot()).clone();
+        let closed_height = controller.ivars().footer_height.get();
+        controller.ivars().usage_resets_expanded.set(true);
+        let mut loading = baseline.clone();
+        loading.usage_resets.phase = crate::domain::usage::ResetPhase::Loading;
+        _published.send_replace(std::sync::Arc::new(loading));
+        controller.render_footer();
+        assert!(controller.ivars().usage_resets_spinning.get());
+        assert_eq!(controller.ivars().footer_height.get(), closed_height + 78.0);
+        let mut ready = baseline.clone();
+        ready.usage_resets = crate::domain::usage::Resets {
+            generation: 1,
+            phase: crate::domain::usage::ResetPhase::Ready,
+            available_count: Some(3),
+            credits: Some(vec![
+                crate::domain::usage::ResetCredit {
+                    title: "Full reset".into(),
+                    expires_at: Some(2_000_000_000)
+                };
+                3
+            ]),
+            error: None,
+        };
+        _published.send_replace(std::sync::Arc::new(ready));
+        controller.render_footer();
+        assert!(!controller.ivars().usage_resets_spinning.get());
+        assert!(text_label(root, "Usage limit resets").is_some());
+        assert!(text_label(root, "3 available").is_some());
+        assert!(text_label(root, "Expires").is_some());
+        export(&bitmap(root), &format!("{name}-usage-resets"));
+        controller.ivars().usage_resets_expanded.set(false);
+        controller.toggle_usage_resets(sel!(toggleUsageResets:), None);
+        assert!(
+            controller.ivars().usage_resets_spinning.get(),
+            "reopening cached results must show loading synchronously"
+        );
+        assert!(
+            text_label(root, "Full reset").is_none(),
+            "cached rows must not flash before loading arrives"
+        );
+        let mut stale = (*monitor.snapshot()).clone();
+        stale.revision += 1;
+        _published.send_replace(std::sync::Arc::new(stale));
+        controller.render_footer();
+        assert!(
+            controller.ivars().usage_resets_spinning.get(),
+            "unrelated revisions must not reveal old results"
+        );
+        let mut fresh = (*monitor.snapshot()).clone();
+        fresh.usage_resets.generation += 1;
+        _published.send_replace(std::sync::Arc::new(fresh));
+        controller.render_footer();
+        assert!(
+            !controller.ivars().usage_resets_spinning.get(),
+            "a new result must resolve loading even if its intermediate loading snapshot was coalesced"
+        );
+        assert!(text_label(root, "Full reset").is_some());
+        controller.ivars().usage_resets_expanded.set(false);
+        _published.send_replace(std::sync::Arc::new(baseline));
+        controller.render_footer();
+        assert_eq!(controller.ivars().footer_height.get(), closed_height);
         export(&bitmap(root), &format!("{name}-wide-table"));
         controller.change_width(460.0);
         *controller.ivars().all.borrow_mut() = saved_sessions;
@@ -837,6 +1476,15 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             .unwrap()
             .clone();
         assert!(composer.attached() && composer.field().isEnabled());
+        assert!(
+            composer.button().isHidden(),
+            "empty composer must have no Send button"
+        );
+        assert_eq!(
+            composer.view().frame().size.height,
+            40.0,
+            "32 pt empty fill plus drawing clearance"
+        );
         let path = text_label(root, "/demo/task-board").unwrap();
         let input_frame =
             root.convertRect_fromView(composer.view().bounds(), Some(composer.view()));
@@ -858,7 +1506,15 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
             .field()
             .setStringValue(ns_string!("Please continue with the next phase."));
         composer.sync(&monitor.snapshot(), &idle);
-        assert!(composer.button().isEnabled());
+        assert!(composer.button().isEnabled() && !composer.button().isHidden());
+        assert_eq!(composer.button().frame().size, NSSize::new(28.0, 28.0));
+        let field_frame = composer
+            .view()
+            .convertRect_fromView(composer.field().bounds(), Some(composer.field()));
+        assert!(
+            (field_frame.mid().y - composer.button().frame().mid().y).abs() < 0.5,
+            "short input and Send must share a vertical center"
+        );
         export(&bitmap(root), &format!("{name}-composer"));
         *controller.ivars().keyboard_focus.borrow_mut() = Some(composer.id());
         controller.reveal_keyboard_focus();
@@ -890,6 +1546,13 @@ pub(crate) fn verify(mtm: MainThreadMarker) {
         let was_open = controller.ivars().menu_open.replace(true);
         controller.render_rows(std::slice::from_ref(&idle));
         assert!(composer.view().frame().size.height > compact_height + 36.0);
+        let text_frame = composer
+            .view()
+            .convertRect_fromView(composer.field().bounds(), Some(composer.field()));
+        assert!(
+            text_frame.origin.y >= composer.button().frame().max().y + 8.0,
+            "multiline text must stay above the Send footer"
+        );
         assert!(composer.editing(), "resizing must retain editing");
         assert_eq!(
             composer

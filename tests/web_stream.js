@@ -7,7 +7,7 @@ const context={window:{}};
 vm.runInNewContext(fs.readFileSync('src/web/stream.js','utf8'),context);
 const Stream=context.window.AAMStream;
 const plain=value=>JSON.parse(JSON.stringify(value));
-const initial=()=>({type:'snapshot',protocol:1,revision:1,state:{sessionOrder:['codex:a/b'],sessions:{'codex:a/b':{id:'codex:a/b',title:'Original',activityOrder:['old','request'],activities:{old:{id:'old',type:'message',html:'Keep this'},request:{id:'request',request:{phase:'ready',error:null}}}}},usage:[],error:null}});
+const initial=()=>({type:'snapshot',protocol:1,revision:1,state:{sessionOrder:['codex:a/b'],sessions:{'codex:a/b':{id:'codex:a/b',title:'Original',activityOrder:['old','request'],activities:{old:{id:'old',type:'message',html:'Keep this'},request:{id:'request',type:'request',request:{phase:'ready',error:null}}}}},usage:[],error:null}});
 const patch=(changes,revision=2,baseRevision=1)=>({type:'patch',protocol:1,baseRevision,revision,changes});
 
 test('keyed changes preserve messages, append/reorder activities and reconstruct renderer arrays',()=>{
@@ -56,7 +56,7 @@ test('opaque entity keys cannot pollute object prototypes',()=>{
 test('remote host resyncs safely and sends history through WebSocket without HTTP or replay',async()=>{
  const renders=[],sockets=[],timers=new Map(),httpCalls=[];let nextTimer=0,dispatch;
  const element=()=>({hidden:true,append(){},setAttribute(){}});
- const browser={URLSearchParams,crypto:require('node:crypto').webcrypto,window:{},document:{body:{append(){}},createElement:element,querySelector:element,addEventListener(){}},
+ const browser={URLSearchParams,crypto:require('node:crypto').webcrypto,window:{addEventListener(){}},document:{body:{append(){}},createElement:element,querySelector:element,addEventListener(){}},
   location:{protocol:'http:',host:'localhost:8765',hash:'',pathname:'/',search:''},history:{replaceState(){}},
   matchMedia:()=>({matches:false,addEventListener(){}}),
   fetch:async path=>{httpCalls.push(path);return {ok:true,status:200,json:async()=>new Stream().receive(initial())};},
@@ -99,4 +99,65 @@ test('remote host resyncs safely and sends history through WebSocket without HTT
  await dispatch({type:'history',session:'codex:a/b'});
  assert.equal(socket.sent.length,count,'disconnect must not replay an admitted or uncertain request');
  assert.deepEqual(httpCalls,['/api/snapshot']);
+});
+
+
+async function diagnosticBrowser() {
+ const ids=new Map(),renders=[],sockets=[],httpCalls=[],intervals=new Map();let serial=0,dispatch;
+ function element(){
+  let id='';const node={hidden:false,textContent:'',children:[],value:'',offsetHeight:110,style:{setProperty(){}},classList:{add(){}},setAttribute(){},append(...nodes){this.children.push(...nodes);},prepend(...nodes){this.children.unshift(...nodes);}};
+  Object.defineProperty(node,'id',{get:()=>id,set:value=>{id=value;ids.set(value,node);}});return node;
+ }
+ const browser={URLSearchParams,crypto:require('node:crypto').webcrypto,window:{addEventListener(){}},
+  document:{hidden:false,body:element(),documentElement:element(),createElement:element,getElementById:element,querySelector:element,addEventListener(){}},
+  location:{protocol:'http:',host:'localhost:8765',hash:'',pathname:'/',search:'?diagnostics=1'},history:{replaceState(){}},
+  matchMedia:()=>({matches:false,addEventListener(){}}),ResizeObserver:class{observe(){}},
+  fetch:async path=>{httpCalls.push(path);return {ok:true,status:200,json:async()=>new Stream().receive(initial())};},
+  setTimeout:()=>++serial,clearTimeout(){},setInterval:(fn,ms)=>{assert.equal(ms,250);intervals.set(++serial,fn);return serial;},clearInterval:id=>intervals.delete(id)};
+ browser.WebSocket=class{static OPEN=1;constructor(){this.readyState=1;this.sent=[];sockets.push(this);}send(s){this.sent.push(JSON.parse(s));}close(){this.readyState=3;this.onclose?.();}};
+ browser.window.AAMMonitor={mount:(_root,send)=>{dispatch=send;return {setSnapshot:value=>renders.push(plain(value)),messageResult(){}};}};
+ vm.runInNewContext(fs.readFileSync('src/web/stream.js','utf8'),browser);
+ vm.runInNewContext(fs.readFileSync('src/web/remote.js','utf8'),browser);
+ await new Promise(setImmediate);
+ const socket=sockets[0],emit=packet=>socket.onmessage({data:JSON.stringify(packet)});
+ const mode=ids.get('aam-diagnostics-mode');
+ return {ids,renders,socket,httpCalls,intervals,dispatch,browser,emit,mode:value=>{mode.value=value;mode.onchange();}};
+}
+
+test('diagnostics freeze and repeat retain one snapshot while stream advances; Live catches up',async()=>{
+ const b=await diagnosticBrowser();b.emit(initial());b.mode('freeze');
+ const frozen=b.renders.at(-1),count=b.renders.length;
+ b.emit(patch([{op:'set',path:['sessions','codex:a/b','title'],value:'Received while frozen'}]));
+ assert.equal(b.renders.length,count);assert.equal(frozen.sessions[0].title,'Original');
+ assert.equal(frozen.sessions[0].activities[1].request.enabled,false);
+ await b.dispatch({type:'submit',session:'codex:a/b',context:'old',action:'allow'});
+ await b.dispatch({type:'message',session:'codex:a/b',text:'Do not send'});
+ await b.dispatch({type:'history',session:'codex:a/b'});
+ assert.deepEqual(b.httpCalls,['/api/snapshot']);assert.equal(b.socket.sent.length,0);
+ b.mode('repeat');assert.equal(b.intervals.size,1);
+ for(let i=0;i<4;i++)[...b.intervals.values()][0]();
+ assert.equal(b.renders.at(-1).sessions[0].title,'Original');
+ b.emit(patch([{op:'set',path:['sessions','codex:a/b','title'],value:'Latest live state'}],3,2));
+ [...b.intervals.values()][0]();assert.equal(b.renders.at(-1).sessions[0].title,'Original');
+ b.mode('live');assert.equal(b.intervals.size,0);assert.equal(b.renders.at(-1).sessions[0].title,'Latest live state');
+ assert.match(b.ids.get('aam-diagnostics-stats').textContent,/packets 3/);
+ b.mode('repeat');b.browser.document.hidden=true;const hidden=b.renders.length;
+ [...b.intervals.values()][0]();assert.equal(b.renders.length,hidden);
+});
+
+test('diagnostics count stream failures, renderer failures and closed connections separately',async()=>{
+ const b=await diagnosticBrowser();b.emit(initial());
+ b.emit(patch([],9,8));
+ assert.match(b.ids.get('aam-diagnostics-stats').textContent,/sync errors 1 · render errors 0/);
+ assert.ok(b.ids.get('aam-diagnostics-error').textContent);
+ const reset=initial();reset.revision=10;b.emit(reset);
+ const render=b.browser.window.aam.setSnapshot;let once=true;
+ b.browser.window.aam.setSnapshot=value=>{if(once){once=false;throw Error('Synthetic render failure');}render(value);};
+ b.emit(patch([],11,10));
+ assert.match(b.ids.get('aam-diagnostics-stats').textContent,/sync errors 1 · render errors 1/);
+ assert.equal(b.ids.get('aam-diagnostics-error').textContent,'Synthetic render failure');
+ b.socket.close();assert.match(b.ids.get('aam-diagnostics-stats').textContent,/closes 1/);
+ b.ids.get('aam-diagnostics-reset').onclick();
+ assert.match(b.ids.get('aam-diagnostics-stats').textContent,/sync errors 0 · render errors 0/);
+ assert.equal(b.ids.get('aam-diagnostics-error').hidden,true);
 });

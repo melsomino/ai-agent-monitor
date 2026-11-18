@@ -30,6 +30,7 @@ The [glass revision](components/glass-surfaces.md) supersedes the neutral H/M pa
 | PA-16 |Single list scroll/footer |Yes |Yes |Yes |C |
 | PA-17 |Elastic overscroll |Contain CSS |Explicitly off |GTK policy |P |
 | PA-18 |Responsive/coarse pointer |≤420/44min targets |No mobile layout |No mobile layout |P/M |
+| PA-19 |Detach/pin monitor |Simulated native frame; same iframe; pin scrolls with header |Same root reparented between NSMenu and standard NSWindow; native title-bar pin |Missing |P/M, [macOS detached window](platforms/macos.md#macos-detached-window) |
 
 ## Sessions and content
 
@@ -59,6 +60,7 @@ The [glass revision](components/glass-surfaces.md) supersedes the neutral H/M pa
 | PS-20 |Metadata |Home-like fixture,hide toggle |Selectable~+branch |Selectable~/+branch |C/D,exact home / toggle |
 | PS-21 |Empty list states |Absent |3states |3states,different priority |M/D |
 | PS-22 |Quota |Static |Remaining/date/expiry/tooltips |Same values,different alignment/tooltips |C/M/P |
+| PS-23 |Usage reset inventory |On-demand mock,2.6s loading,ellipsis disclosure above quota |Monitor-owned on-demand read,spinner,provider count/titles/expiry;solid selected circle |Missing inventory control |M/G gap; [contract](components/glass-surfaces.md#quota-reset-inventory); live web uses the real monitor snapshot |
 | PS-23 |Filter row |Footer query |Footer query |Footer query |C |
 | PS-24 |Footer power |Pause simulation |Quit |Quit |D,[D-12](discrepancies.md#d-12) |
 | PS-25 |[Session composer](components/sessions.md#sessions-composer) |Idle/finished field, mock send, retained drafts |Idle field, live actor delivery, pending/errors, native editing, retained drafts |Missing |M/D; real transport capability is not guaranteed by live observation |

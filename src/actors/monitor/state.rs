@@ -74,6 +74,7 @@ pub struct State {
     pub hooks: HashMap<String, HookState>,
     pub notices: Vec<Notice>,
     pub usage: Option<crate::domain::usage::Usage>,
+    pub usage_resets: crate::domain::usage::Resets,
     pub discovery_error: Option<String>,
     pub agent_errors: HashMap<String, String>,
     pub stopping: bool,

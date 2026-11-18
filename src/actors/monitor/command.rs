@@ -1,6 +1,9 @@
 use super::*;
 pub enum Command {
-    ForgetHistory { client: HistoryClient },
+    ReadUsageResets,
+    ForgetHistory {
+        client: HistoryClient,
+    },
     FinishedSeen {
         completions: HashMap<String, u64>,
     },

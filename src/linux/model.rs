@@ -1,7 +1,7 @@
 //! Guide-defined sorting, filtering, markup and transient disclosure state.
 use crate::{
     actors::monitor::State,
-    domain::session::{Activity, Client, Session},
+    domain::session::{Activity, Session},
 };
 use gtk::glib;
 use std::collections::HashMap;
@@ -23,25 +23,8 @@ pub fn eligible(state: &State, query: &str) -> Vec<Session> {
         })
         .cloned()
         .collect::<Vec<_>>();
-    sessions.sort_by(|a, b| {
-        rank(a.client)
-            .cmp(&rank(b.client))
-            .then(a.client.application_id().cmp(&b.client.application_id()))
-            .then(
-                glib::FilenameCollationKey::from(a.title.to_lowercase())
-                    .cmp(&glib::FilenameCollationKey::from(b.title.to_lowercase())),
-            )
-            .then(a.key().cmp(&b.key()))
-    });
+    sessions.sort_by(crate::platform::session_order);
     sessions
-}
-fn rank(client: Client) -> u8 {
-    match client {
-        Client::VSCode => 0,
-        Client::Terminal => 1,
-        Client::Desktop { .. } => 2,
-        Client::Unknown => 3,
-    }
 }
 pub fn pop_grapheme(text: &mut String) {
     if let Some((index, _)) = text.grapheme_indices(true).next_back() {
@@ -198,7 +181,10 @@ mod tests {
 #[cfg(test)]
 mod behavior_tests {
     use super::*;
-    use crate::domain::{interaction::Interaction, session::Approval};
+    use crate::domain::{
+        interaction::Interaction,
+        session::{Approval, Client},
+    };
     fn session(id: &str, title: &str, activity: Activity) -> Session {
         {
             let mut __session = Session {

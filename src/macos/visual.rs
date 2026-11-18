@@ -41,19 +41,19 @@ pub(super) fn command_text(label: &NSTextField, text: &str) {
     );
     let range = NSRange::new(0, text.encode_utf16().count());
     let paragraph = NSMutableParagraphStyle::new();
-    paragraph.setMinimumLineHeight(16.0);
-    paragraph.setMaximumLineHeight(16.0);
+    paragraph.setMinimumLineHeight(15.0);
+    paragraph.setMaximumLineHeight(15.0);
     paragraph.setLineBreakMode(NSLineBreakMode::ByCharWrapping);
     // SAFETY: Values use their documented AppKit attribute types and UTF-16 range.
     unsafe {
         value.addAttribute_value_range(
             NSFontAttributeName,
-            &NSFont::monospacedSystemFontOfSize_weight(11.0, 0.0),
+            &NSFont::monospacedSystemFontOfSize_weight(10.0, 0.0),
             range,
         );
         value.addAttribute_value_range(
             NSForegroundColorAttributeName,
-            &primary_text_color(),
+            &secondary_text_color(),
             range,
         );
         value.addAttribute_value_range(NSParagraphStyleAttributeName, &paragraph, range);
@@ -506,37 +506,6 @@ pub(super) fn tertiary_text_color() -> Retained<NSColor> {
     appearance_color([138.0, 126.0, 155.0], [147.0, 136.0, 175.0], 1.0)
 }
 
-define_class!(
-    // SAFETY: Main-thread, click-through drawing matching the prototype quota symbol.
-    #[unsafe(super(NSView))]
-    #[thread_kind = MainThreadOnly]
-    #[derive(Debug)]
-    pub(super) struct QuotaSymbol;
-    unsafe impl NSObjectProtocol for QuotaSymbol {}
-    impl QuotaSymbol {
-        #[unsafe(method_id(hitTest:))]
-        fn hit_test(&self,_point:NSPoint)->Option<Retained<NSView>> {None}
-        #[unsafe(method(drawRect:))]
-        fn draw_symbol(&self,_dirty:NSRect) {
-            NSGraphicsContext::saveGraphicsState_class();
-            let scale=NSAffineTransform::transform();scale.scaleBy(self.bounds().size.width/24.0);scale.concat();
-            appearance_color([137.0,103.0,173.0],[185.0,155.0,229.0],1.0).setStroke();
-            for (x,y,w,h) in [(2.0,3.0,3.5,8.0),(9.0,3.0,3.5,14.0)] {
-                let bar=NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect(x,y,w,h),1.0,1.0);bar.setLineWidth(1.8);bar.stroke();
-            }
-            let bar=NSBezierPath::bezierPath();bar.moveToPoint(NSPoint::new(16.0,13.0));bar.lineToPoint(NSPoint::new(16.0,3.0));bar.lineToPoint(NSPoint::new(20.0,3.0));bar.lineToPoint(NSPoint::new(20.0,13.0));bar.setLineWidth(1.8);bar.stroke();
-            let dot=NSBezierPath::bezierPathWithOvalInRect(rect(15.8,18.3,4.4,4.4));dot.setLineWidth(1.8);dot.stroke();
-            NSGraphicsContext::restoreGraphicsState_class();
-        }
-    }
-);
-impl QuotaSymbol {
-    pub(super) fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
-        // SAFETY: This decorative NSView has no ivars.
-        unsafe { msg_send![Self::alloc(mtm),initWithFrame:frame] }
-    }
-}
-
 pub(super) fn draw_thread_line(
     x: f64,
     top: f64,
@@ -633,7 +602,8 @@ define_class!(
             if let Some(remaining) = self.ivars().remaining.filter(|value| *value > 0.0) {
                 let fill = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
                     rect(0.0,0.0,bounds.size.width*remaining.clamp(0.0,100.0)/100.0,bounds.size.height),4.0,4.0);
-                if let Some(color)=stops(&[(appearance_color([152.0,107.0,255.0],[152.0,107.0,255.0],1.0),0.0),(appearance_color([180.0,109.0,241.0],[180.0,109.0,241.0],1.0),0.56),(appearance_color([220.0,121.0,237.0],[220.0,121.0,237.0],1.0),1.0)]) {color.drawInBezierPath_angle(&fill,0.0);}
+                let rgb=crate::domain::layout::quota_rgb(remaining).map(f64::from);
+                gradient(&fill,&appearance_color(rgb,rgb,0.85),&appearance_color(rgb,rgb,1.0),0.0);
                 NSGraphicsContext::saveGraphicsState_class();fill.addClip();
                 gradient(&NSBezierPath::bezierPathWithRect(rect(0.0,bounds.size.height-1.0,bounds.size.width,1.0)),&NSColor::clearColor(),&appearance_color([239.0,213.0,255.0],[239.0,213.0,255.0],0.27),90.0);
                 NSGraphicsContext::restoreGraphicsState_class();
@@ -646,6 +616,7 @@ define_class!(
 pub(super) enum DecisionGlyph {
     Check,
     Cross,
+    Up,
 }
 #[derive(Debug)]
 pub(super) struct DecisionState {
@@ -671,6 +642,7 @@ define_class!(
             let path=NSBezierPath::bezierPath();
             match self.ivars().glyph {
                 DecisionGlyph::Check=>{path.moveToPoint(NSPoint::new(20.0,18.0));path.lineToPoint(NSPoint::new(9.0,7.0));path.lineToPoint(NSPoint::new(4.0,12.0));},
+                DecisionGlyph::Up=>{path.moveToPoint(NSPoint::new(12.0,5.0));path.lineToPoint(NSPoint::new(12.0,19.0));path.moveToPoint(NSPoint::new(6.0,13.0));path.lineToPoint(NSPoint::new(12.0,19.0));path.lineToPoint(NSPoint::new(18.0,13.0));},
                 DecisionGlyph::Cross=>{path.moveToPoint(NSPoint::new(18.0,18.0));path.lineToPoint(NSPoint::new(6.0,6.0));path.moveToPoint(NSPoint::new(6.0,18.0));path.lineToPoint(NSPoint::new(18.0,6.0));},
             }
             path.setLineWidth(1.8);path.setLineCapStyle(NSLineCapStyle::Round);path.setLineJoinStyle(NSLineJoinStyle::Round);path.stroke();
@@ -1070,9 +1042,6 @@ pub(super) fn draw_keyboard_outline(bounds: NSRect, radius: f64) {
     path.stroke();
 }
 
-pub(super) fn group_title_color() -> Retained<NSColor> {
-    appearance_color([77.0, 85.0, 100.0], [204.0, 210.0, 222.0], 1.0)
-}
 pub(super) fn neutral_robot_color() -> Retained<NSColor> {
     appearance_color([112.0, 128.0, 145.0], [148.0, 167.0, 187.0], 1.0)
 }

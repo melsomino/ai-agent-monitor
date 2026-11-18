@@ -48,6 +48,24 @@ const MESSAGE_TOP_GAP: f64 = 4.0;
 const BUTTON_HOVER_PADDING: f64 = 0.0;
 const ICON_BUTTON_SIZE: f64 = 28.0;
 
+#[derive(Default, PartialEq, Eq)]
+struct RowStatus {
+    submissions: HashMap<String, crate::actors::monitor::Submission>,
+    messages: HashMap<String, crate::actors::monitor::MessageSend>,
+    finished: HashSet<String>,
+}
+
+#[derive(PartialEq)]
+struct FooterRenderKey {
+    windows: Vec<crate::domain::usage::Window>,
+    remaining: Vec<Option<u32>>,
+    resets: crate::domain::usage::Resets,
+    expanded: bool,
+    error: Option<String>,
+    query: String,
+    width: f64,
+}
+
 #[derive(Clone, Default)]
 struct MessageHistory {
     messages: Vec<crate::agents::history::Message>,
@@ -147,8 +165,23 @@ fn request_controls(session: &Session) -> Vec<RequestControl> {
 
 #[derive(Default)]
 pub struct State {
+    // The resident owns only the status item and services. Each menu opening
+    // gets a separate controller, retained while detached and disposed on close.
+    popup: RefCell<Option<Retained<MenuController>>>,
+    popup_owner: OnceCell<objc2::rc::Weak<MenuController>>,
+    detach_pending: Cell<bool>,
+    reattaching: Cell<bool>,
+    resume_editors_on_attach: Cell<bool>,
+    detached_window: RefCell<Option<Retained<NSWindow>>>,
+    detached_layout: Cell<bool>,
+    pinned_width: Cell<f64>,
+    detached_frame: Cell<Option<NSRect>>,
+    pin_button: OnceCell<Retained<NSButton>>,
+    pin_background: OnceCell<Retained<NSBox>>,
     monitor: OnceCell<crate::actors::monitor::Handle>,
     revision: Cell<u64>,
+    row_status: RefCell<Option<RowStatus>>,
+    footer_render_key: RefCell<Option<FooterRenderKey>>,
     popup_width: Cell<f64>,
     ui_sender: OnceCell<crate::macos::bridge::Sender>,
     ui_incoming: OnceCell<RefCell<tokio::sync::mpsc::Receiver<crate::macos::bridge::Event>>>,
@@ -156,7 +189,9 @@ pub struct State {
     platform: OnceCell<RefCell<crate::macos::bridge::Platform>>,
     snapshot_timer: OnceCell<Retained<NSTimer>>,
     status: OnceCell<Retained<NSStatusItem>>,
-    status_content: OnceCell<Retained<StatusContentView>>,
+    status_content: OnceCell<Retained<StatusSnapshotView>>,
+    status_artwork: OnceCell<Retained<NSView>>,
+    status_frames: RefCell<HashMap<[u8; 3], [Retained<NSImage>; 2]>>,
     status_badge: OnceCell<Retained<NSBox>>,
     status_count: OnceCell<Retained<NSTextField>>,
     status_working_count: OnceCell<Retained<NSTextField>>,
@@ -166,6 +201,8 @@ pub struct State {
     status_base_images: OnceCell<[Retained<NSImage>; 2]>,
     status_eyes: OnceCell<[Retained<NSImageView>; 2]>,
     status_eye_animation: RefCell<motion::WorkingEyes>,
+    status_painted_eyes: Cell<Option<(bool, [f64; 2])>>,
+    status_badge_snapshot: Cell<Option<(usize, usize, usize, bool)>>,
     status_timer: RefCell<Option<Retained<NSTimer>>>,
     settings_shell: OnceCell<super::inline_settings::Shell>,
     settings_tabs: OnceCell<Retained<NSTabViewController>>,
@@ -234,7 +271,6 @@ pub struct State {
     animation_epoch: Cell<u64>,
     working_epoch: OnceCell<Instant>,
     layout: RefCell<Vec<LayoutRow>>,
-    group_icons: RefCell<Vec<GroupIcon>>,
     caption: OnceCell<Retained<NSTextField>>,
     overview: OnceCell<Retained<NSTextField>>,
     all: RefCell<Vec<Session>>,
@@ -242,12 +278,20 @@ pub struct State {
     filter_query: RefCell<String>,
     filter_dirty: Cell<bool>,
     usage: RefCell<Option<usage::Usage>>,
+    usage_resets_expanded: Cell<bool>,
+    usage_resets_pending: Cell<Option<u64>>,
+    usage_resets_spinner: OnceCell<Retained<NSProgressIndicator>>,
+    usage_resets_spinning: Cell<bool>,
+    usage_resets_error: RefCell<Option<String>>,
+    usage_resets_scroll: RefCell<Option<Retained<NSScrollView>>>,
     lock: OnceCell<File>,
     routing_scroll: Cell<bool>,
     buttons: RefCell<Vec<ButtonHover>>,
     request_controls: RefCell<HashMap<String, RequestControl>>,
     question_panels: RefCell<HashMap<String, Retained<inline_questions::Panel>>>,
     composers: RefCell<HashMap<String, Retained<super::session_composer::Composer>>>,
+    composer_drafts: RefCell<HashMap<String, super::session_composer::Draft>>,
+    question_drafts: RefCell<HashMap<String, inline_questions::Draft>>,
     work_glows: RefCell<Vec<Retained<super::work_caption::WorkGlow>>>,
     expanded_contexts: RefCell<HashSet<String>>,
     responding: RefCell<HashSet<String>>,
@@ -260,6 +304,7 @@ pub struct State {
     keyboard_handler: RefCell<Option<hotkey::MenuKeyboard>>,
     pointer_timer: RefCell<Option<Retained<NSTimer>>>,
     resize_cursor_active: Cell<bool>,
+    hand_cursor_active: Cell<bool>,
     previous_menu_application: RefCell<Option<Retained<NSRunningApplication>>>,
     last_pointer: Cell<Option<NSPoint>>,
 }
@@ -362,6 +407,11 @@ impl State {
     }
 }
 
+#[derive(Default, Debug)]
+struct StatusContentState {
+    images: RefCell<Option<[Retained<NSImage>; 2]>>,
+}
+
 define_class!(
     // SAFETY: NSObject has no subclassing requirements. UI and all state are
     // confined to the main thread; retained controls outlive their weak targets.
@@ -375,6 +425,26 @@ define_class!(
     unsafe impl NSMenuDelegate for MenuController {
         #[unsafe(method(menuWillOpen:))]
         fn will_open(&self, _menu: &NSMenu) {
+            if self.ivars().root.get().is_none() {
+                let existing = self.ivars().popup.borrow().clone();
+                if let Some(popup) = existing {
+                    if popup.is_detached() {
+                        _menu.cancelTracking();
+                        // Leave native menu tracking before activating the window.
+                        unsafe { self.performSelector_withObject_afterDelay(sel!(showDetached:), None, 0.0); }
+                        return;
+                    }
+                    self.ivars().menu_open.set(true);
+                    popup.will_open(sel!(menuWillOpen:), _menu);
+                    return;
+                }
+                self.ivars().menu_open.set(true);
+                self.ivars().shortcut_registration.borrow_mut().take();
+                let popup = self.create_popup(_menu);
+                *self.ivars().popup.borrow_mut() = Some(popup.clone());
+                popup.will_open(sel!(menuWillOpen:), _menu);
+                return;
+            }
             self.acquire_menu_cursor_owner();
             if let Some(screen) = self.ivars().status.get().and_then(|s| s.button(self.mtm()))
                 .and_then(|b| b.window()).and_then(|w| w.screen()) {
@@ -382,7 +452,7 @@ define_class!(
                 if self.menu_width() > maximum { self.change_width(maximum); }
             }
             self.ivars().menu_open.set(true);
-            self.ivars().focus_answer_on_open.set(true);
+            self.ivars().focus_answer_on_open.set(!self.ivars().reattaching.replace(false));
             // NSMenu handles this shortcut as a native key equivalent while it
             // tracks. Keeping Carbon registered here can buffer the key until
             // tracking ends, reopening the menu instead of closing it.
@@ -395,21 +465,103 @@ define_class!(
         #[unsafe(method(menuDidClose:))]
         fn did_close(&self, _menu: &NSMenu) {
             self.ivars().menu_open.set(false);
+            if self.ivars().root.get().is_none() {
+                let popup = self.ivars().popup.borrow().clone();
+                if let Some(popup) = popup {
+                    if popup.ivars().detach_pending.replace(false) {
+                        popup.detach_window();
+                        self.install_shortcut();
+                        return;
+                    }
+                    if popup.is_detached() { return; }
+                    self.ivars().popup.borrow_mut().take();
+                    popup.did_close(sel!(menuDidClose:), _menu);
+                    self.save_popup_data(&popup);
+                    *self.ivars().telegram_auto_open.borrow_mut() =
+                        std::mem::take(&mut *popup.ivars().telegram_auto_open.borrow_mut());
+                    if let Some(item) = popup.ivars().menu_item.get() {
+                        item.setView(None);
+                    }
+                    if let Some(root) = popup.ivars().root.get() {
+                        root.removeFromSuperview();
+                    }
+                    popup.shutdown();
+                }
+                _menu.removeAllItems();
+                add_popup_placeholder(_menu, self.mtm());
+                self.install_shortcut();
+                return;
+            }
             self.close_panel();
             self.restore_menu_application();
             self.install_shortcut();
         }
     }
 
+    // SAFETY: The popup controller is retained by its resident while the window exists.
+    unsafe impl NSWindowDelegate for MenuController {
+        #[unsafe(method(windowWillClose:))]
+        fn detached_closed(&self, _notification: &NSNotification) {
+            // Removing the resident's last strong popup reference must not
+            // destroy the delegate while this AppKit callback is still running.
+            let retained: Retained<Self> = Retained::from(self);
+            retained.dispose_detached();
+        }
+        #[unsafe(method(windowDidResize:))]
+        fn detached_resized(&self, _notification: &NSNotification) {
+            self.layout_detached();
+            self.remember_detached_frame();
+        }
+        #[unsafe(method(windowDidMove:))]
+        fn detached_moved(&self, _notification: &NSNotification) {
+            self.remember_detached_frame();
+        }
+    }
+
     impl MenuController {
+        #[unsafe(method(togglePin:))]
+        fn toggle_pin(&self, _sender: Option<&AnyObject>) {
+            if self.is_detached() {
+                self.reattach_window();
+            } else {
+                self.ivars().detach_pending.set(true);
+                self.dismiss_menu();
+            }
+        }
+        #[unsafe(method(showDetached:))]
+        fn show_detached(&self, _sender: Option<&AnyObject>) {
+            let popup = self.ivars().popup.borrow().clone();
+            if let Some(popup) = popup {
+                popup.focus_detached();
+            }
+        }
+        #[unsafe(method(showPinned:))]
+        fn show_pinned(&self, _sender: Option<&AnyObject>) { self.show(); }
         #[unsafe(method(toggleMenuFromHotkey:))]
         fn toggle_menu_from_hotkey(&self, _timer: &NSTimer) {
             if self.ivars().menu_open.get() { self.dismiss_menu(); } else { self.show(); }
         }
 
+        #[unsafe(method(toggleUsageResets:))]
+        fn toggle_usage_resets(&self, _sender: Option<&AnyObject>) {
+            let open=!self.ivars().usage_resets_expanded.get();
+            self.ivars().usage_resets_expanded.set(open);
+            if open {
+                let current=&self.monitor().snapshot().usage_resets;
+                let generation=if current.phase==crate::domain::usage::ResetPhase::Loading{current.generation}else{current.generation.saturating_add(1)};
+                self.ivars().usage_resets_pending.set(Some(generation));
+                let error=if current.phase==crate::domain::usage::ResetPhase::Loading{None}else{self.monitor().send(crate::actors::monitor::Command::ReadUsageResets).err()};
+                if error.is_some(){self.ivars().usage_resets_pending.set(None);}
+                *self.ivars().usage_resets_error.borrow_mut()=error;
+            } else { self.ivars().usage_resets_pending.set(None); }
+            self.render_footer();
+            self.update_hover();
+        }
+
         #[unsafe(method(closeMenu:))]
         fn close_menu(&self, _sender: Option<&AnyObject>) {
-            self.dismiss_menu();
+            let window = self.ivars().detached_window.borrow().clone();
+            if let Some(window) = window { window.performClose(None); } else { self.dismiss_menu(); }
         }
         #[unsafe(method(animateStatus:))]
         fn animate_status(&self, _timer: &NSTimer) {
@@ -418,14 +570,43 @@ define_class!(
         }
 
         #[unsafe(method(pollState:))]
-        fn poll_state(&self,_timer:&NSTimer){self.drain_ui();self.receive_sessions();if let Some(web)=self.ivars().web_settings.get(){let height=web.frame().size.height;web.poll(self.ivars().menu_open.get()&&self.ivars().settings_active.get()&&self.ivars().settings_selected.get()==4);let changed=web.take_layout_changed();if height!=web.frame().size.height||changed{self.layout_settings();}}}
+        fn poll_state(&self, timer: &NSTimer) {
+            if self.ivars().popup_owner.get().is_some() && !self.ivars().menu_open.get() {
+                return;
+            }
+            if self.ivars().root.get().is_some() && self.mouse_tracking_active() {
+                // Do not replace native controls inside their mouse tracking loop.
+                // The resident still publishes status counters and notifications.
+                return;
+            }
+            self.drain_ui();
+            self.receive_sessions();
+            let popup = self.ivars().popup.borrow().clone();
+            if let Some(popup) = popup {
+                popup.poll_state(sel!(pollState:), timer);
+            }
+            if let Some(web) = self.ivars().web_settings.get() {
+                let height = web.frame().size.height;
+                web.poll(self.ivars().menu_open.get()
+                    && self.ivars().settings_active.get()
+                    && self.ivars().settings_selected.get() == 4);
+                let changed = web.take_layout_changed();
+                if height != web.frame().size.height || changed {
+                    self.layout_settings();
+                }
+            }
+        }
         #[unsafe(method(pollPointer:))]
         fn poll_pointer(&self, _timer: &NSTimer) {
             self.constrain_menu_to_work_area();
             self.sync_header_extension();
             self.sync_footer_extension();
-            self.start_keyboard_tracking();
             self.receive_sessions();
+            if self.mouse_tracking_active() {
+                self.sync_action_cursor();
+                return;
+            }
+            self.start_keyboard_tracking();
             self.advance_disclosure();
             self.advance_robot_eyes();
             self.sample_pointer();
@@ -624,14 +805,6 @@ define_class!(
                 workspace.openURL(&url);
             }
         }
-        #[unsafe(method(copyCommand:))]
-        fn copy_command(&self, sender: &NSButton) {
-            let Some(text)=sender.identifier() else { return; };
-            let pasteboard=NSPasteboard::generalPasteboard();
-            pasteboard.clearContents();
-            // SAFETY: Standard AppKit string type; the command is already visible.
-            pasteboard.setString_forType(&text,unsafe { NSPasteboardTypeString });
-        }
         #[unsafe(method(copyBotValue:))]
         fn copy_bot_value(&self, sender: &NSButton) {
             let text = if sender.tag() == 0 {
@@ -749,29 +922,24 @@ fn settings_note(
 }
 
 define_class!(
-    // SAFETY: Decoration-only NSView, drawn exclusively on the main thread.
-    #[unsafe(super(NSView))]
+    // SAFETY: Native button subclass; all cursor work stays on the AppKit thread.
+    #[unsafe(super(NSButton))]
     #[thread_kind = MainThreadOnly]
     #[derive(Debug)]
-    struct WorkingStatusView;
-    unsafe impl NSObjectProtocol for WorkingStatusView {}
-    impl WorkingStatusView {
-        #[unsafe(method_id(hitTest:))]
-        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> { None }
-
-        #[unsafe(method(drawRect:))]
-        fn draw_status(&self, _dirty: NSRect) {
-            let center = NSPoint::new(self.bounds().size.width / 2.0, self.bounds().size.height / 2.0);
-            working_status_color().setFill();
-            NSBezierPath::bezierPathWithOvalInRect(rect(center.x - 7.5, center.y - 7.5, 15.0, 15.0)).fill();
-            appearance_color([255.0; 3], [16.0, 53.0, 30.0], 1.0).setFill();
-            // Center the triangle's visual mass, without SF Symbol alignment insets.
-            let triangle = NSBezierPath::bezierPath();
-            triangle.moveToPoint(NSPoint::new(center.x - 2.24, center.y - 4.16));
-            triangle.lineToPoint(NSPoint::new(center.x + 4.48, center.y));
-            triangle.lineToPoint(NSPoint::new(center.x - 2.24, center.y + 4.16));
-            triangle.closePath();
-            triangle.fill();
+    struct ActionButton;
+    unsafe impl NSObjectProtocol for ActionButton {}
+    impl ActionButton {
+        #[unsafe(method(resetCursorRects))]
+        fn reset_action_cursor(&self) {
+            unsafe { let _: () = msg_send![super(self), resetCursorRects]; }
+            if self.isEnabled() {
+                self.addCursorRect_cursor(self.bounds(), &NSCursor::pointingHandCursor());
+            }
+        }
+        #[unsafe(method(setEnabled:))]
+        fn set_action_enabled(&self, enabled: bool) {
+            unsafe { let _: () = msg_send![super(self), setEnabled: enabled]; }
+            if let Some(window) = self.window() { window.invalidateCursorRectsForView(self); }
         }
     }
 );
@@ -790,8 +958,7 @@ define_class!(
 );
 
 define_class!(
-    // SAFETY: This NSView is main-thread-only. Its decoration never intercepts
-    // clicks; the owning NSStatusBarButton handles the complete hit area.
+    // SAFETY: This main-thread decoration never handles mouse input.
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
     #[derive(Debug)]
@@ -800,6 +967,29 @@ define_class!(
     impl StatusContentView {
         #[unsafe(method_id(hitTest:))]
         fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> { None }
+    }
+);
+
+define_class!(
+    // SAFETY: This NSView is main-thread-only. Its decoration never intercepts
+    // clicks; the owning NSStatusBarButton handles the complete hit area.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = StatusContentState]
+    #[derive(Debug)]
+    struct StatusSnapshotView;
+    unsafe impl NSObjectProtocol for StatusSnapshotView {}
+    impl StatusSnapshotView {
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> { None }
+        #[unsafe(method(drawRect:))]
+        fn draw(&self, _dirty: NSRect) {
+            if let Some(images) = self.ivars().images.borrow().as_ref() {
+                let image = &images[usize::from(visual::is_dark(self))];
+                image.drawInRect_fromRect_operation_fraction(self.bounds(), NSRect::ZERO, NSCompositingOperation::SourceOver, 1.0);
+            }
+        }
+
     }
 );
 
@@ -813,12 +1003,19 @@ fn owner(view: &NSView) -> Option<Retained<MenuController>> {
     }
     None
 }
-fn pointer_changed(view: &NSView) {
-    if let Some(controller) = owner(view) {
-        controller.update_group_headings();
-        controller.sync_backdrop();
-        controller.update_hover();
-    }
+
+fn add_popup_placeholder(menu: &NSMenu, mtm: MainThreadMarker) {
+    // A nonempty native menu can enter tracking; menuWillOpen: replaces this
+    // inert item before presentation. It owns no custom view or controller.
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!(""),
+            None,
+            ns_string!(""),
+        )
+    };
+    menu.addItem(&item);
 }
 pub(super) fn route_wheel(view: &NSView, event: &NSEvent) {
     if let Some(controller) = owner(view) {
@@ -962,10 +1159,15 @@ impl PanelView {
         }
     }
 }
+#[derive(Default, Debug)]
+struct ScrollOwner {
+    controller: RefCell<Option<objc2::rc::Weak<MenuController>>>,
+}
 define_class!(
     // SAFETY: Standard NSScrollView override, confined to the main thread.
     #[unsafe(super(NSScrollView))]
     #[thread_kind = MainThreadOnly]
+    #[ivars = ScrollOwner]
     #[derive(Debug)]
     struct SessionScrollView;
     unsafe impl NSObjectProtocol for SessionScrollView {}
@@ -974,7 +1176,13 @@ define_class!(
         fn reflected(&self, clip: &NSClipView) {
             // SAFETY: Forward AppKit's standard scroll notification.
             unsafe { let _: () = msg_send![super(self), reflectScrolledClipView: clip]; }
-            pointer_changed(self);
+            // AppKit also calls this while removing/deallocating a scroll
+            // view. Never retain self or walk its dying ancestor hierarchy.
+            let controller = self.ivars().controller.borrow().as_ref().and_then(|owner| owner.load());
+            if let Some(controller) = controller {
+                controller.sync_backdrop();
+                controller.update_hover();
+            }
         }
     }
 );
@@ -1002,6 +1210,7 @@ struct HoverState {
     thread: OnceCell<Retained<SessionThread>>,
     destination: OnceCell<Retained<StatusContentView>>,
     destination_arrow: OnceCell<Retained<NSImageView>>,
+    destination_icon: OnceCell<Retained<StatusContentView>>,
 }
 define_class!(
     // SAFETY: This NSView only stores its hover decoration on the main thread.
@@ -1059,10 +1268,14 @@ impl SessionRowView {
             background.setFillColor(&color);
             paint_hover(background, if active || focused { 1.0 } else { 0.0 });
         }
-        if let Some(destination) = self.ivars().destination.get() {
-            destination.setHidden(!active && !focused);
+        if let Some(icon) = self.ivars().destination_icon.get() {
+            icon.setFrameOrigin(NSPoint::new(
+                if active || focused { 18.0 } else { 0.0 },
+                0.0,
+            ));
         }
         if let Some(arrow) = self.ivars().destination_arrow.get() {
+            arrow.setHidden(!active && !focused);
             let color = if focused {
                 primary_text_color()
             } else {
@@ -1175,13 +1388,9 @@ struct LayoutRow {
     robot: Retained<SessionRobot>,
 }
 
-struct GroupIcon {
-    view: Retained<StatusContentView>,
-    first: usize,
-}
-
 /// Use one row only when the entire set fits; otherwise keep natural widths
 /// in a left-aligned column. The final gap separates controls from metadata.
+#[cfg(test)]
 fn answer_button_layout(sizes: &[NSSize], available: f64) -> (Vec<NSRect>, f64) {
     let halo = 2.0 * BUTTON_HOVER_PADDING;
     let gap = halo + 6.0;
@@ -1245,48 +1454,45 @@ fn earlier_messages<'a>(
     messages
 }
 
-/// Immediate decisions share the first row; scope-specific decisions keep
-/// a disclosure beside their button and optional details below it.
+/// Wrap natural-width decisions as whole blocks, including a scope disclosure.
+/// Expanded scopes follow all decision rows and never move their buttons.
 fn request_action_layout(
     sizes: &[NSSize],
     contexts: &[Option<f64>],
     width: f64,
 ) -> (Vec<NSRect>, f64) {
-    let immediate = contexts
-        .iter()
-        .take_while(|context| context.is_none())
-        .count();
-    let (mut frames, mut y) = if immediate == 2
-        && sizes[..2]
-            .iter()
-            .all(|size| size.width <= (width - 10.0) / 2.0)
-    {
-        let half = (width - 10.0) / 2.0;
-        let height = sizes[..2]
-            .iter()
-            .map(|size| size.height)
-            .fold(0.0, f64::max);
-        (
-            vec![
-                rect(0.0, 0.0, half, height),
-                rect(half + 10.0, 0.0, half, height),
-            ],
-            height,
-        )
-    } else {
-        answer_button_layout(&sizes[..immediate], width)
-    };
-    for (index, size) in sizes.iter().enumerate().skip(immediate) {
-        if y > 0.0 {
-            y += 12.0;
+    let mut frames = Vec::new();
+    let (mut x, mut y, mut row_height) = (0.0, 0.0, 0.0_f64);
+    for (size, context) in sizes.iter().zip(contexts) {
+        let block_width = size.width + if context.is_some() { 36.0 } else { 0.0 };
+        if x > 0.0 && x + block_width > width {
+            x = 0.0;
+            y += row_height + 10.0;
+            row_height = 0.0;
         }
-        frames.push(rect(0.0, y, size.width, size.height));
-        y += size.height;
-        if let Some(height) = contexts[index].filter(|height| *height > 0.0) {
-            y += height + 4.0;
-        }
+        frames.push(rect(x, y, size.width, size.height));
+        row_height = row_height.max(size.height);
+        x += block_width + 10.0;
     }
-    (frames, y)
+    let mut height = y + row_height;
+    for context in contexts.iter().flatten().filter(|height| **height > 0.0) {
+        height += 4.0 + context;
+    }
+    (frames, height)
+}
+
+fn request_scope_y(frames: &[NSRect], contexts: &[Option<f64>], index: usize) -> f64 {
+    frames
+        .iter()
+        .map(|frame| frame.origin.y + frame.size.height)
+        .fold(0.0, f64::max)
+        + 4.0
+        + contexts[..index]
+            .iter()
+            .flatten()
+            .filter(|height| **height > 0.0)
+            .map(|height| height + 4.0)
+            .sum::<f64>()
 }
 
 /// Left-to-right status-item order: pending requests, unseen completions, working.
@@ -1307,7 +1513,7 @@ fn status_counter_positions(widths: [Option<f64>; 3]) -> ([f64; 3], f64) {
 
 fn request_glyph(control: &RequestControl) -> Option<visual::DecisionGlyph> {
     match control.label.as_str() {
-        "Allow once" | "Allow" | "Allow similar commands" => Some(visual::DecisionGlyph::Check),
+        "Allow once" | "Allow" => Some(visual::DecisionGlyph::Check),
         "Deny" => Some(visual::DecisionGlyph::Cross),
         _ => None,
     }
@@ -1460,6 +1666,73 @@ fn center_label(label: &NSTextField, center_y: f64) {
 }
 
 impl MenuController {
+    fn create_popup(&self, menu: &NSMenu) -> Retained<Self> {
+        let allocated = Self::alloc(self.mtm()).set_ivars(State::default());
+        // SAFETY: Same initializer as the resident, with independent UI storage.
+        let popup: Retained<Self> = unsafe { msg_send![super(allocated), init] };
+        let state = popup.ivars();
+        state.popup_owner.set(objc2::rc::Weak::new(self)).ok();
+        state.detached_frame.set(self.ivars().detached_frame.get());
+        state.monitor.set(self.monitor().clone()).ok();
+        state.revision.set(u64::MAX);
+        state
+            .ui_sender
+            .set(self.ivars().ui_sender.get().unwrap().clone())
+            .ok();
+        state.menu.set(Retained::from(menu)).ok();
+        menu.removeAllItems();
+        if let Some(status) = self.ivars().status.get() {
+            state.status.set(status.clone()).ok();
+        }
+        *state.applications.borrow_mut() =
+            self.monitor().snapshot().preferences.applications.clone();
+        *state.telegram_auto_open.borrow_mut() =
+            std::mem::take(&mut *self.ivars().telegram_auto_open.borrow_mut());
+        *state.expanded.borrow_mut() = std::mem::take(&mut *self.ivars().expanded.borrow_mut());
+        *state.keyboard_focus.borrow_mut() = self.ivars().keyboard_focus.borrow_mut().take();
+        *state.previous_menu_application.borrow_mut() =
+            self.ivars().previous_menu_application.borrow_mut().take();
+        *state.composer_drafts.borrow_mut() =
+            std::mem::take(&mut *self.ivars().composer_drafts.borrow_mut());
+        *state.question_drafts.borrow_mut() =
+            std::mem::take(&mut *self.ivars().question_drafts.borrow_mut());
+        *state.message_history.borrow_mut() =
+            std::mem::take(&mut *self.ivars().message_history.borrow_mut());
+        state
+            .history_generation
+            .set(self.ivars().history_generation.get());
+        popup.build_menu();
+        popup
+    }
+
+    fn save_popup_data(&self, popup: &Self) {
+        let source = popup.ivars();
+        let target = self.ivars();
+        let mut composers = std::mem::take(&mut *source.composer_drafts.borrow_mut());
+        composers.extend(
+            source
+                .composers
+                .borrow()
+                .iter()
+                .map(|(key, composer)| (key.clone(), composer.draft())),
+        );
+        *target.composer_drafts.borrow_mut() = composers;
+        let mut questions = std::mem::take(&mut *source.question_drafts.borrow_mut());
+        questions.extend(
+            source
+                .question_panels
+                .borrow()
+                .iter()
+                .map(|(key, panel)| (key.clone(), panel.draft())),
+        );
+        *target.question_drafts.borrow_mut() = questions;
+        *target.message_history.borrow_mut() =
+            std::mem::take(&mut *source.message_history.borrow_mut());
+        target
+            .history_generation
+            .set(source.history_generation.get());
+    }
+
     fn menu_width(&self) -> f64 {
         let width = self.ivars().popup_width.get();
         if width >= MENU_WIDTH {
@@ -1491,6 +1764,9 @@ impl MenuController {
             return;
         }
         self.ivars().popup_width.set(width);
+        if !self.is_detached() {
+            self.ivars().pinned_width.set(width);
+        }
         if let Some(menu) = self.ivars().menu.get() {
             menu.setMinimumWidth(width);
         }
@@ -1500,7 +1776,7 @@ impl MenuController {
     }
 
     fn sync_window_width(&self) {
-        if !self.ivars().menu_open.get() {
+        if !self.ivars().menu_open.get() || self.is_detached() {
             return;
         }
         let Some(root) = self.ivars().root.get() else {
@@ -1525,6 +1801,16 @@ impl MenuController {
     }
 
     pub fn shutdown(&self) {
+        self.remember_detached_frame();
+        if let Some(window) = self.ivars().detached_window.borrow_mut().take() {
+            window.setDelegate(None);
+            window.close();
+            self.set_detached_application_policy(false);
+        }
+        if let Some(popup) = self.ivars().popup.borrow_mut().take() {
+            popup.close_panel();
+            popup.shutdown();
+        }
         if let Some(timer) = self.ivars().snapshot_timer.get() {
             timer.invalidate();
         }
@@ -1547,6 +1833,15 @@ impl MenuController {
         session: Session,
         draft: Option<std::collections::BTreeMap<String, Vec<String>>>,
     ) {
+        if let Some(owner) = self
+            .ivars()
+            .popup_owner
+            .get()
+            .and_then(|owner| owner.load())
+        {
+            owner.show_form(session, draft);
+            return;
+        }
         open_owned_form(
             &self.ivars().forms,
             |forms| {
@@ -1601,14 +1896,17 @@ impl MenuController {
                         self.dismiss_menu();
                         self.show_form(*session, draft);
                     } else {
+                        let popup = self.ivars().popup.borrow().clone();
+                        let controller = popup.as_deref().unwrap_or(self);
                         let key = session.key();
-                        self.ivars().expanded.borrow_mut().insert(key.clone());
-                        *self.ivars().keyboard_focus.borrow_mut() = Some(key);
-                        self.ivars().filter_dirty.set(true);
-                        self.filter();
-                        if self.ivars().menu_open.get() {
-                            self.hide_settings();
-                            self.focus_answer();
+                        controller.ivars().expanded.borrow_mut().insert(key.clone());
+                        *controller.ivars().keyboard_focus.borrow_mut() = Some(key);
+                        controller.ivars().filter_dirty.set(true);
+                        if controller.ivars().menu_open.get() {
+                            controller.hide_settings();
+                            controller.filter();
+                            controller.focus_answer();
+                            controller.focus_detached();
                         } else {
                             self.show();
                         }
@@ -1631,6 +1929,10 @@ impl MenuController {
     }
 
     fn install_shortcut(&self) {
+        if self.ivars().popup_owner.get().is_some() {
+            self.configure_menu_shortcut();
+            return;
+        }
         let old = self.ivars().shortcut_registration.borrow_mut().take();
         drop(old);
         self.ivars().shortcut_error.borrow_mut().take();
@@ -1804,6 +2106,11 @@ impl MenuController {
     }
 
     fn dismiss_menu(&self) {
+        // Navigation and answers dismiss transient menus, but must leave the
+        // deliberately detached window available beside the agent application.
+        if self.is_detached() {
+            return;
+        }
         if self.ivars().menu_open.get()
             && let Some(menu) = self.ivars().menu.get()
         {
@@ -1813,12 +2120,16 @@ impl MenuController {
 
     fn show(&self) {
         let state = self.ivars();
+        let popup = state.popup.borrow().clone();
+        if let Some(popup) = popup
+            && popup.focus_detached()
+        {
+            return;
+        }
         if state.menu_open.get() {
             return;
         }
         self.receive_sessions();
-        self.filter();
-        self.resize_content(state.content_height.get());
         self.refresh();
         if let Some(button) = state.status.get().and_then(|item| item.button(self.mtm()))
             && button.window().is_some()
@@ -1828,6 +2139,272 @@ impl MenuController {
             unsafe {
                 button.performClick(None);
             }
+        }
+    }
+
+    fn is_detached(&self) -> bool {
+        self.ivars().detached_window.borrow().is_some()
+    }
+
+    #[allow(deprecated)]
+    fn focus_detached(&self) -> bool {
+        let window = self.ivars().detached_window.borrow().clone();
+        let Some(window) = window else {
+            return false;
+        };
+        if NSApplication::sharedApplication(self.mtm()).activationPolicy()
+            == NSApplicationActivationPolicy::Prohibited
+        {
+            return true;
+        }
+        if window.isMiniaturized() {
+            window.deminiaturize(None);
+        }
+        NSApplication::sharedApplication(self.mtm()).activateIgnoringOtherApps(true);
+        window.makeKeyAndOrderFront(None);
+        true
+    }
+
+    /// Reparent only after NSMenu has ended tracking. The same views retain
+    /// their drafts, expanded rows and scroll position across both hosts.
+    fn detach_window(&self) {
+        let state = self.ivars();
+        let Some(root) = state.root.get() else {
+            return;
+        };
+        let origin = root.window().map(|w| w.frame().origin);
+        state.pinned_width.set(self.menu_width());
+        self.suspend_host_editors();
+        for extension in [state.header_extension.get(), state.footer_extension.get()]
+            .into_iter()
+            .flatten()
+        {
+            extension.removeFromSuperview();
+        }
+        if let Some(item) = state.menu_item.get() {
+            item.setView(None);
+        }
+        root.removeFromSuperview();
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(self.mtm()),
+                root.bounds(),
+                NSWindowStyleMask::Titled
+                    | NSWindowStyleMask::Closable
+                    | NSWindowStyleMask::Miniaturizable
+                    | NSWindowStyleMask::Resizable,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        // The resident retains the popup, which retains this native window.
+        unsafe {
+            window.setReleasedWhenClosed(false);
+        }
+        window.setTitle(ns_string!("AI Agent Monitor"));
+        window.setContentMinSize(NSSize::new(MENU_WIDTH, 200.0));
+        *state.detached_window.borrow_mut() = Some(window.clone());
+        window.setContentView(Some(root));
+        if let Some(origin) = origin {
+            window.setFrameOrigin(origin);
+        } else {
+            window.center();
+        }
+        if let Some(frame) = state.detached_frame.get() {
+            window.setFrame_display(window.constrainFrameRect_toScreen(frame, None), false);
+        } else if self.persists_window_geometry() {
+            window.setFrameUsingName(ns_string!("MonitorDetachedWindow"));
+        }
+        root.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        if let Some(button) = state.pin_button.get() {
+            button.setHidden(true);
+        }
+        if let Some(background) = state.pin_background.get() {
+            background.setHidden(true);
+        }
+        let accessory = NSTitlebarAccessoryViewController::new(self.mtm());
+        accessory.setLayoutAttribute(NSLayoutAttribute::Left);
+        let pin = NSButton::initWithFrame(NSButton::alloc(self.mtm()), rect(0.0, 0.0, 28.0, 24.0));
+        pin.setBordered(false);
+        pin.setToolTip(Some(ns_string!("Pin to menu bar")));
+        pin.setImage(
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                ns_string!("pin.fill"),
+                Some(ns_string!("Pin to menu bar")),
+            )
+            .as_deref(),
+        );
+        unsafe {
+            pin.setTarget(Some(self));
+            pin.setAction(Some(sel!(togglePin:)));
+        }
+        accessory.setView(&pin);
+        window.addTitlebarAccessoryViewController(&accessory);
+        window.setDelegate(Some(ProtocolObject::from_ref(self)));
+        state.menu_open.set(true);
+        if let Some(menu) = state.menu.get() {
+            menu.removeAllItems();
+            add_popup_placeholder(menu, self.mtm());
+        }
+        self.layout_detached();
+        self.remember_detached_frame();
+        self.resume_host_editors();
+        self.set_detached_application_policy(true);
+        // Activation happens after menuDidClose returns, so the old tracking
+        // window cannot steal focus back while it completes dismissal.
+        if let Some(owner) = state.popup_owner.get().and_then(|o| o.load()) {
+            unsafe {
+                owner.performSelector_withObject_afterDelay(sel!(showDetached:), None, 0.0);
+            }
+        } else {
+            self.focus_detached();
+        }
+        self.start_pointer_tracking();
+    }
+
+    fn layout_detached(&self) {
+        let state = self.ivars();
+        if state.detached_layout.replace(true) {
+            return;
+        }
+        if let Some(window) = state.detached_window.borrow().clone()
+            && let Some(root) = state.root.get()
+        {
+            let size = window.contentRectForFrameRect(window.frame()).size;
+            root.setFrameSize(size);
+            if (state.popup_width.replace(size.width) - size.width).abs() > 0.5 {
+                self.render_rows(&state.filtered_sessions());
+            }
+            self.render_footer();
+            self.resize_content(state.content_height.get());
+        }
+        state.detached_layout.set(false);
+    }
+
+    fn reattach_window(&self) {
+        let state = self.ivars();
+        self.remember_detached_frame();
+        let Some(window) = state.detached_window.borrow_mut().take() else {
+            return;
+        };
+        self.suspend_host_editors();
+        window.setDelegate(None);
+        if let Some(root) = state.root.get() {
+            root.removeFromSuperview();
+            root.setAutoresizingMask(NSAutoresizingMaskOptions::ViewNotSizable);
+            state.menu_item.get().unwrap().setView(Some(root));
+        }
+        window.setContentView(None);
+        window.close();
+        self.set_detached_application_policy(false);
+        if let Some(button) = state.pin_button.get() {
+            button.setHidden(false);
+        }
+        if let Some(background) = state.pin_background.get() {
+            background.setHidden(false);
+        }
+        if let Some(menu) = state.menu.get() {
+            menu.removeAllItems();
+            menu.addItem(state.menu_item.get().unwrap());
+            menu.addItem(state.menu_close_shortcut.get().unwrap());
+        }
+        state.menu_open.set(false);
+        state.reattaching.set(true);
+        state.resume_editors_on_attach.set(true);
+        self.stop_pointer_tracking();
+        self.stop_keyboard_tracking();
+        self.change_width(state.pinned_width.get().max(MENU_WIDTH));
+        self.resize_content(state.content_height.get());
+        if NSApplication::sharedApplication(self.mtm()).activationPolicy()
+            != NSApplicationActivationPolicy::Prohibited
+            && let Some(owner) = state.popup_owner.get().and_then(|o| o.load())
+        {
+            unsafe {
+                owner.performSelector_withObject_afterDelay(sel!(showPinned:), None, 0.0);
+            }
+        }
+    }
+
+    fn suspend_host_editors(&self) {
+        for composer in self.ivars().composers.borrow().values() {
+            composer.suspend();
+        }
+        for panel in self.ivars().question_panels.borrow().values() {
+            panel.suspend_editing();
+        }
+        if let Some(window) = self.ivars().root.get().and_then(|root| root.window()) {
+            unsafe {
+                window.endEditingFor(None);
+            }
+        }
+    }
+
+    fn resume_host_editors(&self) {
+        for composer in self.ivars().composers.borrow().values() {
+            composer.resume();
+        }
+        for panel in self.ivars().question_panels.borrow().values() {
+            panel.resume_editing();
+        }
+    }
+
+    fn dispose_detached(&self) {
+        let state = self.ivars();
+        self.remember_detached_frame();
+        let window = state.detached_window.borrow_mut().take();
+        if let Some(window) = window {
+            window.setDelegate(None);
+        }
+        self.set_detached_application_policy(false);
+        state.menu_open.set(false);
+        self.close_panel();
+        if let Some(owner) = state.popup_owner.get().and_then(|o| o.load()) {
+            owner.save_popup_data(self);
+            *owner.ivars().telegram_auto_open.borrow_mut() =
+                std::mem::take(&mut *state.telegram_auto_open.borrow_mut());
+            owner.ivars().popup.borrow_mut().take();
+            owner.install_shortcut();
+        }
+        self.shutdown();
+    }
+
+    fn persists_window_geometry(&self) -> bool {
+        // Hidden AppKit verification must never change the user's preferences.
+        NSApplication::sharedApplication(self.mtm()).activationPolicy()
+            != NSApplicationActivationPolicy::Prohibited
+    }
+
+    fn set_detached_application_policy(&self, detached: bool) {
+        let app = NSApplication::sharedApplication(self.mtm());
+        // Keep hidden verification processes out of Dock and the app switcher.
+        if app.activationPolicy() == NSApplicationActivationPolicy::Prohibited {
+            return;
+        }
+        let policy = if detached {
+            NSApplicationActivationPolicy::Regular
+        } else {
+            NSApplicationActivationPolicy::Accessory
+        };
+        if app.activationPolicy() != policy && !app.setActivationPolicy(policy) {
+            eprintln!("ai-agent-monitor: could not update detached-window application policy");
+        }
+    }
+
+    fn remember_detached_frame(&self) {
+        let window = self.ivars().detached_window.borrow().clone();
+        let Some(window) = window else {
+            return;
+        };
+        let frame = window.frame();
+        self.ivars().detached_frame.set(Some(frame));
+        if let Some(owner) = self.ivars().popup_owner.get().and_then(|o| o.load()) {
+            owner.ivars().detached_frame.set(Some(frame));
+        }
+        if self.persists_window_geometry() {
+            window.saveFrameUsingName(ns_string!("MonitorDetachedWindow"));
         }
     }
 
@@ -1867,7 +2444,14 @@ impl MenuController {
         this.ivars().snapshot_timer.set(timer).ok();
         *this.ivars().applications.borrow_mut() =
             this.monitor().snapshot().preferences.applications.clone();
-        this.build_menu();
+        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("AI Agent Monitor"));
+        menu.setAutoenablesItems(false);
+        menu.setDelegate(Some(ProtocolObject::from_ref(&*this)));
+        add_popup_placeholder(&menu, mtm);
+        this.ivars()
+            .menu
+            .set(menu)
+            .expect("resident menu initialized once");
         this.build_status_item();
         this.install_shortcut();
         this.refresh();
@@ -2673,149 +3257,7 @@ impl MenuController {
     fn build_status_item(&self) {
         let item = NSStatusBar::systemStatusBar().statusItemWithLength(20.0);
         if let Some(button) = item.button(self.mtm()) {
-            let height = button.bounds().size.height;
-            // SAFETY: NSView's designated initializer is valid for this subclass.
-            let content: Retained<StatusContentView> = unsafe {
-                msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(-3.0, 0.0, 26.0, height)]
-            };
-            let data =
-                NSData::with_bytes(include_bytes!("../../assets/menubar/robots-template.pdf"));
-            let image = NSImage::initWithData(NSImage::alloc(), &data).or_else(|| {
-                NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                    ns_string!("rectangle.stack"),
-                    Some(ns_string!("Agent Sessions")),
-                )
-            });
-            if let Some(image) = image {
-                image.setAccessibilityDescription(Some(ns_string!("Agent Sessions")));
-                image.setTemplate(true);
-                let icon = NSImageView::imageViewWithImage(&image, self.mtm());
-                image.setSize(NSSize::new(24.0, 17.6));
-                icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-                icon.setFrame(rect(1.0, height / 2.0 - 8.8, 24.0, 17.6));
-                icon.setAutoresizingMask(
-                    NSAutoresizingMaskOptions::ViewMinYMargin
-                        | NSAutoresizingMaskOptions::ViewMaxYMargin,
-                );
-                icon.setContentTintColor(Some(&NSColor::labelColor()));
-                content.addSubview(&icon);
-                let active_data =
-                    NSData::with_bytes(include_bytes!("../../assets/menubar/robots-working.pdf"));
-                let active_image = NSImage::initWithData(NSImage::alloc(), &active_data)
-                    .expect("embedded working icon is a valid PDF");
-                active_image.setTemplate(true);
-                active_image.setSize(NSSize::new(24.0, 17.6));
-                self.ivars()
-                    .status_base_images
-                    .set([image, active_image])
-                    .expect("base icons initialized once");
-                self.ivars()
-                    .status_icon
-                    .set(icon)
-                    .expect("status icon initialized once");
-            }
-            let masks = [
-                include_bytes!("../../assets/menubar/eyes-left.pdf").as_slice(),
-                include_bytes!("../../assets/menubar/eyes-right.pdf").as_slice(),
-            ]
-            .map(|bytes| {
-                let data = NSData::with_bytes(bytes);
-                let image = NSImage::initWithData(NSImage::alloc(), &data)
-                    .expect("embedded eye mask is a valid PDF");
-                image.setTemplate(true);
-                image.setSize(NSSize::new(24.0, 17.6));
-                image
-            });
-            let eyes = masks.map(|image| {
-                let eyes = NSImageView::imageViewWithImage(&image, self.mtm());
-                eyes.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
-                eyes.setFrame(rect(1.0, height / 2.0 - 8.8, 24.0, 17.6));
-                eyes.setAutoresizingMask(
-                    NSAutoresizingMaskOptions::ViewMinYMargin
-                        | NSAutoresizingMaskOptions::ViewMaxYMargin,
-                );
-                eyes.setContentTintColor(Some(&NSColor::systemGreenColor()));
-                eyes.setHidden(true);
-                content.addSubview(&eyes);
-                eyes
-            });
-            self.ivars()
-                .status_eyes
-                .set(eyes)
-                .expect("eye overlays initialized once");
-            let badge = NSBox::initWithFrame(
-                NSBox::alloc(self.mtm()),
-                rect(14.0, (height / 2.0 - 10.0).max(1.0), 12.0, 12.0),
-            );
-            badge.setBoxType(NSBoxType::Custom);
-            badge.setTitlePosition(NSTitlePosition::NoTitle);
-            badge.setBorderWidth(0.0);
-            badge.setCornerRadius(7.0);
-            badge.setFillColor(&appearance_color(
-                [203.0, 119.0, 12.0],
-                [255.0, 159.0, 10.0],
-                1.0,
-            ));
-            content.addSubview(&badge);
-            let count = self.label(&content, "", rect(28.0, 0.0, 14.0, 14.0), 10.0, 0.3, false);
-            count.setFont(Some(&NSFont::systemFontOfSize(10.0)));
-            count.setAlignment(NSTextAlignment::Center);
-            count.setTextColor(Some(&appearance_color([255.0; 3], [0.0; 3], 1.0)));
-            center_label(&count, height / 2.0);
-            let working_count =
-                self.label(&content, "", rect(28.0, 0.0, 14.0, 18.0), 12.0, 0.23, false);
-            working_count.setTextColor(Some(&NSColor::systemGreenColor()));
-            working_count.setFont(Some(&NSFont::systemFontOfSize(12.0)));
-            working_count.setHidden(true);
-            center_label(&working_count, height / 2.0);
-            self.ivars()
-                .status_working_count
-                .set(working_count)
-                .expect("working count initialized once");
-            let finished_badge =
-                NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(28.0, 0.0, 14.0, 14.0));
-            finished_badge.setBoxType(NSBoxType::Custom);
-            finished_badge.setTitlePosition(NSTitlePosition::NoTitle);
-            finished_badge.setBorderWidth(0.0);
-            finished_badge.setCornerRadius(7.0);
-            finished_badge.setFillColor(&appearance_color(
-                [62.0, 109.0, 185.0],
-                [114.75, 198.9, 255.0],
-                1.0,
-            ));
-            finished_badge.setHidden(true);
-            content.addSubview(&finished_badge);
-            self.ivars()
-                .status_finished_badge
-                .set(finished_badge)
-                .expect("finished badge initialized once");
-            let finished_count =
-                self.label(&content, "", rect(28.0, 0.0, 14.0, 14.0), 10.0, 0.4, false);
-            finished_count.setTextColor(Some(&appearance_color(
-                [255.0; 3],
-                [17.85, 38.25, 53.55],
-                1.0,
-            )));
-            finished_count.setFont(Some(&NSFont::systemFontOfSize(10.0)));
-            finished_count.setAlignment(NSTextAlignment::Center);
-            finished_count.setHidden(true);
-            self.ivars()
-                .status_finished_count
-                .set(finished_count)
-                .expect("finished count initialized once");
-            button.addSubview(&content);
-            self.ivars()
-                .status_content
-                .set(content)
-                .expect("status content initialized once");
-            self.ivars()
-                .status_badge
-                .set(badge)
-                .expect("badge initialized once");
-            self.ivars()
-                .status_count
-                .set(count)
-                .expect("count initialized once");
+            self.build_status_artwork(&button);
         }
         // Let AppKit own status-item selection and switching between menu-bar
         // items. The custom view confines the menu to the work area before draw.
@@ -2827,31 +3269,265 @@ impl MenuController {
         self.update_badge(self.monitor().snapshot().pending_count());
     }
 
+    fn build_status_artwork(&self, button: &NSView) {
+        let height = button.bounds().size.height;
+        // SAFETY: NSView's designated initializer is valid for this subclass.
+        let content =
+            NSView::initWithFrame(NSView::alloc(self.mtm()), rect(0.0, 0.0, 26.0, height));
+        let data = NSData::with_bytes(include_bytes!("../../assets/menubar/robots-template.pdf"));
+        let image = NSImage::initWithData(NSImage::alloc(), &data).or_else(|| {
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                ns_string!("rectangle.stack"),
+                Some(ns_string!("Agent Sessions")),
+            )
+        });
+        if let Some(image) = image {
+            image.setAccessibilityDescription(Some(ns_string!("Agent Sessions")));
+            image.setTemplate(true);
+            let icon = NSImageView::imageViewWithImage(&image, self.mtm());
+            image.setSize(NSSize::new(24.0, 17.6));
+            icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+            icon.setFrame(rect(1.0, height / 2.0 - 8.8, 24.0, 17.6));
+            icon.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewMinYMargin
+                    | NSAutoresizingMaskOptions::ViewMaxYMargin,
+            );
+            icon.setContentTintColor(Some(&NSColor::labelColor()));
+            content.addSubview(&icon);
+            let active_data =
+                NSData::with_bytes(include_bytes!("../../assets/menubar/robots-working.pdf"));
+            let active_image = NSImage::initWithData(NSImage::alloc(), &active_data)
+                .expect("embedded working icon is a valid PDF");
+            active_image.setTemplate(true);
+            active_image.setSize(NSSize::new(24.0, 17.6));
+            self.ivars()
+                .status_base_images
+                .set([image, active_image])
+                .expect("base icons initialized once");
+            self.ivars()
+                .status_icon
+                .set(icon)
+                .expect("status icon initialized once");
+        }
+        let masks = [
+            include_bytes!("../../assets/menubar/eyes-left.pdf").as_slice(),
+            include_bytes!("../../assets/menubar/eyes-right.pdf").as_slice(),
+        ]
+        .map(|bytes| {
+            let data = NSData::with_bytes(bytes);
+            let image = NSImage::initWithData(NSImage::alloc(), &data)
+                .expect("embedded eye mask is a valid PDF");
+            image.setTemplate(true);
+            image.setSize(NSSize::new(24.0, 17.6));
+            image
+        });
+        let eyes = masks.map(|image| {
+            let eyes = NSImageView::imageViewWithImage(&image, self.mtm());
+            eyes.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+            eyes.setFrame(rect(1.0, height / 2.0 - 8.8, 24.0, 17.6));
+            eyes.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewMinYMargin
+                    | NSAutoresizingMaskOptions::ViewMaxYMargin,
+            );
+            eyes.setContentTintColor(Some(&NSColor::systemGreenColor()));
+            eyes.setHidden(true);
+            content.addSubview(&eyes);
+            eyes
+        });
+        self.ivars()
+            .status_eyes
+            .set(eyes)
+            .expect("eye overlays initialized once");
+        let badge = NSBox::initWithFrame(
+            NSBox::alloc(self.mtm()),
+            rect(14.0, (height / 2.0 - 10.0).max(1.0), 12.0, 12.0),
+        );
+        badge.setBoxType(NSBoxType::Custom);
+        badge.setTitlePosition(NSTitlePosition::NoTitle);
+        badge.setBorderWidth(0.0);
+        badge.setCornerRadius(7.0);
+        badge.setFillColor(&appearance_color(
+            [203.0, 119.0, 12.0],
+            [255.0, 159.0, 10.0],
+            1.0,
+        ));
+        content.addSubview(&badge);
+        let count = self.label(&content, "", rect(28.0, 0.0, 14.0, 14.0), 10.0, 0.3, false);
+        count.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+        count.setAlignment(NSTextAlignment::Center);
+        count.setTextColor(Some(&appearance_color([255.0; 3], [0.0; 3], 1.0)));
+        center_label(&count, height / 2.0);
+        let working_count =
+            self.label(&content, "", rect(28.0, 0.0, 14.0, 18.0), 12.0, 0.23, false);
+        working_count.setTextColor(Some(&NSColor::systemGreenColor()));
+        working_count.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        working_count.setHidden(true);
+        center_label(&working_count, height / 2.0);
+        self.ivars()
+            .status_working_count
+            .set(working_count)
+            .expect("working count initialized once");
+        let finished_badge =
+            NSBox::initWithFrame(NSBox::alloc(self.mtm()), rect(28.0, 0.0, 14.0, 14.0));
+        finished_badge.setBoxType(NSBoxType::Custom);
+        finished_badge.setTitlePosition(NSTitlePosition::NoTitle);
+        finished_badge.setBorderWidth(0.0);
+        finished_badge.setCornerRadius(7.0);
+        finished_badge.setFillColor(&appearance_color(
+            [62.0, 109.0, 185.0],
+            [114.75, 198.9, 255.0],
+            1.0,
+        ));
+        finished_badge.setHidden(true);
+        content.addSubview(&finished_badge);
+        self.ivars()
+            .status_finished_badge
+            .set(finished_badge)
+            .expect("finished badge initialized once");
+        let finished_count =
+            self.label(&content, "", rect(28.0, 0.0, 14.0, 14.0), 10.0, 0.4, false);
+        finished_count.setTextColor(Some(&appearance_color(
+            [255.0; 3],
+            [17.85, 38.25, 53.55],
+            1.0,
+        )));
+        finished_count.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+        finished_count.setAlignment(NSTextAlignment::Center);
+        finished_count.setHidden(true);
+        self.ivars()
+            .status_finished_count
+            .set(finished_count)
+            .expect("finished count initialized once");
+        let presentation: Retained<StatusSnapshotView> = unsafe {
+            msg_send![super(StatusSnapshotView::alloc(self.mtm()).set_ivars(StatusContentState::default())), initWithFrame: rect(-3.0, 0.0, 26.0, height)]
+        };
+        self.ivars()
+            .status_artwork
+            .set(content)
+            .expect("status artwork initialized once");
+        button.addSubview(&presentation);
+        self.ivars()
+            .status_content
+            .set(presentation)
+            .expect("status content initialized once");
+        self.ivars()
+            .status_badge
+            .set(badge)
+            .expect("badge initialized once");
+        self.ivars()
+            .status_count
+            .set(count)
+            .expect("count initialized once");
+    }
+
     fn paint_status_eyes(&self) {
         let state = self.ivars();
         let (levels, active) = {
             let animation = state.status_eye_animation.borrow();
             (animation.levels(), animation.active())
         };
+        let previous = state.status_painted_eyes.replace(Some((active, levels)));
+        if previous == Some((active, levels)) {
+            return;
+        }
+        let key = [
+            u8::from(active),
+            (levels[0] * 2.0) as u8,
+            (levels[1] * 2.0) as u8,
+        ];
+        if let Some(image) = state.status_frames.borrow().get(&key).cloned() {
+            self.present_status_frame(image);
+            return;
+        }
         if let Some(icon) = state.status_icon.get()
             && let Some(images) = state.status_base_images.get()
         {
             icon.setImage(Some(&images[usize::from(active)]));
-            NSView::setNeedsDisplay(icon, true);
         }
         if let Some(eyes) = state.status_eyes.get() {
             for (eye, level) in eyes.iter().zip(levels) {
                 eye.setAlphaValue(level);
                 eye.setHidden(level == 0.0);
-                NSView::setNeedsDisplay(eye, true);
             }
+        }
+        let (Some(artwork), Some(presentation)) =
+            (state.status_artwork.get(), state.status_content.get())
+        else {
+            return;
+        };
+        let size = artwork.bounds().size;
+        let scale = presentation
+            .window()
+            .map_or(2.0, |window| window.backingScaleFactor());
+        // AppKit temporarily switches the source view's appearance while taking
+        // light/dark status-item snapshots. Those callbacks must never invalidate
+        // the cache or schedule another redraw. Prepare both variants here, away
+        // from the snapshot/drawing path; drawRect: only selects an existing one.
+        let mut variants = Vec::with_capacity(2);
+        for name in unsafe { [NSAppearanceNameAqua, NSAppearanceNameDarkAqua] } {
+            artwork.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
+            // SAFETY: A null planes pointer asks AppKit to allocate owned RGBA
+            // storage. Dimensions and logical size preserve Retina resolution.
+            let Some(bitmap) = (unsafe {
+                NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                    NSBitmapImageRep::alloc(), std::ptr::null_mut(), (size.width * scale).ceil() as isize,
+                    (size.height * scale).ceil() as isize, 8, 4, true, false, NSDeviceRGBColorSpace, 0, 0,
+                )
+            }) else {
+                return;
+            };
+            bitmap.setSize(size);
+            artwork.cacheDisplayInRect_toBitmapImageRep(artwork.bounds(), &bitmap);
+            let image = NSImage::initWithSize(NSImage::alloc(), size);
+            image.addRepresentation(&bitmap);
+            variants.push(image);
+        }
+        let images: [Retained<NSImage>; 2] = variants
+            .try_into()
+            .expect("both status appearances prepared");
+        state.status_frames.borrow_mut().insert(key, images.clone());
+        self.present_status_frame(images);
+    }
+
+    fn present_status_frame(&self, images: [Retained<NSImage>; 2]) {
+        if let Some(content) = self.ivars().status_content.get() {
+            *content.ivars().images.borrow_mut() = Some(images);
+            content.setNeedsDisplay(true);
+        }
+        if let Some(button) = self
+            .ivars()
+            .status
+            .get()
+            .and_then(|item| item.button(self.mtm()))
+        {
+            NSView::setNeedsDisplay(&button, true);
         }
     }
 
     fn update_badge(&self, count: usize) {
         let state = self.ivars();
+        if state.popup_owner.get().is_some() {
+            // Popup tracking can receive a revision before the resident's
+            // snapshot timer. The resident alone owns status-item artwork, but
+            // it must observe the same revision while the popup stays open.
+            if let Some(owner) = state.popup_owner.get().and_then(|owner| owner.load()) {
+                owner.receive_sessions();
+            }
+            return;
+        }
         let working_count = state.working_count();
         let working = count == 0 && working_count > 0;
+        let finished_count = state.finished_count();
+        let animate = working
+            && self.monitor().snapshot().preferences.animation
+            && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        // Agent progress can change many times per second. It must not relayout
+        // the status item or invalidate AppKit's replicant snapshot unless its
+        // visible counters or animation mode actually change.
+        let badge_snapshot = (count, working_count, finished_count, animate);
+        if state.status_badge_snapshot.get() == Some(badge_snapshot) {
+            return;
+        }
         let number_width = if let Some(label) = state.status_working_count.get() {
             label.setHidden(working_count == 0);
             label.setStringValue(&NSString::from_str(&working_count.to_string()));
@@ -2871,7 +3547,6 @@ impl MenuController {
         } else {
             0.0
         };
-        let finished_count = state.finished_count();
         let finished_number_width = if finished_count > 99 {
             26.0
         } else if finished_count > 9 {
@@ -2900,15 +3575,15 @@ impl MenuController {
             (working_count > 0).then_some(number_width),
         ]);
         let canvas_width = 26.0 + extra_width;
-        let animate = working
-            && self.monitor().snapshot().preferences.animation
-            && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
         let Some(item) = state.status.get() else {
             return;
         };
         let Some(button) = item.button(self.mtm()) else {
             return;
         };
+        state.status_badge_snapshot.set(Some(badge_snapshot));
+        state.status_frames.borrow_mut().clear();
+        state.status_painted_eyes.set(None);
         // macOS adds margins outside the public button's content rectangle.
         // Target the real capsule width, rather than treating length as that width.
         let margins = button
@@ -2931,6 +3606,9 @@ impl MenuController {
                 height,
             ));
             allow_status_overflow(content);
+        }
+        if let Some(artwork) = state.status_artwork.get() {
+            artwork.setFrameSize(NSSize::new(canvas_width, height));
         }
         if let Some(label) = state.status_working_count.get() {
             label.setFrame(rect(counter_x[2], 0.0, number_width, 18.0));
@@ -2960,7 +3638,6 @@ impl MenuController {
             .status_eye_animation
             .borrow_mut()
             .update(working, animate);
-        self.paint_status_eyes();
         if animate && state.status_timer.borrow().is_none() {
             // SAFETY: The resident controller implements animateStatus: and
             // outlives the timer; common modes include native menu tracking.
@@ -3004,6 +3681,7 @@ impl MenuController {
             tooltip.push_str(&format!(" · Working: {working_count}"));
         }
         button.setToolTip(Some(&NSString::from_str(&tooltip)));
+        self.paint_status_eyes();
     }
 
     fn label(
@@ -3244,16 +3922,15 @@ impl MenuController {
                     msg_send![&*button, setAccessibilityLabel: &*NSString::from_str(tooltip)];
             }
         }
-        *self.ivars().toolbar_buttons.borrow_mut() =
-            std::mem::take(&mut *self.ivars().buttons.borrow_mut());
         // SAFETY: NSView's designated initializer is valid for this subclass.
         let list: Retained<SessionListView> = unsafe {
             msg_send![SessionListView::alloc(mtm), initWithFrame: rect(0.0, 0.0, self.list_width(), 400.0)]
         };
         // SAFETY: NSScrollView's initializer is valid for this ivar-free subclass.
         let scroll: Retained<SessionScrollView> = unsafe {
-            msg_send![SessionScrollView::alloc(mtm), initWithFrame: rect(11.0, 4.0, self.list_width(), 460.0)]
+            msg_send![super(SessionScrollView::alloc(mtm).set_ivars(ScrollOwner::default())), initWithFrame: rect(11.0, 4.0, self.list_width(), 460.0)]
         };
+        *scroll.ivars().controller.borrow_mut() = Some(objc2::rc::Weak::new(self));
         scroll.setDrawsBackground(false);
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
@@ -3273,11 +3950,51 @@ impl MenuController {
             .expect("footer initialized once");
         list.addSubview(&toolbar);
         view.addSubview(&caption);
+        let pin = self.action_button(
+            &view,
+            "",
+            sel!(togglePin:),
+            "window-pin",
+            rect(
+                1.0,
+                view.bounds().size.height - ICON_BUTTON_SIZE - 1.0,
+                ICON_BUTTON_SIZE,
+                ICON_BUTTON_SIZE,
+            ),
+            false,
+        );
+        pin.setImage(
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                ns_string!("pin"),
+                Some(ns_string!("Detach window")),
+            )
+            .as_deref(),
+        );
+        pin.setContentTintColor(Some(&secondary_text_color()));
+        pin.setToolTip(Some(ns_string!("Detach window")));
+        self.ivars().pin_button.set(pin).unwrap();
+        self.ivars()
+            .pin_background
+            .set(
+                self.ivars()
+                    .buttons
+                    .borrow()
+                    .last()
+                    .unwrap()
+                    .background
+                    .clone(),
+            )
+            .unwrap();
+        *self.ivars().toolbar_buttons.borrow_mut() =
+            std::mem::take(&mut *self.ivars().buttons.borrow_mut());
         view.setPostsFrameChangedNotifications(true);
-        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("AI Agent Monitor"));
+        let menu = self.ivars().menu.get().cloned().unwrap_or_else(|| {
+            let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("AI Agent Monitor"));
+            menu.setDelegate(Some(ProtocolObject::from_ref(self)));
+            menu
+        });
         menu.setAutoenablesItems(false);
         menu.setMinimumWidth(self.menu_width());
-        menu.setDelegate(Some(ProtocolObject::from_ref(self)));
         // SAFETY: nil action and an empty key equivalent create an inert container item.
         let item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -3317,7 +4034,9 @@ impl MenuController {
             .menu_item
             .set(item)
             .expect("menu item initialized once");
-        self.ivars().menu.set(menu).expect("menu initialized once");
+        if self.ivars().menu.get().is_none() {
+            self.ivars().menu.set(menu).expect("menu initialized once");
+        }
         self.ivars().list.set(list).expect("list initialized once");
         self.ivars().root.set(view).expect("root initialized once");
         self.ivars()
@@ -3347,14 +4066,16 @@ impl MenuController {
         transparent: bool,
     ) -> Retained<NSButton> {
         // SAFETY: All callers use implemented selectors and the retained controller as target.
-        let button = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(title),
-                Some(self),
-                Some(action),
-                self.mtm(),
-            )
-        };
+        let native: Retained<ActionButton> =
+            unsafe { msg_send![ActionButton::alloc(self.mtm()), initWithFrame: frame] };
+        let button = native.into_super();
+        button.setTitle(&NSString::from_str(title));
+        button.setButtonType(NSButtonType::MomentaryPushIn);
+        button.setBezelStyle(NSBezelStyle::Push);
+        unsafe {
+            button.setTarget(Some(self));
+            button.setAction(Some(action));
+        }
         let frame = if !transparent && title.is_empty() {
             rect(
                 frame.origin.x + (frame.size.width - ICON_BUTTON_SIZE) / 2.0,
@@ -3404,52 +4125,6 @@ impl MenuController {
         button
     }
 
-    fn client_group_heading(&self, client: Client) -> Retained<StatusContentView> {
-        let view: Retained<StatusContentView> = unsafe {
-            msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, 0.0, self.list_width(), 26.0)]
-        };
-        let icon = self.client_icon(client);
-        icon.setFrame(rect(session_layout::ICON_LEFT + 2.0, 3.0, 20.0, 20.0));
-        let children = icon.subviews();
-        for index in 0..children.count() {
-            children
-                .objectAtIndex(index)
-                .setFrame(rect(0.0, 0.0, 20.0, 20.0));
-        }
-        view.addSubview(&icon);
-        let name = self.label(
-            &view,
-            client.label(),
-            rect(SESSION_TEXT_LEFT, 7.0, 280.0, 16.0),
-            12.0,
-            0.35,
-            true,
-        );
-        name.sizeToFit();
-        name.setTextColor(Some(&visual::group_title_color()));
-        center_label(&name, 13.0);
-        let line_x = SESSION_TEXT_LEFT + name.frame().size.width + 12.0;
-        let divider = NSBox::initWithFrame(
-            NSBox::alloc(self.mtm()),
-            rect(
-                line_x,
-                13.0,
-                (self.list_width() - line_x - 12.0).max(0.0),
-                0.5,
-            ),
-        );
-        divider.setBoxType(NSBoxType::Custom);
-        divider.setTitlePosition(NSTitlePosition::NoTitle);
-        divider.setBorderWidth(0.0);
-        divider.setFillColor(&appearance_color(
-            [115.0, 128.0, 145.0],
-            [151.0, 168.0, 188.0],
-            0.22,
-        ));
-        view.addSubview(&divider);
-        view
-    }
-
     fn client_icon(&self, client: Client) -> Retained<StatusContentView> {
         // Keep the decoration click-through while using the app's own full-color icon.
         // SAFETY: This decoration-only NSView subclass has no ivars.
@@ -3497,14 +4172,6 @@ impl MenuController {
     }
 
     fn status_icon(&self, view: &NSView, activity: Activity, finished: bool, y: f64) {
-        if activity == Activity::Working {
-            let disc: Retained<WorkingStatusView> = unsafe {
-                msg_send![WorkingStatusView::alloc(self.mtm()), initWithFrame: rect(self.list_width() - 61.0, y - 1.0, 18.0, 18.0)]
-            };
-            disc.setToolTip(Some(ns_string!("Working")));
-            view.addSubview(&disc);
-            return;
-        }
         if activity == Activity::Confirmation || (finished && activity == Activity::Idle) {
             let is_finished = activity == Activity::Idle;
             let color = if is_finished {
@@ -3595,7 +4262,10 @@ impl MenuController {
     }
 
     fn close_panel(&self) {
-        self.hide_settings();
+        if let Some(scroll) = self.ivars().scroll.get() {
+            scroll.ivars().controller.borrow_mut().take();
+        }
+        self.end_shortcut_recording(false);
         for caption in self.ivars().work_glows.borrow().iter() {
             caption.release_sprite();
         }
@@ -3626,15 +4296,15 @@ impl MenuController {
         self.stop_pointer_tracking();
         let state = self.ivars();
         state.reset_disclosures();
-        self.filter();
-        self.render_footer();
-        if let Some(scroll) = state.scroll.get() {
-            scroll.contentView().scrollToPoint(NSPoint::new(0.0, 0.0));
-        }
     }
 
     fn start_keyboard_tracking(&self) {
         let state = self.ivars();
+        if state.root.get().and_then(|root| root.window()).is_some()
+            && state.resume_editors_on_attach.replace(false)
+        {
+            self.resume_host_editors();
+        }
         // Install after NSMenu has attached the view and entered its tracking loop.
         if state.menu_open.get()
             && state.keyboard_handler.borrow().is_none()
@@ -3696,7 +4366,31 @@ impl MenuController {
     }
 
     pub fn handle_session_key(&self, event: &NSEvent) -> bool {
+        // NSApplication retains the resident controller, while the actual
+        // controls and focus belong to the current disposable popup.
+        // Clone before dispatch: Enter/Escape can close and release that popup.
+        let popup = self.ivars().popup.borrow().clone();
+        if let Some(popup) = popup {
+            return popup.handle_session_key(event);
+        }
         let state = self.ivars();
+        if let Some(window) = state.detached_window.borrow().as_ref()
+            && !window.isKeyWindow()
+        {
+            return false;
+        }
+        if self.is_detached()
+            && event.keyCode() == 13
+            && event
+                .modifierFlags()
+                .contains(NSEventModifierFlags::Command)
+            && !event
+                .modifierFlags()
+                .intersects(NSEventModifierFlags::Control | NSEventModifierFlags::Option)
+        {
+            self.close_menu(sel!(closeMenu:), None);
+            return true;
+        }
         if state.settings_active.get() {
             return self.handle_settings_key(event);
         }
@@ -3748,6 +4442,19 @@ impl MenuController {
             return false;
         }
         let key = event.keyCode();
+        if key == 53 && state.usage_resets_expanded.get() {
+            state.usage_resets_expanded.set(false);
+            self.render_footer();
+            return true;
+        }
+        if matches!(key, 36 | 76 | 49)
+            && state.keyboard_focus.borrow().as_deref() == Some("usage-resets")
+        {
+            if !event.isARepeat() {
+                self.toggle_usage_resets(sel!(toggleUsageResets:), None);
+            }
+            return true;
+        }
         if key == 49 {
             let focus = state.keyboard_focus.borrow().clone();
             let button = focus.as_ref().and_then(|id| {
@@ -4014,6 +4721,7 @@ impl MenuController {
         let mut answers: Vec<_> = buttons
             .iter()
             .filter(|item| item.button.isEnabled() || item.focusable_when_disabled)
+            .filter(|item| !item.button.isHiddenOrHasHiddenAncestor())
             .filter_map(|item| {
                 let key = item.button.identifier()?.to_string();
                 let control = controls.get(&key)?;
@@ -4036,14 +4744,18 @@ impl MenuController {
                 .unwrap_or(answers.len());
             answers.insert(before, (composer.id(), composer.session().to_owned()));
         }
-        keyboard_order(
+        let mut order = keyboard_order(
             layout.iter().filter_map(|row| {
                 row.id
                     .as_ref()
                     .map(|id| (id.clone(), expanded.contains(id)))
             }),
             &answers,
-        )
+        );
+        if !state.settings_active.get() {
+            order.push("usage-resets".into());
+        }
+        order
     }
 
     fn filter_edited(&self) {
@@ -4169,6 +4881,7 @@ impl MenuController {
 
     fn stop_pointer_tracking(&self) {
         self.paint_resize_cursor(false);
+        self.paint_hand_cursor(false);
         if let Some(timer) = self.ivars().pointer_timer.borrow_mut().take() {
             timer.invalidate();
         }
@@ -4194,7 +4907,14 @@ impl MenuController {
 
     /// Handle the tracking window's real edges before NSMenu consumes its gutters.
     pub(super) fn handle_width_mouse(&self, event: &NSEvent) -> bool {
-        if !self.ivars().menu_open.get() || event.r#type() != NSEventType::LeftMouseDown {
+        let popup = self.ivars().popup.borrow().clone();
+        if let Some(popup) = popup {
+            return popup.handle_width_mouse(event);
+        }
+        if self.is_detached()
+            || !self.ivars().menu_open.get()
+            || event.r#type() != NSEventType::LeftMouseDown
+        {
             return false;
         }
         let Some(root) = self.ivars().root.get() else {
@@ -4217,7 +4937,13 @@ impl MenuController {
     }
 
     pub(super) fn sync_resize_cursor(&self) {
-        let active = self.ivars().menu_open.get()
+        let popup = self.ivars().popup.borrow().clone();
+        if let Some(popup) = popup {
+            popup.sync_resize_cursor();
+            return;
+        }
+        let active = !self.is_detached()
+            && self.ivars().menu_open.get()
             && self.ivars().root.get().is_some_and(|root| {
                 root.ivars().resize_drag.get().is_some()
                     || root.window().is_some_and(|window| {
@@ -4225,6 +4951,7 @@ impl MenuController {
                     })
             });
         self.paint_resize_cursor(active);
+        self.sync_action_cursor();
     }
 
     fn sample_pointer(&self) {
@@ -4235,6 +4962,7 @@ impl MenuController {
                 shell.paint();
             }
             self.sync_backdrop();
+            self.sync_action_cursor();
             return;
         }
         let Some(window) = state.root.get().and_then(|view| view.window()) else {
@@ -4248,6 +4976,77 @@ impl MenuController {
         if state.last_pointer.replace(Some(point)) != Some(point) {
             self.update_hover_at(point);
         }
+        self.sync_action_cursor();
+    }
+
+    fn paint_hand_cursor(&self, active: bool) {
+        let was_active = self.ivars().hand_cursor_active.replace(active);
+        let cursor = NSCursor::pointingHandCursor();
+        if active {
+            cursor.set();
+        } else if was_active && NSCursor::currentCursor() == cursor {
+            // Never replace native text, link or resize cursors on exit.
+            NSCursor::arrowCursor().set();
+        }
+    }
+
+    fn sync_action_cursor(&self) {
+        let state = self.ivars();
+        if NSApplication::sharedApplication(self.mtm()).activationPolicy()
+            == NSApplicationActivationPolicy::Prohibited
+        {
+            return;
+        }
+        let active = !state.resize_cursor_active.get()
+            && state.menu_open.get()
+            && state
+                .root
+                .get()
+                .and_then(|root| root.window())
+                .is_some_and(|window| {
+                    let screen_point = NSEvent::mouseLocation();
+                    window.isVisible()
+                        && NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(
+                            screen_point,
+                            0,
+                            self.mtm(),
+                        ) == window.windowNumber()
+                        && self.action_cursor_at(window.convertPointFromScreen(screen_point))
+                });
+        self.paint_hand_cursor(active);
+    }
+
+    fn action_cursor_at(&self, point: NSPoint) -> bool {
+        let state = self.ivars();
+        let Some(root) = state.root.get() else {
+            return false;
+        };
+        // hitTest expects the receiver's parent coordinates, not document ones.
+        let parent = unsafe { root.superview() };
+        let point = parent.map_or(point, |parent| parent.convertPoint_fromView(point, None));
+        let mut hit = root.hitTest(point);
+        while let Some(view) = hit {
+            if view.downcast_ref::<NSTextView>().is_some() {
+                return false;
+            }
+            if let Some(field) = view.downcast_ref::<NSTextField>()
+                && (field.isEditable() || field.isSelectable())
+            {
+                return false;
+            }
+            if let Some(control) = view.downcast_ref::<NSControl>()
+                && control.action().is_some()
+            {
+                return control.isEnabled();
+            }
+            if std::ptr::eq(&*view, &***root) {
+                break;
+            }
+            hit = unsafe { view.superview() };
+        }
+        // Custom session titles and radio surfaces share the actual hover hit
+        // regions; empty row space and hidden/disabled buttons have no target.
+        !state.settings_active.get() && state.hovered.get().is_some()
     }
 
     fn apply_hover(&self, target: Option<pointer::Target>) {
@@ -4289,6 +5088,10 @@ impl MenuController {
             .chain(state.buttons.borrow().iter())
             .enumerate()
         {
+            if item.button.isHiddenOrHasHiddenAncestor() {
+                paint_hover(&item.background, 0.0);
+                continue;
+            }
             let focused = item.button.identifier().is_some_and(|id| {
                 let id = id.to_string();
                 focus.as_ref() == Some(&id) && state.request_controls.borrow().contains_key(&id)
@@ -4299,6 +5102,31 @@ impl MenuController {
                 continue;
             }
             let hovered = target == Some(pointer::Target::Button(index));
+            if item
+                .button
+                .identifier()
+                .is_some_and(|id| id.to_string() == "usage-resets")
+            {
+                item.background.setFillColor(&appearance_color(
+                    [196.0, 184.0, 214.0],
+                    [33.0, 26.0, 46.0],
+                    1.0,
+                ));
+                let focused = focus.as_deref() == Some("usage-resets");
+                item.background
+                    .setBorderWidth(if focused { 2.0 } else { 0.0 });
+                item.background
+                    .setBorderColor(&NSColor::controlAccentColor());
+                paint_hover(
+                    &item.background,
+                    if hovered || focused || state.usage_resets_expanded.get() {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                );
+                continue;
+            }
             if index < state.toolbar_buttons.borrow().len() {
                 let color = if focused {
                     primary_text_color()
@@ -4522,6 +5350,17 @@ impl MenuController {
                 }
             })
             .collect();
+        if let Some(index) = state.buttons.borrow().iter().position(|item| {
+            item.button
+                .identifier()
+                .is_some_and(|id| id.to_string() == "usage-resets")
+                && button_area(item).contains((p.x, p.y))
+        }) {
+            self.apply_hover(Some(pointer::Target::Button(
+                state.toolbar_buttons.borrow().len() + index,
+            )));
+            return;
+        }
         self.apply_hover(pointer::target_at(
             (p.x, p.y),
             window,
@@ -4538,7 +5377,14 @@ impl MenuController {
         if state.routing_scroll.replace(true) {
             return;
         }
-        if state.settings_active.get() {
+        let resets_scroll = state.usage_resets_scroll.borrow().clone();
+        if let Some(scroll) = resets_scroll.filter(|scroll| {
+            let point = scroll.convertPoint_fromView(event.locationInWindow(), None);
+            let size = scroll.bounds().size;
+            point.x >= 0.0 && point.y >= 0.0 && point.x < size.width && point.y < size.height
+        }) {
+            scroll.scrollWheel(event);
+        } else if state.settings_active.get() {
             if let Some(shell) = state.settings_shell.get() {
                 shell.scroll.scrollWheel(event);
             }
@@ -4673,22 +5519,7 @@ impl MenuController {
             origin.y.min((document_height - viewport).max(0.0)),
         ));
         self.sync_backdrop();
-        self.update_group_headings();
         self.update_hover();
-    }
-
-    fn update_group_headings(&self) {
-        let state = self.ivars();
-        let layout = state.layout.borrow();
-        for icon in state.group_icons.borrow().iter() {
-            if let Some(first) = layout.get(icon.first) {
-                // Group labels belong to the document, not the viewport.
-                icon.view.setFrameOrigin(NSPoint::new(
-                    0.0,
-                    first.view.frame().origin.y - session_layout::GROUP_HEADER_HEIGHT,
-                ));
-            }
-        }
     }
 
     fn request_context(
@@ -4759,15 +5590,15 @@ impl MenuController {
                 &NSString::from_str(text.trim_end()),
                 self.mtm(),
             );
-            code.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(11.0, 0.0)));
-            code.setTextColor(Some(&primary_text_color()));
+            code.setFont(Some(&NSFont::monospacedSystemFontOfSize_weight(10.0, 0.0)));
+            code.setTextColor(Some(&secondary_text_color()));
             code.setSelectable(true);
             command_text(&code, text.trim_end());
             code.setMaximumNumberOfLines(0);
             if let Some(cell) = code.cell() {
                 cell.setLineBreakMode(NSLineBreakMode::ByCharWrapping);
             }
-            let code_width = width - if index == 0 { 44.0 } else { 22.0 };
+            let code_width = width - 16.0;
             let full_height = code
                 .cell()
                 .map(|cell| {
@@ -4802,7 +5633,7 @@ impl MenuController {
                 full_height.min(two_lines)
             };
             code.setMaximumNumberOfLines(if expanded { 0 } else { 2 });
-            let panel_height = height + 18.0;
+            let panel_height = height + 12.0;
             let background: Retained<StatusContentView> = unsafe {
                 msg_send![StatusContentView::alloc(self.mtm()), initWithFrame: rect(0.0, y, width, panel_height)]
             };
@@ -4814,28 +5645,8 @@ impl MenuController {
             box_view.setFillColor(&appearance_color([218.0; 3], [42.0; 3], 1.0));
             background.addSubview(&box_view);
             view.addSubview(&background);
-            code.setFrame(rect(11.0, y + 9.0, code_width, height));
+            code.setFrame(rect(8.0, y + 6.0, code_width, height));
             view.addSubview(&code);
-            if index == 0 {
-                let copy = self.action_button(
-                    &view,
-                    "",
-                    sel!(copyCommand:),
-                    &text,
-                    rect(width - 30.0, y + 3.0, 28.0, 28.0),
-                    false,
-                );
-                copy.setRefusesFirstResponder(true);
-                copy.setToolTip(Some(ns_string!("Copy command")));
-                if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                    ns_string!("doc.on.doc"),
-                    Some(ns_string!("Copy command")),
-                ) {
-                    image.setSize(NSSize::new(13.0, 13.0));
-                    copy.setImage(Some(&image));
-                    copy.setContentTintColor(Some(&secondary_text_color()));
-                }
-            }
             if overflowing && !scoped {
                 let button = self.action_button(
                     &view,
@@ -4916,16 +5727,21 @@ impl MenuController {
                 format!("Model: {}", session.model.as_deref().unwrap_or_default()),
             ));
         }
-        let mut y = 0.0;
+        let (mut x, mut y) = (0.0, 0.0);
+        let height = 15.4;
         for (symbol, description, value, tooltip) in rows {
-            if y > 0.0 {
-                y += 2.0;
+            let measure = NSTextField::labelWithString(&NSString::from_str(&value), self.mtm());
+            measure.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            measure.sizeToFit();
+            let width = (18.0 + measure.frame().size.width.ceil()).min(self.detail_width());
+            if x > 0.0 && x + width > self.detail_width() {
+                x = 0.0;
+                y += height + 2.0;
             }
-            let height = 15.4;
             let label = self.label(
                 &view,
                 &value,
-                rect(18.0, y, self.detail_width() - 18.0, height),
+                rect(x + 18.0, y, width - 18.0, height),
                 11.0,
                 0.0,
                 false,
@@ -4935,15 +5751,16 @@ impl MenuController {
             label.setToolTip(Some(&NSString::from_str(&tooltip)));
             let icon = visual::MetadataIcon::new(
                 self.mtm(),
-                rect(0.0, y + (height - 12.0) / 2.0, 12.0, 12.0),
+                rect(x, y + (height - 12.0) / 2.0, 12.0, 12.0),
                 symbol,
             );
             icon.setToolTip(Some(&NSString::from_str(description)));
             view.addSubview(&icon);
-            y += height;
+            x += width + 16.0;
         }
-        view.setFrameSize(NSSize::new(self.detail_width(), y));
-        (view, y)
+        let total_height = y + height;
+        view.setFrameSize(NSSize::new(self.detail_width(), total_height));
+        (view, total_height)
     }
 
     fn render_rows(&self, sessions: &[Session]) {
@@ -4975,7 +5792,11 @@ impl MenuController {
             panel.suspend_editing();
         }
         self.clear_hover();
-        self.ivars().buttons.borrow_mut().clear();
+        self.ivars().buttons.borrow_mut().retain(|item| {
+            item.button
+                .identifier()
+                .is_some_and(|id| id.to_string() == "usage-resets")
+        });
         self.ivars().request_controls.borrow_mut().clear();
         let children = list.subviews();
         for index in 0..children.count() {
@@ -4989,48 +5810,8 @@ impl MenuController {
         let mut layout = Vec::new();
         let mut y = session_layout::TOP_INSET;
         let mut ordered: Vec<_> = sessions.iter().collect();
-        let client_order = |client| match client {
-            Client::VSCode => 0,
-            Client::Terminal => 1,
-            Client::Desktop { .. } => 2,
-            Client::Unknown => 3,
-        };
-        ordered.sort_by(|a, b| {
-            client_order(a.client)
-                .cmp(&client_order(b.client))
-                .then_with(|| a.client.application_id().cmp(&b.client.application_id()))
-                .then_with(|| {
-                    match NSString::from_str(&a.title)
-                        .localizedStandardCompare(&NSString::from_str(&b.title))
-                    {
-                        NSComparisonResult::Ascending => std::cmp::Ordering::Less,
-                        NSComparisonResult::Descending => std::cmp::Ordering::Greater,
-                        _ => a.key().cmp(&b.key()),
-                    }
-                })
-        });
-        let mut group = None;
-        let mut icons: Vec<GroupIcon> = Vec::new();
+        ordered.sort_by(|a, b| crate::platform::session_order(a, b));
         for session in ordered {
-            let new_group = group != Some(session.client);
-            let session_gap = if new_group {
-                session_layout::GROUP_HEADER_HEIGHT
-                    + if group.is_some() {
-                        session_layout::GROUP_GAP
-                    } else {
-                        0.0
-                    }
-            } else {
-                0.0
-            };
-            if new_group {
-                icons.push(GroupIcon {
-                    view: self.client_group_heading(session.client),
-                    first: layout.len(),
-                });
-                group = Some(session.client);
-            }
-            y += session_gap;
             let inline = if !session.interaction().questions.is_empty()
                 && session.interaction().actions.is_empty()
             {
@@ -5051,6 +5832,11 @@ impl MenuController {
                                 self.detail_width() - 26.0,
                                 &detail_text_color(true),
                             );
+                            if let Some(draft) =
+                                self.ivars().question_drafts.borrow_mut().remove(&key)
+                            {
+                                panel.restore_draft(draft);
+                            }
                             self.ivars()
                                 .question_panels
                                 .borrow_mut()
@@ -5089,7 +5875,7 @@ impl MenuController {
             } else {
                 request_controls(session)
             };
-            // Put scope-specific alternatives below the immediate decisions.
+            // Keep scope-specific alternatives after the immediate decisions.
             // The bound response value stays attached to its control.
             controls.sort_by_key(|control| !control.detail.trim().is_empty());
             let is_question = session.approval().is_some();
@@ -5205,6 +5991,14 @@ impl MenuController {
                     })
                     .clone();
                 composer.set_width(self.detail_width());
+                if let Some(draft) = self
+                    .ivars()
+                    .composer_drafts
+                    .borrow_mut()
+                    .remove(&session.key())
+                {
+                    composer.restore_draft(draft);
+                }
                 composer.sync(&snapshot, session);
                 Some(composer)
             } else {
@@ -5347,7 +6141,7 @@ impl MenuController {
                 .unwrap_or(0.0);
             let height = SESSION_HEADER_HEIGHT + detail_height;
             let row = SessionRowView::create(self.mtm(), rect(0.0, y, self.list_width(), height));
-            if !new_group {
+            if !layout.is_empty() {
                 let separator = NSBox::initWithFrame(
                     NSBox::alloc(self.mtm()),
                     rect(0.0, height - 0.5, self.list_width(), 0.5),
@@ -5369,11 +6163,12 @@ impl MenuController {
                 .snapshot()
                 .unseen_finished
                 .contains_key(&session.key());
-            let title_right = if session.activity == Activity::Idle && !finished {
-                self.list_width() - 36.0
-            } else {
-                self.list_width() - 68.0
-            };
+            let title_right =
+                if matches!(session.activity, Activity::Idle | Activity::Working) && !finished {
+                    self.list_width() - 36.0
+                } else {
+                    self.list_width() - 68.0
+                };
             let text_width = title_right - SESSION_TEXT_LEFT - 12.0 - 42.0;
             let robot_button = self.action_button(
                 &row,
@@ -5489,6 +6284,7 @@ impl MenuController {
             ) {
                 let arrow = NSImageView::imageViewWithImage(&image, self.mtm());
                 arrow.setFrame(rect(0.0, 1.0, 14.0, 14.0));
+                arrow.setHidden(true);
                 arrow.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
                 destination.addSubview(&arrow);
                 row.ivars()
@@ -5497,7 +6293,7 @@ impl MenuController {
                     .expect("destination arrow initialized once");
             }
             let app_icon = self.client_icon(session.client);
-            app_icon.setFrame(rect(18.0, 0.0, 16.0, 16.0));
+            app_icon.setFrame(rect(0.0, 0.0, 16.0, 16.0));
             let children = app_icon.subviews();
             for index in 0..children.count() {
                 children
@@ -5505,7 +6301,10 @@ impl MenuController {
                     .setFrame(rect(0.0, 0.0, 16.0, 16.0));
             }
             destination.addSubview(&app_icon);
-            destination.setHidden(true);
+            row.ivars()
+                .destination_icon
+                .set(app_icon)
+                .expect("destination icon initialized once");
             row.addSubview(&destination);
             row.ivars()
                 .destination
@@ -5648,10 +6447,10 @@ impl MenuController {
                     self.ivars().buttons.borrow_mut().push(ButtonHover {
                         button,
                         background: composer.background(),
-                        base_alpha: 0.0,
+                        base_alpha: 1.0,
                         radio: None,
                         caption: Some(composer.caption()),
-                        symbol: None,
+                        symbol: Some(composer.symbol()),
                         focusable_when_disabled: false,
                         gutter: None,
                     });
@@ -5798,9 +6597,7 @@ impl MenuController {
                                 message_end
                                     + 8.0
                                     + control_inset
-                                    + control_frames[index].origin.y
-                                    + control_frames[index].size.height
-                                    + 4.0,
+                                    + request_scope_y(&control_frames, &context_heights, index),
                             ));
                             document.addSubview(context);
                         }
@@ -5819,6 +6616,7 @@ impl MenuController {
                                 rect(
                                     content_x
                                         + control_inset
+                                        + control_frames[index].origin.x
                                         + control_frames[index].size.width
                                         + 4.0,
                                     message_end
@@ -5997,7 +6795,7 @@ impl MenuController {
                 view: row.clone().into_super(),
                 row: Some(row),
                 id: Some(session.key()),
-                gap: session_gap,
+                gap: 0.0,
                 base_height: SESSION_HEADER_HEIGHT,
                 detail_height,
                 detail: detail_clip,
@@ -6006,10 +6804,6 @@ impl MenuController {
             });
             y += height;
         }
-        for icon in &icons {
-            list.addSubview(&icon.view);
-        }
-        *self.ivars().group_icons.borrow_mut() = icons;
         drop(reveal);
         drop(expanded);
         if self
@@ -6053,7 +6847,7 @@ impl MenuController {
 
     fn sync_header_extension(&self) {
         let state = self.ivars();
-        if !state.menu_open.get() {
+        if !state.menu_open.get() || self.is_detached() {
             return;
         }
         let Some(root) = state.root.get() else {
@@ -6107,7 +6901,7 @@ impl MenuController {
 
     fn sync_footer_extension(&self) {
         let state = self.ivars();
-        if !state.menu_open.get() {
+        if !state.menu_open.get() || self.is_detached() {
             return;
         }
         // Settings has no quota footer, but native NSMenu padding still needs
@@ -6180,6 +6974,7 @@ impl MenuController {
     }
 
     fn sync_backdrop(&self) {
+        self.sync_pin_position();
         let state = self.ivars();
         let (Some(root), Some(scroll), Some(backdrop)) =
             (state.root.get(), state.scroll.get(), state.backdrop.get())
@@ -6215,26 +7010,121 @@ impl MenuController {
         }
     }
 
+    fn sync_pin_position(&self) {
+        let state = self.ivars();
+        let (Some(root), Some(scroll), Some(pin), Some(background)) = (
+            state.root.get(),
+            state.scroll.get(),
+            state.pin_button.get(),
+            state.pin_background.get(),
+        ) else {
+            return;
+        };
+        // The scroll view has an 11-point horizontal gutter. Keep the pin in
+        // the root so that gutter cannot offset or clip its circular hover;
+        // move it with the header's scroll offset rather than fixing it onscreen.
+        let offset = scroll.contentView().bounds().origin.y;
+        let frame = rect(
+            1.0,
+            root.bounds().size.height - ICON_BUTTON_SIZE - 1.0 + offset,
+            ICON_BUTTON_SIZE,
+            ICON_BUTTON_SIZE,
+        );
+        let hidden =
+            self.is_detached() || state.settings_active.get() || offset >= ICON_BUTTON_SIZE + 1.0;
+        if pin.frame() != frame || pin.isHidden() != hidden {
+            pin.setFrame(frame);
+            background.setFrame(frame);
+            pin.setHidden(hidden);
+            if hidden {
+                background.setHidden(true);
+            }
+            state.last_pointer.set(None);
+        }
+    }
+
     fn render_footer(&self) {
         let state = self.ivars();
         if state.settings_active.get() {
             return;
         }
-        let usage = state.usage.borrow();
-        let query = state.filter_query.borrow().clone();
-        let filter_rows = usize::from(!query.is_empty());
-        let Some(footer) = state.footer.get() else {
-            return;
-        };
+        let mut resets = self.monitor().snapshot().usage_resets.clone();
+        if let Some(generation) = state.usage_resets_pending.get() {
+            if resets.generation >= generation {
+                state.usage_resets_pending.set(None);
+            } else {
+                resets.phase = crate::domain::usage::ResetPhase::Loading;
+                resets.credits = None;
+                resets.available_count = None;
+                resets.error = None;
+            }
+        }
+        let expanded = state.usage_resets_expanded.get();
+        let local_error = state.usage_resets_error.borrow().clone();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        let query = state.filter_query.borrow().clone();
+        let windows = state
+            .usage
+            .borrow()
+            .as_ref()
+            .map(|usage| usage.windows.clone())
+            .unwrap_or_default();
+        let mut visible_resets = resets.clone();
+        visible_resets.generation = 0;
+        let key = FooterRenderKey {
+            remaining: windows.iter().map(|window| window.remaining(now)).collect(),
+            windows,
+            resets: visible_resets,
+            expanded,
+            error: local_error.clone(),
+            query: query.clone(),
+            width: self.menu_width(),
+        };
+        if state.footer_render_key.borrow().as_ref() == Some(&key) {
+            return;
+        }
+        *state.footer_render_key.borrow_mut() = Some(key);
+        state.buttons.borrow_mut().retain(|item| {
+            item.button
+                .identifier()
+                .is_none_or(|id| id.to_string() != "usage-resets")
+        });
+        let loading = expanded
+            && local_error.is_none()
+            && matches!(
+                resets.phase,
+                crate::domain::usage::ResetPhase::Idle | crate::domain::usage::ResetPhase::Loading
+            );
+        let reset_rows = resets.credits.as_ref().map(Vec::len).unwrap_or(0);
+        let reset_height = if !expanded {
+            0.0
+        } else if loading {
+            78.0
+        } else if local_error.is_some() || resets.phase == crate::domain::usage::ResetPhase::Error {
+            76.0
+        } else {
+            34.0 + reset_rows.clamp(1, 6) as f64 * 24.0
+        };
+        let reset_scroll_origin = state
+            .usage_resets_scroll
+            .borrow()
+            .as_ref()
+            .map(|scroll| scroll.contentView().bounds().origin);
+        state.usage_resets_scroll.borrow_mut().take();
+        let usage = state.usage.borrow();
+        let filter_rows = usize::from(!query.is_empty());
+        let Some(footer) = state.footer.get() else {
+            return;
+        };
         let windows = usage
             .as_ref()
             .map(|usage| usage.windows.as_slice())
             .unwrap_or_default();
-        let height = windows.len().max(1) as f64 * 40.0 + 20.0 + filter_rows as f64 * 20.0;
+        let height =
+            windows.len().max(1) as f64 * 40.0 + 20.0 + filter_rows as f64 * 20.0 + reset_height;
         let changed = state.footer_height.replace(height) != height;
         let children = footer.subviews();
         for index in 0..children.count() {
@@ -6287,18 +7177,26 @@ impl MenuController {
             let name_text = window
                 .map(|window| format!("Codex {}", window.label()))
                 .unwrap_or_else(|| "Codex usage".to_owned());
-            let y = height - 16.0 - filter_rows as f64 * 20.0 - 36.0 - index as f64 * 40.0;
-            let panel = glass_box(self.mtm(), rect(16.0, y, quota_width - 32.0, 36.0), 3);
+            let y = height
+                - 16.0
+                - filter_rows as f64 * 20.0
+                - 36.0
+                - index as f64 * 40.0
+                - reset_height;
+            let panel_height = 36.0 + if index == 0 { reset_height } else { 0.0 };
+            let panel = glass_box(
+                self.mtm(),
+                rect(16.0, y, quota_width - 32.0, panel_height),
+                3,
+            );
             panel.setBoxType(NSBoxType::Custom);
             panel.setTitlePosition(NSTitlePosition::NoTitle);
             panel.setCornerRadius(17.0);
             quota.addSubview(&panel);
-            let icon = visual::QuotaSymbol::new(self.mtm(), rect(29.0, y + 9.0, 18.0, 18.0));
-            quota.addSubview(&icon);
             let name = self.label(
                 &quota,
                 &name_text,
-                rect(56.0, y + 8.0, 150.0, 20.0),
+                rect(29.0, y + 8.0, 150.0, 20.0),
                 11.0,
                 0.0,
                 false,
@@ -6306,7 +7204,7 @@ impl MenuController {
             name.setTextColor(Some(&primary_text_color()));
             name.sizeToFit();
             let name_width = name.frame().size.width.ceil();
-            name.setFrame(rect(56.0, y + 8.0, name_width, 20.0));
+            name.setFrame(rect(29.0, y + 8.0, name_width, 20.0));
             let date = self.label(
                 &quota,
                 &reset,
@@ -6317,7 +7215,7 @@ impl MenuController {
             );
             date.sizeToFit();
             let date_width = date.frame().size.width.ceil().max(15.0);
-            let date_x = quota_width - 29.0 - date_width;
+            let date_x = quota_width - 29.0 - date_width - if index == 0 { 22.0 } else { 0.0 };
             date.setFrame(rect(date_x, y + 8.0, date_width, 20.0));
             let percent = self.label(
                 &quota,
@@ -6327,11 +7225,14 @@ impl MenuController {
                 0.0,
                 true,
             );
+            if remaining.is_some_and(|value| value <= 40) {
+                percent.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
+            }
             percent.sizeToFit();
             let percent_width = percent.frame().size.width.ceil().max(15.0);
             let percent_x = date_x - 24.0 - percent_width;
             percent.setFrame(rect(percent_x, y + 8.0, percent_width, 20.0));
-            let track_x = 56.0 + name_width + 12.0;
+            let track_x = 29.0 + name_width + 12.0;
             let track_width = (percent_x - 12.0 - track_x).max(0.0);
             let track: Retained<UsageTrack> = unsafe {
                 msg_send![super(UsageTrack::alloc(self.mtm()).set_ivars(UsageTrackState { remaining: remaining.map(f64::from) })),initWithFrame:rect(track_x,y+14.0,track_width,8.0)]
@@ -6370,8 +7271,211 @@ impl MenuController {
                 label.setTextColor(Some(&visual::quota_value_color()));
                 label.setToolTip(Some(&tooltip));
             }
+            if let Some(value) = remaining.filter(|value| *value <= 50) {
+                let rgb = crate::domain::layout::quota_rgb(f64::from(value)).map(f64::from);
+                percent.setTextColor(Some(&appearance_color(rgb, rgb, 1.0)));
+            }
             name.setTextColor(Some(&primary_text_color()));
             track.setToolTip(Some(&tooltip));
+            if index == 0 {
+                let frame = rect(quota_width - 45.0, y + 6.0, 24.0, 24.0);
+                let background = NSBox::initWithFrame(NSBox::alloc(self.mtm()), frame);
+                background.setBoxType(NSBoxType::Custom);
+                background.setTitlePosition(NSTitlePosition::NoTitle);
+                background.setBorderWidth(0.0);
+                background.setCornerRadius(12.0);
+                background.setFillColor(&appearance_color(
+                    [196.0, 184.0, 214.0],
+                    [33.0, 26.0, 46.0],
+                    1.0,
+                ));
+                paint_hover(&background, if expanded { 1.0 } else { 0.0 });
+                quota.addSubview(&background);
+                let button = self.action_button(
+                    &quota,
+                    "",
+                    sel!(toggleUsageResets:),
+                    "usage-resets",
+                    frame,
+                    true,
+                );
+                button.setTransparent(false);
+                button.setImage(
+                    NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                        ns_string!("ellipsis"),
+                        Some(ns_string!("Usage limit resets")),
+                    )
+                    .as_deref(),
+                );
+                button.setContentTintColor(Some(&secondary_text_color()));
+                button.setToolTip(Some(ns_string!("Show / hide usage limit resets")));
+                self.ivars().buttons.borrow_mut().push(ButtonHover {
+                    button,
+                    background,
+                    base_alpha: if expanded { 1.0 } else { 0.0 },
+                    radio: None,
+                    caption: None,
+                    symbol: None,
+                    focusable_when_disabled: false,
+                    gutter: None,
+                });
+                if expanded {
+                    let top = y + 36.0 + reset_height;
+                    if loading {
+                        self.label(
+                            &quota,
+                            "Loading usage limit resets…",
+                            rect(78.0, top - 46.0, quota_width - 115.0, 18.0),
+                            11.0,
+                            0.0,
+                            true,
+                        );
+                        let spinner = state.usage_resets_spinner.get_or_init(|| {
+                            let spinner = NSProgressIndicator::initWithFrame(
+                                NSProgressIndicator::alloc(self.mtm()),
+                                rect(0.0, 0.0, 16.0, 16.0),
+                            );
+                            spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+                            spinner.setIndeterminate(true);
+                            spinner
+                        });
+                        spinner.removeFromSuperview();
+                        spinner.setFrame(rect(53.0, top - 44.0, 16.0, 16.0));
+                        quota.addSubview(spinner);
+                        if !state.usage_resets_spinning.replace(true) {
+                            // SAFETY: Main-thread AppKit animation, no sender is required.
+                            unsafe {
+                                spinner.startAnimation(None);
+                            }
+                        }
+                    } else if let Some(error) = local_error.as_deref().or(resets.error.as_deref()) {
+                        let label = self.label(
+                            &quota,
+                            error,
+                            rect(29.0, top - 38.0, quota_width - 58.0, 30.0),
+                            10.0,
+                            0.0,
+                            true,
+                        );
+                        label.setMaximumNumberOfLines(2);
+                        if let Some(cell) = label.cell() {
+                            cell.setWraps(true);
+                            cell.setScrollable(false);
+                            cell.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
+                        }
+                        label.setToolTip(Some(&NSString::from_str(error)));
+                    } else {
+                        let heading = self.label(
+                            &quota,
+                            "Usage limit resets",
+                            rect(29.0, top - 27.0, 150.0, 16.0),
+                            11.0,
+                            0.3,
+                            false,
+                        );
+                        heading.sizeToFit();
+                        if let Some(count) = resets.available_count {
+                            self.label(
+                                &quota,
+                                &format!("{count} available"),
+                                rect(35.0 + heading.frame().size.width, top - 27.0, 90.0, 16.0),
+                                10.0,
+                                0.0,
+                                true,
+                            );
+                        }
+                        let expires = self.label(
+                            &quota,
+                            "Expires",
+                            rect(quota_width - 103.0, top - 27.0, 74.0, 16.0),
+                            11.0,
+                            0.3,
+                            false,
+                        );
+                        expires.setAlignment(NSTextAlignment::Right);
+                        if let Some(credits) =
+                            resets.credits.as_ref().filter(|rows| !rows.is_empty())
+                        {
+                            let formatter = NSDateFormatter::new();
+                            formatter.setDateFormat(Some(ns_string!("d MMM yyyy 'at' HH:mm")));
+                            let document_height = credits.len() as f64 * 24.0;
+                            let viewport_height = credits.len().min(6) as f64 * 24.0;
+                            let scroll = NSScrollView::initWithFrame(
+                                NSScrollView::alloc(self.mtm()),
+                                rect(29.0, y + 40.0, quota_width - 58.0, viewport_height),
+                            );
+                            scroll.setDrawsBackground(false);
+                            scroll.setHasVerticalScroller(credits.len() > 6);
+                            scroll.setAutohidesScrollers(true);
+                            scroll.setBorderType(NSBorderType::NoBorder);
+                            let document = NSView::initWithFrame(
+                                NSView::alloc(self.mtm()),
+                                rect(0.0, 0.0, quota_width - 58.0, document_height),
+                            );
+                            for (row, credit) in credits.iter().enumerate() {
+                                let ry = document_height - 18.0 - row as f64 * 24.0;
+                                self.label(
+                                    &document,
+                                    &credit.title,
+                                    rect(0.0, ry, 130.0, 16.0),
+                                    11.0,
+                                    0.0,
+                                    false,
+                                );
+                                let text = credit
+                                    .expires_at
+                                    .map(|value| {
+                                        formatter
+                                            .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(
+                                                value as f64,
+                                            ))
+                                            .to_string()
+                                    })
+                                    .unwrap_or_else(|| "No expiration".into());
+                                let date = self.label(
+                                    &document,
+                                    &text,
+                                    rect(quota_width - 268.0, ry, 210.0, 16.0),
+                                    10.0,
+                                    0.0,
+                                    true,
+                                );
+                                date.setAlignment(NSTextAlignment::Right);
+                            }
+                            scroll.setDocumentView(Some(&document));
+                            let origin = reset_scroll_origin.unwrap_or_else(|| {
+                                NSPoint::new(0.0, (document_height - viewport_height).max(0.0))
+                            });
+                            scroll.contentView().scrollToPoint(origin);
+                            scroll.reflectScrolledClipView(&scroll.contentView());
+                            quota.addSubview(&scroll);
+                            *state.usage_resets_scroll.borrow_mut() = Some(scroll);
+                        } else {
+                            self.label(
+                                &quota,
+                                if resets.available_count == Some(0) {
+                                    "No resets available."
+                                } else {
+                                    "Expiration details unavailable."
+                                },
+                                rect(29.0, top - 51.0, quota_width - 58.0, 16.0),
+                                10.0,
+                                0.0,
+                                true,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if !loading
+            && state.usage_resets_spinning.replace(false)
+            && let Some(spinner) = state.usage_resets_spinner.get()
+        {
+            // SAFETY: Main-thread AppKit animation, no sender is required.
+            unsafe {
+                spinner.stopAnimation(None);
+            }
         }
         if changed {
             self.layout_rows();
@@ -6379,7 +7483,7 @@ impl MenuController {
     }
 
     fn constrain_menu_to_work_area(&self) {
-        if !self.ivars().menu_open.get() {
+        if !self.ivars().menu_open.get() || self.is_detached() {
             return;
         }
         let Some(window) = self.ivars().root.get().and_then(|root| root.window()) else {
@@ -6435,9 +7539,16 @@ impl MenuController {
         } else {
             state.footer_height.get()
         };
-        let height = (content_height + footer_height)
+        let natural_height = (content_height + footer_height)
             .max(64.0 + footer_height)
             .min(maximum);
+        let height = state
+            .detached_window
+            .borrow()
+            .as_ref()
+            .map_or(natural_height, |w| {
+                w.contentRectForFrameRect(w.frame()).size.height
+            });
         let viewport = height;
         NSAnimationContext::beginGrouping();
         let context = NSAnimationContext::currentContext();
@@ -6467,6 +7578,7 @@ impl MenuController {
         NSAnimationContext::endGrouping();
         if resized
             && state.menu_open.get()
+            && !self.is_detached()
             && let Some(menu) = state.menu.get()
         {
             menu.update();
@@ -6483,9 +7595,74 @@ impl MenuController {
             .send(crate::actors::monitor::Command::Refresh);
     }
     fn receive_sessions(&self) {
+        self.receive_sessions_with_mouse(self.mouse_tracking_active());
+    }
+
+    fn mouse_tracking_active(&self) -> bool {
+        NSApplication::sharedApplication(self.mtm()).activationPolicy()
+            != NSApplicationActivationPolicy::Prohibited
+            && NSEvent::pressedMouseButtons() & 1 != 0
+    }
+
+    fn receive_sessions_with_mouse(&self, mouse_pressed: bool) {
         let state = self.ivars();
+        if mouse_pressed && state.root.get().is_some() && state.revision.get() != u64::MAX {
+            if let Some(owner) = state.popup_owner.get().and_then(|owner| owner.load()) {
+                owner.receive_sessions_with_mouse(true);
+            }
+            // Leave the revision unread: the first tick after release applies
+            // the newest snapshot, coalescing all intermediate revisions.
+            return;
+        }
         let snapshot = self.monitor().snapshot();
         if state.revision.replace(snapshot.revision) == snapshot.revision {
+            return;
+        }
+        if state.root.get().is_none() {
+            // No popup UI exists while closed. Services, native notifications,
+            // standalone forms and the status item remain resident.
+            *state.all.borrow_mut() = snapshot.sessions.clone();
+            *state.applications.borrow_mut() = snapshot.preferences.applications.clone();
+            state.composer_drafts.borrow_mut().retain(|key, _| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| session.key() == *key)
+            });
+            state.question_drafts.borrow_mut().retain(|key, _| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| session.approval_key().as_ref() == Some(key))
+            });
+            state.message_history.borrow_mut().retain(|key, _| {
+                snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| session.key() == *key)
+            });
+            for form in state.forms.borrow().iter() {
+                form.reconcile(&snapshot);
+            }
+            if shortcut_needs_sync(
+                &state.shortcut_applied.borrow(),
+                &snapshot.preferences.shortcut,
+                state.menu_open.get(),
+                state.shortcut_monitor.borrow().is_some(),
+            ) {
+                self.install_shortcut();
+            }
+            let link = state
+                .telegram_auto_open
+                .borrow_mut()
+                .take_link(snapshot.telegram.link.as_deref());
+            if let Some(link) = link {
+                open_telegram_bot(&link);
+            }
+            self.update_badge(snapshot.pending_count());
+            if snapshot.stopping {
+                crate::macos::native::stop_application(self.mtm());
+            }
             return;
         }
         if let Some(release) = state.release.get() {
@@ -6512,6 +7689,14 @@ impl MenuController {
                     .get(&crate::actors::monitor::HistoryKey::window(key.clone()))
                     && value.generation == history.ticket
                 {
+                    if history.messages != value.messages
+                        || history.cursor != value.cursor
+                        || history.loading != value.loading
+                        || history.exhausted != value.exhausted
+                        || history.error != value.error
+                    {
+                        state.filter_dirty.set(true);
+                    }
                     history.messages = value.messages.clone();
                     history.cursor = value.cursor.clone();
                     history.loading = value.loading;
@@ -6529,7 +7714,15 @@ impl MenuController {
                 )
             )
         });
-        state.filter_dirty.set(true);
+        let status = RowStatus {
+            submissions: snapshot.submissions.clone(),
+            messages: snapshot.message_sends.clone(),
+            finished: snapshot.unseen_finished.keys().cloned().collect(),
+        };
+        if state.row_status.borrow().as_ref() != Some(&status) {
+            *state.row_status.borrow_mut() = Some(status);
+            state.filter_dirty.set(true);
+        }
         state.responding.borrow_mut().extend(
             snapshot
                 .submissions
@@ -6562,11 +7755,17 @@ impl MenuController {
         self.refresh_telegram_settings();
         self.refresh_integration_settings();
         *state.all.borrow_mut() = sessions;
-        self.filter();
+        // Keep the latest state and dirty flag while closed. menuWillOpen:
+        // applies them before the menu becomes visible. Native message and
+        // approval controls need not be rebuilt for an invisible popup.
+        if state.menu_open.get() {
+            self.filter();
+        }
         if snapshot.stopping {
             crate::macos::native::stop_application(self.mtm());
         }
         self.update_badge(snapshot.pending_count());
+        self.sync_action_cursor();
     }
 
     fn filter(&self) {
@@ -6587,11 +7786,20 @@ impl MenuController {
                     || a.cwd != b.cwd
                     || a.workspace != b.workspace
                     || a.git_branch != b.git_branch
+                    || a.model != b.model
+                    || a.model_display_name != b.model_display_name
+                    || a.reasoning_effort != b.reasoning_effort
                     || a.client != b.client
+                    || a.connection != b.connection
+                    || a.target != b.target
                     || a.activity != b.activity
                     || a.last_message() != b.last_message()
+                    || a.latest_message().map(|message| &message.id)
+                        != b.latest_message().map(|message| &message.id)
+                    || a.images() != b.images()
                     || a.progress() != b.progress()
                     || a.approval() != b.approval()
+                    || a.interaction() != b.interaction()
             });
         drop(previous);
         if changed {
@@ -6643,7 +7851,9 @@ impl MenuController {
                     offset += length + 3;
                 }
             }
-            overview.setAttributedStringValue(&value);
+            if overview.stringValue().to_string() != summary {
+                overview.setAttributedStringValue(&value);
+            }
             let hint = if counts[4] == 0 {
                 summary
             } else {
@@ -7152,30 +8362,38 @@ mod close_tests {
     }
 
     #[test]
-    fn immediate_approval_decisions_stay_together_above_scoped_options() {
+    fn approval_decisions_wrap_naturally_without_moving_on_scope_expansion() {
         let sizes = [
             NSSize::new(120.0, 32.0),
             NSSize::new(80.0, 32.0),
-            NSSize::new(220.0, 32.0),
+            NSSize::new(140.0, 32.0),
         ];
-        let (frames, height) = request_action_layout(&sizes, &[None, None, Some(60.0)], 362.0);
-        assert_eq!(frames.len(), 3);
-        assert_eq!(frames[0].origin.y, frames[1].origin.y);
-        assert_eq!(frames[0].size.width, frames[1].size.width);
-        assert!(frames[0].origin.x + frames[0].size.width < frames[1].origin.x);
-        assert!(frames[2].origin.y >= frames[0].size.height + 12.0);
-        assert_eq!(height, frames[2].origin.y + frames[2].size.height + 64.0);
-        assert!(
-            frames
-                .iter()
-                .all(|frame| frame.origin.x + frame.size.width <= 362.0)
+        let closed = [None, None, Some(0.0)];
+        let open = [None, None, Some(60.0)];
+        let (frames, height) = request_action_layout(&sizes, &closed, 420.0);
+        assert_eq!(
+            frames,
+            vec![
+                rect(0.0, 0.0, 120.0, 32.0),
+                rect(130.0, 0.0, 80.0, 32.0),
+                rect(220.0, 0.0, 140.0, 32.0)
+            ]
         );
-        let (only_scope, height) = request_action_layout(&sizes[2..], &[Some(60.0)], 362.0);
-        assert_eq!(only_scope[0].origin.y, 0.0);
+        assert_eq!(height, 32.0);
+        let (expanded, height) = request_action_layout(&sizes, &open, 420.0);
+        assert_eq!(expanded, frames);
+        assert_eq!(request_scope_y(&frames, &open, 2), 36.0);
         assert_eq!(height, 96.0);
-        let (collapsed, height) = request_action_layout(&sizes, &[None, None, Some(0.0)], 362.0);
-        assert_eq!(collapsed, frames);
-        assert_eq!(height, collapsed[2].origin.y + collapsed[2].size.height);
+        let (wrapped, height) = request_action_layout(&sizes, &closed, 362.0);
+        assert_eq!(wrapped[2], rect(0.0, 42.0, 140.0, 32.0));
+        assert_eq!(height, 74.0);
+        for (frame, context) in wrapped.iter().zip(closed) {
+            assert!(
+                frame.origin.x + frame.size.width + if context.is_some() { 36.0 } else { 0.0 }
+                    <= 362.0
+            );
+        }
+        assert_eq!(request_action_layout(&[], &[], 362.0), (vec![], 0.0));
     }
 
     #[test]

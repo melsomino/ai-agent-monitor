@@ -26,3 +26,29 @@ pub struct Usage {
     pub observed_at: String,
     pub windows: Vec<Window>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetCredit {
+    pub title: String,
+    pub expires_at: Option<i64>,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResetPhase {
+    #[default]
+    Idle,
+    Loading,
+    Ready,
+    Error,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Resets {
+    #[serde(default)]
+    pub generation: u64,
+    pub phase: ResetPhase,
+    pub available_count: Option<u64>,
+    pub credits: Option<Vec<ResetCredit>>,
+    pub error: Option<String>,
+}
